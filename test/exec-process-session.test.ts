@@ -135,6 +135,18 @@ test("signalProcess(KILL) records an exit even though the launcher trap can't ca
   assert.equal(state, "exited", "a KILL'd process must be recorded as exited via the signalProcess sentinel");
 });
 
+test("signalProcess rejects when the substrate cannot confirm process exit", async () => {
+  const proc = createExecProcessSessions({
+    async run() {
+      return { stdout: "", stderr: "process is still alive", code: 1, timedOut: false };
+    },
+  });
+  await assert.rejects(
+    proc.signalProcess({ id: "sandbox", rootDir: "/workspace" }, "00000000-0000-0000-0000-000000000000", "KILL"),
+    /signalProcess failed.*still alive/,
+  );
+});
+
 test("reading or writing an unknown process id is rejected", async () => {
   const { proc, handle } = fixture();
   const bogus = "00000000-0000-0000-0000-000000000000";

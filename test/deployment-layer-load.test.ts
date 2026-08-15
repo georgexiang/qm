@@ -61,6 +61,93 @@ test("loadDeploymentLayer derives the runtime shapes from tool descriptors", () 
   ]);
 });
 
+test("a deployment tool descriptor registers typed ephemeral process metadata", () => {
+  const tool = {
+    id: "local-browser",
+    install: { binary: "local-browser-adapter" },
+    process: {
+      executableId: "local-browser-adapter",
+      protocolMajor: 2,
+      launchSchema: {
+        type: "object",
+        properties: { taskId: { type: "string" } },
+        required: ["taskId"],
+        additionalProperties: false,
+      },
+    },
+  };
+  const descriptor = parseToolDescriptor(JSON.stringify(tool), "tools/local-browser/tool.json");
+
+  assert.deepEqual(descriptor.process, tool.process);
+  assert.deepEqual(loadDeploymentLayer(layerDir({ localBrowser: tool })).ephemeralProcesses, [tool.process]);
+});
+
+test("deployment process executable IDs are unique", () => {
+  const process = {
+    executableId: "shared-adapter",
+    protocolMajor: 1,
+    launchSchema: { type: "object" },
+  };
+  assert.throws(
+    () =>
+      loadDeploymentLayer(
+        layerDir({
+          first: { id: "first", install: { binary: "shared-adapter" }, process },
+          second: { id: "second", install: { binary: "shared-adapter" }, process },
+        }),
+      ),
+    /ephemeral process executable ID "shared-adapter" is declared by both "first" and "second"/,
+  );
+});
+
+test("deployment process metadata rejects malformed fields and invalid launch schemas", () => {
+  for (const process of [
+    { executableId: "../adapter", protocolMajor: 1, launchSchema: { type: "object" } },
+    { executableId: "adapter", protocolMajor: 0, launchSchema: { type: "object" } },
+    { executableId: "adapter", protocolMajor: 1, launchSchema: [] },
+    { executableId: "adapter", protocolMajor: 1, launchSchema: { type: "not-a-json-schema-type" } },
+    {
+      executableId: "adapter",
+      protocolMajor: 1,
+      launchSchema: { type: "object", properties: { taskId: { type: "not-a-json-schema-type" } } },
+    },
+    { executableId: "adapter", protocolMajor: 1, launchSchema: { type: "string" } },
+    { executableId: "adapter", protocolMajor: 1, launchSchema: { type: "object", propertyNames: 42 } },
+    {
+      executableId: "adapter",
+      protocolMajor: 1,
+      launchSchema: { type: "object", unevaluatedProperties: false },
+    },
+    { executableId: "adapter", protocolMajor: 1, launchSchema: { type: "object", minProperties: 1 } },
+    {
+      executableId: "adapter",
+      protocolMajor: 1,
+      launchSchema: { type: "object", properties: { ids: { type: "array", uniqueItems: true } } },
+    },
+  ]) {
+    assert.throws(
+      () =>
+        parseToolDescriptor(
+          JSON.stringify({ id: "tool", install: { binary: "adapter" }, process }),
+          "tools/tool/tool.json",
+        ),
+      /process\.(?:executableId|protocolMajor|launchSchema)/,
+    );
+  }
+  assert.throws(
+    () =>
+      parseToolDescriptor(
+        JSON.stringify({
+          id: "tool",
+          install: { binary: "installed-adapter" },
+          process: { executableId: "other-adapter", protocolMajor: 1, launchSchema: { type: "object" } },
+        }),
+        "tools/tool/tool.json",
+      ),
+    /process\.executableId.*install\.binary/,
+  );
+});
+
 test("brokered tools resolve to service, binary, and quarantine roots", () => {
   const layer = loadDeploymentLayer(
     layerDir({
@@ -272,6 +359,7 @@ const BROKERED_ACME = {
 
 test("a layer installed after boot reaches the app that booted without one", () => {
   const built = buildApp(testConfig({ orgId: "acme" }));
+  assert.equal(typeof built.ephemeralProcessProvider.start, "function");
   assert.equal(
     built.brokeredTools.length,
     0,
@@ -290,15 +378,22 @@ test("replaceDeploymentLayer reaches every holder of the runtime arrays", () => 
   const runtime = emptyDeploymentLayer();
   const brokeredTools = runtime.brokeredTools;
   const commandRules = runtime.commandRules;
+  const ephemeralProcesses = runtime.ephemeralProcesses;
   replaceDeploymentLayer(
     runtime,
     loadDeploymentLayer(
       layerDir({
-        acme: { ...BROKERED_ACME, approvals: [{ command: "delete", decision: "deny" }] },
+        acme: {
+          ...BROKERED_ACME,
+          approvals: [{ command: "delete", decision: "deny" }],
+          process: { executableId: "acmectl", protocolMajor: 1, launchSchema: { type: "object" } },
+        },
       }),
     ),
   );
   assert.equal(brokeredTools.length, 1, "credential vending reads this array");
   assert.equal(brokeredTools[0]?.service, "acme");
   assert.equal(commandRules.length, 1, "the command policy reads this array, and already sees post-boot layers");
+  assert.equal(ephemeralProcesses.length, 1, "process providers read the hot-replaced registration array");
+  assert.equal(ephemeralProcesses[0]?.executableId, "acmectl");
 });

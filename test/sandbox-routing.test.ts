@@ -4,6 +4,7 @@ import { createSandboxRouter, type SandboxRoute } from "../src/sandbox/sandbox-r
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { CapabilityUnsupportedError, supportsScopeProfile } from "../src/sandbox/sandbox.ts";
 import type { Sandbox, SandboxHandle, ExecResult, AgentComputerProfile } from "../src/sandbox/sandbox.ts";
+import { createSandboxEphemeralProcessProvider } from "../src/sandbox/ephemeral-sandbox-process.ts";
 import type { WorkspaceLayer } from "../src/types.ts";
 
 function fakeBackend(name: string): Sandbox & { calls: string[] } {
@@ -146,6 +147,33 @@ test("a capability held by SOME backends stays exposed and dispatches per handle
       assert.match((e as Error).message, /does not support backupComputer/);
       return true;
     },
+  );
+});
+
+test("the ephemeral process provider follows a process-capable routed handle", async () => {
+  const routes = createMemoryMap<SandboxRoute>();
+  const thin = fakeBackend("aws");
+  thin.profile.processSessions = false;
+  delete (thin as Partial<Sandbox>).startProcess;
+  delete (thin as Partial<Sandbox>).readProcess;
+  delete (thin as Partial<Sandbox>).writeStdin;
+  delete (thin as Partial<Sandbox>).signalProcess;
+  delete (thin as Partial<Sandbox>).listProcesses;
+  const capable = fakeBackend("sprites");
+  await routes.put("personal:s", { backend: "sprites" });
+  const router = createSandboxRouter({ backends: { aws: thin, sprites: capable }, routes, defaultBackend: "aws" });
+  const provider = createSandboxEphemeralProcessProvider(router, [
+    { executableId: "adapter", protocolMajor: 1, launchSchema: { type: "object" } },
+  ]);
+  const routed = await router.provision(layersFor("personal:s"));
+
+  const process = await provider.start({ handle: routed, executableId: "adapter", protocolMajor: 1, launch: {} });
+  await provider.stop(process);
+
+  const unrouted = await router.provision(layersFor("personal:f"));
+  await assert.rejects(
+    provider.start({ handle: unrouted, executableId: "adapter", protocolMajor: 1, launch: {} }),
+    (error) => error instanceof CapabilityUnsupportedError,
   );
 });
 

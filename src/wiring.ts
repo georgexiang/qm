@@ -115,6 +115,10 @@ import {
 } from "./sandbox/sandbox-routing.ts";
 import { createSandboxMigrationRunner, type SandboxMigrationRunner } from "./sandbox/sandbox-migration-runner.ts";
 import { effectiveEgressEnforcement, type Sandbox } from "./sandbox/sandbox.ts";
+import {
+  createSandboxEphemeralProcessProvider,
+  type EphemeralSandboxProcessProvider,
+} from "./sandbox/ephemeral-sandbox-process.ts";
 import { withOperatorTokenFallback } from "./credentials/connector-token.ts";
 import {
   createAwsSecretsManagerSource,
@@ -353,6 +357,7 @@ export interface BuiltApp {
   workspace: WorkspaceStore;
   memory: MemoryService;
   sandbox: Sandbox;
+  ephemeralProcessProvider: EphemeralSandboxProcessProvider;
   advisoryLock: AdvisoryLock;
   sandboxMigration: SandboxMigrationRunner;
   blobTransfer: BlobTransferStore;
@@ -642,6 +647,7 @@ export function buildApp(
     defaultBackend: config.sandboxBackend,
     onError: sandboxOnError,
   });
+  const ephemeralProcessProvider = createSandboxEphemeralProcessProvider(sandbox, deploymentLayer.ephemeralProcesses);
   const sandboxMigration = createSandboxMigrationRunner({
     backends: sandboxBackends,
     routes: sandboxRoutes,
@@ -1507,6 +1513,7 @@ export function buildApp(
     ...(askResolution ? { fireAskResolution: askResolution } : {}),
     ...(dropResolution ? { fireDropResolution: dropResolution } : {}),
     sandbox,
+    ephemeralProcessProvider,
     sandboxMigration,
     advisoryLock,
     blobTransfer,

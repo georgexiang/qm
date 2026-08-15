@@ -50,6 +50,47 @@ test("install.binary is restricted to the inert charset (it lands in generated D
   }
 });
 
+test("ephemeral process metadata round-trips through the CLI descriptor parser", () => {
+  const process = {
+    executableId: "local-browser-adapter",
+    protocolMajor: 2,
+    launchSchema: {
+      type: "object",
+      properties: { taskId: { type: "string" } },
+      required: ["taskId"],
+      additionalProperties: false,
+    },
+  };
+  assert.deepEqual(P({ id: "local-browser", install: { binary: "local-browser-adapter" }, process }).process, process);
+  for (const invalid of [
+    { ...process, executableId: "../adapter" },
+    { ...process, protocolMajor: 0 },
+    { ...process, launchSchema: [] },
+    { ...process, launchSchema: { type: "not-a-json-schema-type" } },
+    { ...process, launchSchema: { type: "object", properties: { taskId: { type: "invalid" } } } },
+    { ...process, launchSchema: { type: "string" } },
+    { ...process, launchSchema: { type: "object", propertyNames: 42 } },
+    { ...process, launchSchema: { type: "object", unevaluatedProperties: false } },
+    { ...process, launchSchema: { type: "object", properties: { taskId: { type: "string", pattern: "[" } } } },
+    { ...process, launchSchema: { type: "object", minProperties: 1 } },
+    { ...process, launchSchema: { type: "object", properties: { ids: { type: "array", uniqueItems: true } } } },
+  ]) {
+    assert.throws(
+      () => P({ id: "local-browser", install: { binary: "local-browser-adapter" }, process: invalid }),
+      /process\./,
+    );
+  }
+  assert.throws(
+    () =>
+      P({
+        id: "local-browser",
+        install: { binary: "local-browser-adapter" },
+        process: { ...process, executableId: "other-adapter" },
+      }),
+    /process\.executableId.*install\.binary/,
+  );
+});
+
 test("auth requires check + reauth; credentialPaths + splitEnv optional and shape-checked", () => {
   const d = P({
     id: "my-tool",
@@ -407,6 +448,15 @@ test("drift-lock: cli sandbox-layer parser matches the canonical src/deployment 
       install: { binary: "tool-bin" },
       approvals: [{ command: "deploy" }, { pattern: "\\btool-bin\\b\\s+--force\\b" }],
     },
+    {
+      id: "t",
+      install: { binary: "tool-adapter" },
+      process: {
+        executableId: "tool-adapter",
+        protocolMajor: 2,
+        launchSchema: { type: "object", properties: { taskId: { type: "string" } } },
+      },
+    },
   ];
   for (const v of valid) {
     assert.deepEqual(
@@ -444,6 +494,9 @@ test("drift-lock: cli sandbox-layer parser matches the canonical src/deployment 
     '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":"workspace","kind":"directory"}]}}',
     '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".acme","kind":"directory"},{"path":".acme/sub/key","kind":"file"}]}}',
     '{"id":"x","install":{"binary":"evil; rm -rf /"}}',
+    '{"id":"x","process":{"executableId":"../adapter","protocolMajor":1,"launchSchema":{"type":"object"}}}',
+    '{"id":"x","process":{"executableId":"adapter","protocolMajor":0,"launchSchema":{"type":"object"}}}',
+    '{"id":"x","process":{"executableId":"adapter","protocolMajor":1,"launchSchema":{"type":"invalid"}}}',
     JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(?:(x|x)+)+$" }] }),
     JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(a+)+$" }] }),
     JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(?:ab|a?b)+$" }] }),

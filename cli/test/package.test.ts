@@ -50,6 +50,17 @@ test(
       const tarballBytes = readFileSync(tarball);
       const packageManifest = JSON.parse(readFileSync(join(cliDir, "package.json"), "utf8")) as Record<string, unknown>;
       const version = packageManifest["version"] as string;
+      const zodManifest = JSON.parse(readFileSync(join(cliDir, "node_modules", "zod", "package.json"), "utf8")) as {
+        version: string;
+      };
+      const zodPack = JSON.parse(
+        execFileSync("npm", ["pack", "--json", "--pack-destination", dir], {
+          cwd: join(cliDir, "node_modules", "zod"),
+          encoding: "utf8",
+          env,
+        }),
+      ) as Array<{ filename: string }>;
+      const zodTarballBytes = readFileSync(join(dir, zodPack[0]!.filename));
       registry = createServer((request, response) => {
         const origin = `http://${request.headers.host}`;
         if (request.url && decodeURIComponent(request.url) === "/@yc-software/qm") {
@@ -70,6 +81,32 @@ test(
               },
             }),
           );
+          return;
+        }
+        if (request.url === "/zod") {
+          response.setHeader("content-type", "application/json");
+          response.end(
+            JSON.stringify({
+              name: "zod",
+              "dist-tags": { latest: zodManifest.version },
+              versions: {
+                [zodManifest.version]: {
+                  name: "zod",
+                  version: zodManifest.version,
+                  dist: {
+                    tarball: `${origin}/zod/-/zod-${zodManifest.version}.tgz`,
+                    shasum: createHash("sha1").update(zodTarballBytes).digest("hex"),
+                    integrity: `sha512-${createHash("sha512").update(zodTarballBytes).digest("base64")}`,
+                  },
+                },
+              },
+            }),
+          );
+          return;
+        }
+        if (request.url === `/zod/-/zod-${zodManifest.version}.tgz`) {
+          response.setHeader("content-type", "application/octet-stream");
+          response.end(zodTarballBytes);
           return;
         }
         if (request.url === `/@yc-software/qm/-/qm-${version}.tgz`) {
