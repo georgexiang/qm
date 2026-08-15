@@ -6,6 +6,7 @@ import {
   mintCapabilityToken,
   verifyBlobTransferCapability,
   verifyCapabilityToken,
+  verifyRetainedAuthorityCapability,
   type CapabilityClaims,
 } from "../src/auth/capability-token.ts";
 
@@ -68,6 +69,58 @@ test("scope authorization metadata is type-checked", async () => {
     ),
     null,
   );
+});
+
+test("authority lineage round-trips and rejects malformed fields", async () => {
+  const lineage = {
+    authorityId: "auth-123",
+    sessionId: "session-123",
+    turnId: "turn-123",
+    runId: "run-123",
+  };
+  const valid = claims(lineage as unknown as Partial<CapabilityClaims>);
+  assert.deepEqual(await verifyCapabilityToken(await mintCapabilityToken(valid, SECRET), SECRET), {
+    orgId: "default-org",
+    ...valid,
+  });
+
+  for (const [field, value] of [
+    ["authorityId", 1],
+    ["authorityId", ""],
+    ["sessionId", []],
+    ["turnId", {}],
+    ["runId", false],
+  ] as const) {
+    assert.equal(
+      await verifyCapabilityToken(
+        await mintCapabilityToken(
+          claims({ ...lineage, [field]: value } as unknown as Partial<CapabilityClaims>),
+          SECRET,
+        ),
+        SECRET,
+      ),
+      null,
+      `${field} must be a string`,
+    );
+  }
+
+  for (const partial of [
+    { authorityId: lineage.authorityId },
+    { sessionId: lineage.sessionId },
+    { turnId: lineage.turnId },
+    { ...lineage, sessionId: undefined },
+  ]) {
+    const token = await mintCapabilityToken(claims(partial as Partial<CapabilityClaims>), SECRET);
+    assert.ok(await verifyCapabilityToken(token, SECRET), "generic audiences accept typed optional lineage");
+    assert.equal(await verifyRetainedAuthorityCapability(token, SECRET), null);
+  }
+
+  assert.equal(await verifyRetainedAuthorityCapability(await mintCapabilityToken(claims(), SECRET), SECRET), null);
+  const withoutRun = claims({ authorityId: "auth-123", sessionId: "session-123", turnId: "turn-123" });
+  assert.deepEqual(await verifyRetainedAuthorityCapability(await mintCapabilityToken(withoutRun, SECRET), SECRET), {
+    orgId: "default-org",
+    ...withoutRun,
+  });
 });
 
 test("a tampered payload fails verification", async () => {

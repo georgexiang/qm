@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { Conversation, Principal, TurnRequest, TurnResult } from "../types.ts";
+import { CAPABILITY_TTL_MS } from "../auth/capability-token.ts";
 import { orgId as orgIdOf } from "../config.ts";
 import { scopeId } from "../types.ts";
 import { isHalt, routeWake, type Wake } from "../wake/wake.ts";
@@ -219,9 +221,18 @@ export function createTurnMethods(
       };
 
       const origin = resolveTurnOrigin(req);
+      const retainedAuthority =
+        origin.kind === "human"
+          ? {
+              authorityId: randomUUID(),
+              turnId: randomUUID(),
+              authorityExpiresAt: Date.now() + CAPABILITY_TTL_MS,
+            }
+          : {};
 
       const input = {
         surface: req.surface,
+        ...retainedAuthority,
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
         actor,
