@@ -1479,6 +1479,7 @@ export function buildApp(
       void runActivity.close?.();
       await harness.turns.close?.();
       await tasks.close?.();
+      await files.close?.();
     },
   };
 
