@@ -67,3 +67,7 @@ test("Core publishes one schema for every Phase F message kind", () => {
     "relay.invoke",
   ]);
 });
+
+test("Core does not collapse distinct large protocol majors through numeric precision", () => {
+  assert.equal(isDesktopBrowserProtocolCompatible("9007199254740992.0", "9007199254740993.0"), false);
+});

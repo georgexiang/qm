@@ -47,83 +47,61 @@ type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
 
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = "1.0" as const;
 
+const objectSchema = <const Required extends readonly string[], const Properties extends Record<string, unknown>>(
+  required: Required,
+  properties: Properties,
+) => ({
+  type: "object" as const,
+  additionalProperties: true,
+  required,
+  properties,
+});
+
+const messageSchema = <const Kind extends DesktopBrowserMessageKind, const Payload extends Record<string, unknown>>(
+  kind: Kind,
+  payload: Payload,
+) =>
+  objectSchema(["protocolVersion", "kind", "payload"], {
+    protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+    kind: { const: kind },
+    payload,
+  });
+
+const nonEmptyStringSchema = { type: "string", minLength: 1 } as const;
+
 export const desktopBrowserMessageSchemas = {
-  "core.authority": {
-    type: "object",
-    additionalProperties: true,
-    required: ["protocolVersion", "kind", "payload"],
-    properties: {
-      protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-      kind: { const: "core.authority" },
-      payload: {
-        type: "object",
-        additionalProperties: true,
-        required: ["requestId", "audience"],
-        properties: {
-          requestId: { type: "string", minLength: 1 },
-          audience: { type: "string", minLength: 1 },
-        },
-      },
-    },
-  },
-  "relay.invoke": {
-    type: "object",
-    additionalProperties: true,
-    required: ["protocolVersion", "kind", "payload"],
-    properties: {
-      protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-      kind: { const: "relay.invoke" },
-      payload: {
-        type: "object",
-        additionalProperties: true,
-        required: ["dispatchId", "operationId", "requestHash", "argv"],
-        properties: {
-          dispatchId: { type: "string", minLength: 1 },
-          operationId: { type: "string", minLength: 1 },
-          requestHash: { type: "string", minLength: 1 },
-          argv: { type: "array", minItems: 1, items: { type: "string" } },
-        },
-      },
-    },
-  },
-  "host.result": {
-    type: "object",
-    additionalProperties: true,
-    required: ["protocolVersion", "kind", "payload"],
-    properties: {
-      protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-      kind: { const: "host.result" },
-      payload: {
-        type: "object",
-        additionalProperties: true,
-        required: ["operationId", "outcome", "resultHash"],
-        properties: {
-          operationId: { type: "string", minLength: 1 },
-          outcome: { enum: ["completed", "failed", "unknown"] },
-          resultHash: { type: "string", minLength: 1 },
-        },
-      },
-    },
-  },
-  "companion.status": {
-    type: "object",
-    additionalProperties: true,
-    required: ["protocolVersion", "kind", "payload"],
-    properties: {
-      protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
-      kind: { const: "companion.status" },
-      payload: {
-        type: "object",
-        additionalProperties: true,
-        required: ["brokerStatus", "browserSkillStatus", "currentTaskPresent"],
-        properties: {
-          brokerStatus: { enum: ["ready", "paused", "disconnected"] },
-          browserSkillStatus: { enum: ["ready", "offline"] },
-          currentTaskPresent: { type: "boolean" },
-        },
-      },
-    },
-  },
+  "core.authority": messageSchema(
+    "core.authority",
+    objectSchema(["requestId", "audience"], {
+      requestId: nonEmptyStringSchema,
+      audience: nonEmptyStringSchema,
+    }),
+  ),
+  "relay.invoke": messageSchema(
+    "relay.invoke",
+    objectSchema(["dispatchId", "operationId", "requestHash", "argv"], {
+      dispatchId: nonEmptyStringSchema,
+      operationId: nonEmptyStringSchema,
+      requestHash: nonEmptyStringSchema,
+      argv: { type: "array", minItems: 1, items: { type: "string" } },
+    }),
+  ),
+  "host.result": messageSchema(
+    "host.result",
+    objectSchema(["operationId", "outcome", "resultHash"], {
+      operationId: nonEmptyStringSchema,
+      outcome: { enum: ["completed", "failed", "unknown"] },
+      resultHash: nonEmptyStringSchema,
+    }),
+  ),
+  "companion.status": messageSchema(
+    "companion.status",
+    objectSchema(["brokerStatus", "browserSkillStatus", "currentTaskPresent"], {
+      brokerStatus: { enum: ["ready", "paused", "disconnected"] },
+      browserSkillStatus: { enum: ["ready", "offline"] },
+      currentTaskPresent: { type: "boolean" },
+    }),
+  ),
 } as const;
 
 const messageParsers = Object.fromEntries(
@@ -137,10 +115,10 @@ export function encodeDesktopBrowserMessage(message: DesktopBrowserMessage): str
   return JSON.stringify(message);
 }
 
-function protocolMajor(version: string): number {
+function protocolMajor(version: string): string {
   const match = /^([0-9]+)\.[0-9]+$/.exec(version);
   if (!match) throw new Error(`invalid desktop browser protocol version ${JSON.stringify(version)}`);
-  return Number(match[1]);
+  return match[1]!.replace(/^0+(?=[0-9])/, "");
 }
 
 export function isDesktopBrowserProtocolCompatible(remoteVersion: string, supportedVersion: string): boolean {
