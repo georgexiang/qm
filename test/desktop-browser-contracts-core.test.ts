@@ -7,7 +7,7 @@ import {
   encodeDesktopBrowserMessage,
   isDesktopBrowserProtocolCompatible,
   type DesktopBrowserMessage,
-} from "../packages/desktop-browser-contracts/src/index.ts";
+} from "qm-desktop-browser-contracts";
 
 test("Core round-trips a versioned authority message through the public contract", () => {
   const message: DesktopBrowserMessage = {
@@ -33,6 +33,13 @@ test("Core rejects an authority message that does not match its published schema
         }),
       ),
     /core\.authority message does not match its schema/,
+  );
+});
+
+test("Core rejects protocol components longer than the published bound", () => {
+  assert.throws(
+    () => isDesktopBrowserProtocolCompatible("1234567890.0", DESKTOP_BROWSER_PROTOCOL_VERSION),
+    /invalid desktop browser protocol version/,
   );
 });
 
@@ -68,6 +75,7 @@ test("Core publishes one schema for every Phase F message kind", () => {
   ]);
 });
 
-test("Core does not collapse distinct large protocol majors through numeric precision", () => {
-  assert.equal(isDesktopBrowserProtocolCompatible("9007199254740992.0", "9007199254740993.0"), false);
+test("Core normalizes bounded protocol majors without numeric conversion", () => {
+  assert.equal(isDesktopBrowserProtocolCompatible("000000001.0", "1.0"), true);
+  assert.equal(isDesktopBrowserProtocolCompatible("000000002.0", "1.0"), false);
 });

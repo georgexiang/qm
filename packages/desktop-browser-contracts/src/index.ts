@@ -47,6 +47,9 @@ type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
 
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = "1.0" as const;
 
+const PROTOCOL_VERSION_PATTERN = "^([0-9]{1,9})\\.[0-9]{1,9}$";
+const protocolVersionPattern = new RegExp(PROTOCOL_VERSION_PATTERN);
+
 const objectSchema = <const Required extends readonly string[], const Properties extends Record<string, unknown>>(
   required: Required,
   properties: Properties,
@@ -62,7 +65,7 @@ const messageSchema = <const Kind extends DesktopBrowserMessageKind, const Paylo
   payload: Payload,
 ) =>
   objectSchema(["protocolVersion", "kind", "payload"], {
-    protocolVersion: { type: "string", pattern: "^[0-9]+\\.[0-9]+$" },
+    protocolVersion: { type: "string", pattern: PROTOCOL_VERSION_PATTERN },
     kind: { const: kind },
     payload,
   });
@@ -116,7 +119,7 @@ export function encodeDesktopBrowserMessage(message: DesktopBrowserMessage): str
 }
 
 function protocolMajor(version: string): string {
-  const match = /^([0-9]+)\.[0-9]+$/.exec(version);
+  const match = protocolVersionPattern.exec(version);
   if (!match) throw new Error(`invalid desktop browser protocol version ${JSON.stringify(version)}`);
   return match[1]!.replace(/^0+(?=[0-9])/, "");
 }

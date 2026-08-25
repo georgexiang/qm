@@ -2,6 +2,9 @@
   "name": "qm",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "license": "MIT",
   "type": "module",
   "description": "Headless core for the shared org agent (managed-agents architecture).",
