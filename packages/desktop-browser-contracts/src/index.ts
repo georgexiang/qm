@@ -31,6 +31,10 @@ export interface RelayChallengeMessage {
   payload: {
     relayInstanceId: string;
     challengeNonce: string;
+    deploymentCanonicalId: string;
+    brokerInstanceId: string;
+    browserInstanceId: string;
+    connectionEpoch: number;
   };
 }
 
@@ -38,8 +42,12 @@ export interface HostChallengeResponseMessage {
   protocolVersion: `${number}.${number}`;
   kind: "host.challenge-response";
   payload: {
+    relayInstanceId: string;
+    deploymentCanonicalId: string;
     devicePublicKey: string;
     brokerInstanceId: string;
+    browserInstanceId: string;
+    connectionEpoch: number;
     challengeNonce: string;
     signatureAlgorithm: "ed25519";
     signature: string;
@@ -154,11 +162,15 @@ const messageSchema = <const Kind extends DesktopBrowserMessageKind, const Paylo
   kind: Kind,
   payload: Payload,
 ) =>
-  objectSchema(["protocolVersion", "kind", "payload"], {
-    protocolVersion: { type: "string", pattern: PROTOCOL_VERSION_PATTERN },
-    kind: { const: kind },
-    payload,
-  }, true);
+  objectSchema(
+    ["protocolVersion", "kind", "payload"],
+    {
+      protocolVersion: { type: "string", pattern: PROTOCOL_VERSION_PATTERN },
+      kind: { const: kind },
+      payload,
+    },
+    true,
+  );
 
 const nonEmptyStringSchema = { type: "string", minLength: 1 } as const;
 const canonicalLexicalStringSchema = {
@@ -316,10 +328,14 @@ const desktopBrowserOnlineDeviceProjectionAdditiveSchema = objectSchema(
 export const desktopBrowserMessageSchemas = {
   "core.authority": messageSchema(
     "core.authority",
-    objectSchema(["requestId", "audience"], {
-      requestId: nonEmptyStringSchema,
-      audience: nonEmptyStringSchema,
-    }, true),
+    objectSchema(
+      ["requestId", "audience"],
+      {
+        requestId: nonEmptyStringSchema,
+        audience: nonEmptyStringSchema,
+      },
+      true,
+    ),
   ),
   "host.hello": messageSchema(
     "host.hello",
@@ -350,10 +366,21 @@ export const desktopBrowserMessageSchemas = {
   "relay.challenge": messageSchema(
     "relay.challenge",
     objectSchema(
-      ["relayInstanceId", "challengeNonce"],
+      [
+        "relayInstanceId",
+        "challengeNonce",
+        "deploymentCanonicalId",
+        "brokerInstanceId",
+        "browserInstanceId",
+        "connectionEpoch",
+      ],
       {
         relayInstanceId: nonEmptyStringSchema,
         challengeNonce: nonEmptyStringSchema,
+        deploymentCanonicalId: canonicalLexicalStringSchema,
+        brokerInstanceId: canonicalLexicalStringSchema,
+        browserInstanceId: canonicalLexicalStringSchema,
+        connectionEpoch: positiveIntegerSchema,
       },
       true,
     ),
@@ -361,10 +388,24 @@ export const desktopBrowserMessageSchemas = {
   "host.challenge-response": messageSchema(
     "host.challenge-response",
     objectSchema(
-      ["devicePublicKey", "brokerInstanceId", "challengeNonce", "signatureAlgorithm", "signature"],
+      [
+        "relayInstanceId",
+        "deploymentCanonicalId",
+        "devicePublicKey",
+        "brokerInstanceId",
+        "browserInstanceId",
+        "connectionEpoch",
+        "challengeNonce",
+        "signatureAlgorithm",
+        "signature",
+      ],
       {
+        relayInstanceId: nonEmptyStringSchema,
+        deploymentCanonicalId: canonicalLexicalStringSchema,
         devicePublicKey: nonEmptyStringSchema,
         brokerInstanceId: nonEmptyStringSchema,
+        browserInstanceId: canonicalLexicalStringSchema,
+        connectionEpoch: positiveIntegerSchema,
         challengeNonce: nonEmptyStringSchema,
         signatureAlgorithm: { const: "ed25519" },
         signature: nonEmptyStringSchema,
@@ -374,28 +415,40 @@ export const desktopBrowserMessageSchemas = {
   ),
   "relay.invoke": messageSchema(
     "relay.invoke",
-    objectSchema(["dispatchId", "operationId", "requestHash", "argv"], {
-      dispatchId: nonEmptyStringSchema,
-      operationId: nonEmptyStringSchema,
-      requestHash: nonEmptyStringSchema,
-      argv: { type: "array", minItems: 1, items: { type: "string" } },
-    }, true),
+    objectSchema(
+      ["dispatchId", "operationId", "requestHash", "argv"],
+      {
+        dispatchId: nonEmptyStringSchema,
+        operationId: nonEmptyStringSchema,
+        requestHash: nonEmptyStringSchema,
+        argv: { type: "array", minItems: 1, items: { type: "string" } },
+      },
+      true,
+    ),
   ),
   "host.result": messageSchema(
     "host.result",
-    objectSchema(["operationId", "outcome", "resultHash"], {
-      operationId: nonEmptyStringSchema,
-      outcome: { enum: ["completed", "failed", "unknown"] },
-      resultHash: nonEmptyStringSchema,
-    }, true),
+    objectSchema(
+      ["operationId", "outcome", "resultHash"],
+      {
+        operationId: nonEmptyStringSchema,
+        outcome: { enum: ["completed", "failed", "unknown"] },
+        resultHash: nonEmptyStringSchema,
+      },
+      true,
+    ),
   ),
   "companion.status": messageSchema(
     "companion.status",
-    objectSchema(["brokerStatus", "browserSkillStatus", "currentTaskPresent"], {
-      brokerStatus: { enum: ["ready", "paused", "disconnected"] },
-      browserSkillStatus: { enum: ["ready", "offline"] },
-      currentTaskPresent: { type: "boolean" },
-    }, true),
+    objectSchema(
+      ["brokerStatus", "browserSkillStatus", "currentTaskPresent"],
+      {
+        brokerStatus: { enum: ["ready", "paused", "disconnected"] },
+        browserSkillStatus: { enum: ["ready", "offline"] },
+        currentTaskPresent: { type: "boolean" },
+      },
+      true,
+    ),
   ),
 } as const;
 
@@ -494,11 +547,7 @@ export function decodeDesktopBrowserMessage(
   return message;
 }
 
-function parseDesktopBrowserRecord<T>(
-  parser: ReturnType<typeof fromJSONSchema>,
-  label: string,
-  raw: unknown,
-): T {
+function parseDesktopBrowserRecord<T>(parser: ReturnType<typeof fromJSONSchema>, label: string, raw: unknown): T {
   const parsed = parser.safeParse(raw);
   if (!parsed.success) {
     throw new Error(
@@ -509,7 +558,8 @@ function parseDesktopBrowserRecord<T>(
 }
 
 function pickRegistrationTupleParser(raw: unknown): ReturnType<typeof fromJSONSchema> {
-  const version = raw && typeof raw === "object" ? (raw as Record<string, unknown>).registrationProtocolVersion : undefined;
+  const version =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>).registrationProtocolVersion : undefined;
   return isCompatibleAdditiveMinorVersion(version, DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION)
     ? registrationReservationTupleAdditiveParser
     : registrationReservationTupleParser;
@@ -523,12 +573,12 @@ function pickPublicIdentityParser(raw: unknown): ReturnType<typeof fromJSONSchem
 }
 
 function pickRegistrationConfirmationEnvelopeParser(raw: unknown): ReturnType<typeof fromJSONSchema> {
-  const registrationTuple = raw && typeof raw === "object"
-    ? (raw as Record<string, unknown>).registrationTuple
-    : undefined;
-  const version = registrationTuple && typeof registrationTuple === "object"
-    ? (registrationTuple as Record<string, unknown>).registrationProtocolVersion
-    : undefined;
+  const registrationTuple =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>).registrationTuple : undefined;
+  const version =
+    registrationTuple && typeof registrationTuple === "object"
+      ? (registrationTuple as Record<string, unknown>).registrationProtocolVersion
+      : undefined;
   return isCompatibleAdditiveMinorVersion(version, DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION)
     ? registrationConfirmationEnvelopeAdditiveParser
     : registrationConfirmationEnvelopeParser;
@@ -542,7 +592,12 @@ export function parseDesktopBrowserRegistrationReservationTuple(
     "desktop browser registration reservation tuple",
     raw,
   );
-  if (!isDesktopBrowserProtocolCompatible(tuple.registrationProtocolVersion, DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION)) {
+  if (
+    !isDesktopBrowserProtocolCompatible(
+      tuple.registrationProtocolVersion,
+      DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
+    )
+  ) {
     throw new Error(
       `registration protocol major ${protocolMajor(tuple.registrationProtocolVersion)} is incompatible with supported major ${protocolMajor(DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION)}`,
     );
@@ -567,9 +622,7 @@ export function parseDesktopBrowserPublicIdentity(raw: unknown): DesktopBrowserP
   return canonicalizeDesktopBrowserPublicIdentity(identity);
 }
 
-export function projectDesktopBrowserPublicIdentity(
-  raw: unknown,
-): DesktopBrowserPublicIdentity {
+export function projectDesktopBrowserPublicIdentity(raw: unknown): DesktopBrowserPublicIdentity {
   const tuple = parseDesktopBrowserRegistrationReservationTuple(raw);
   return {
     publicIdentityVersion: tuple.registrationProtocolVersion,
@@ -591,7 +644,9 @@ export function parseDesktopBrowserRegistrationConfirmationEnvelope(
   const tuple = parseDesktopBrowserRegistrationReservationTuple(envelope.registrationTuple);
   const publicIdentity = parseDesktopBrowserPublicIdentity(envelope.publicIdentity);
   const projectedPublicIdentity = projectDesktopBrowserPublicIdentity(tuple);
-  if (JSON.stringify(canonicalizeDesktopBrowserPublicIdentity(publicIdentity)) !== JSON.stringify(projectedPublicIdentity)) {
+  if (
+    JSON.stringify(canonicalizeDesktopBrowserPublicIdentity(publicIdentity)) !== JSON.stringify(projectedPublicIdentity)
+  ) {
     throw new Error(
       "desktop browser registration confirmation envelope public identity must exactly project the registration tuple",
     );
@@ -658,22 +713,16 @@ function canonicalizeDesktopBrowserPublicIdentity(
   };
 }
 
-export function encodeDesktopBrowserRegistrationReservationTupleBytes(
-  raw: unknown,
-): Uint8Array<ArrayBuffer> {
+export function encodeDesktopBrowserRegistrationReservationTupleBytes(raw: unknown): Uint8Array<ArrayBuffer> {
   const tuple = parseDesktopBrowserRegistrationReservationTuple(raw);
   return Buffer.from(JSON.stringify(canonicalizeDesktopBrowserRegistrationReservationTuple(tuple)));
 }
 
-export function encodeDesktopBrowserRegistrationConfirmationSigningBytes(
-  raw: unknown,
-): Uint8Array<ArrayBuffer> {
+export function encodeDesktopBrowserRegistrationConfirmationSigningBytes(raw: unknown): Uint8Array<ArrayBuffer> {
   return encodeDesktopBrowserRegistrationReservationTupleBytes(raw);
 }
 
-export function encodeDesktopBrowserRegistrationConfirmationVerificationBytes(
-  raw: unknown,
-): Uint8Array<ArrayBuffer> {
+export function encodeDesktopBrowserRegistrationConfirmationVerificationBytes(raw: unknown): Uint8Array<ArrayBuffer> {
   return encodeDesktopBrowserRegistrationConfirmationSigningBytes(raw);
 }
 
@@ -692,4 +741,31 @@ export function computeDesktopBrowserRegistrationConfirmationFingerprint(
 export function computeDesktopBrowserPublicDeviceFingerprint(raw: DesktopBrowserPublicIdentity): string {
   const canonicalBytes = encodeDesktopBrowserPublicIdentityBytes(raw);
   return createHash("sha256").update(canonicalBytes).digest("hex").slice(0, 16);
+}
+
+export function encodeHostChallengeResponseSigningBytes(message: {
+  protocolVersion: HostChallengeResponseMessage["protocolVersion"];
+  payload: Pick<
+    HostChallengeResponseMessage["payload"],
+    | "relayInstanceId"
+    | "deploymentCanonicalId"
+    | "devicePublicKey"
+    | "brokerInstanceId"
+    | "browserInstanceId"
+    | "connectionEpoch"
+    | "challengeNonce"
+  >;
+}): Uint8Array<ArrayBuffer> {
+  return Buffer.from(
+    JSON.stringify({
+      protocolVersion: message.protocolVersion,
+      relayInstanceId: message.payload.relayInstanceId,
+      deploymentCanonicalId: message.payload.deploymentCanonicalId,
+      devicePublicKey: message.payload.devicePublicKey,
+      brokerInstanceId: message.payload.brokerInstanceId,
+      browserInstanceId: message.payload.browserInstanceId,
+      connectionEpoch: message.payload.connectionEpoch,
+      challengeNonce: message.payload.challengeNonce,
+    }),
+  );
 }

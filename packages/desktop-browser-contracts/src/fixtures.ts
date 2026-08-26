@@ -39,14 +39,22 @@ export const phaseFContractFixtures = [
     payload: {
       relayInstanceId: "relay-1",
       challengeNonce: "nonce-1",
+      deploymentCanonicalId: "qm://deployments/example",
+      brokerInstanceId: "broker-macbook-pro",
+      browserInstanceId: "browser-primary",
+      connectionEpoch: 7,
     },
   },
   {
     protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
     kind: "host.challenge-response",
     payload: {
+      relayInstanceId: "relay-1",
+      deploymentCanonicalId: "qm://deployments/example",
       devicePublicKey: "ed25519:device-public-key-abc",
       brokerInstanceId: "broker-macbook-pro",
+      browserInstanceId: "browser-primary",
+      connectionEpoch: 7,
       challengeNonce: "nonce-1",
       signatureAlgorithm: "ed25519",
       signature: "base64:signature-1",
