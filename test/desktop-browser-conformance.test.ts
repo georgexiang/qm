@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  browserSkillRuntimeLayout,
   buildFailureDiagnostics,
   buildChromeLaunchPlan,
   captureBrowserSkillConformanceFixtures,
+  createBrowserSkillRuntime,
+  darwinBrowserSkillSocketPathLimit,
   immediateBrowserQueryEnvironment,
   normalizeBrowserSkillConformanceFixtures,
   runDesktopBrowserConformance,
@@ -16,6 +19,7 @@ import {
   waitForDaemonReadiness,
   writeBrowserSkillConformanceManifest,
 } from "../scripts/desktop-browser-conformance.ts";
+import { createNodeDesktopBrowserConformanceDeps as createNodeRunnerDeps } from "../scripts/run-browser-skill-conformance.mjs";
 
 const sourceCommit = "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c";
 
@@ -24,6 +28,72 @@ const daemonRecord = (overrides: Record<string, unknown> = {}): Record<string, u
   sock_path: "/runtime/bsk-home/run/daemon.sock",
   started_at_epoch_secs: 10,
   ...overrides,
+});
+
+test("createBrowserSkillRuntime uses a short unique darwin root and cleans it", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "desktop-browser-conformance-parent-"));
+  const makeRuntime = () =>
+    createBrowserSkillRuntime({
+      platform: "darwin",
+      tempParentDir: parent,
+      makeTempDirectory: async (prefix) => await mkdtemp(prefix),
+      setDirectoryPermissions: async (directory, mode) => await chmod(directory, mode),
+      removeRuntimeDirectory: async (directory) => await rm(directory, { recursive: true, force: true }),
+    });
+
+  try {
+    const first = await makeRuntime();
+    const second = await makeRuntime();
+
+    assert.notEqual(first.runtimeDirectory, second.runtimeDirectory);
+    assert.equal(first.bskHome, first.runtimeDirectory);
+    assert.equal(second.bskHome, second.runtimeDirectory);
+    assert.match(first.runtimeDirectory, new RegExp(`^${parent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/qm-bsk-`));
+    assert.ok(first.daemonSocketPath.length < darwinBrowserSkillSocketPathLimit);
+    assert.ok(second.daemonSocketPath.length < darwinBrowserSkillSocketPathLimit);
+    assert.equal((await stat(first.runtimeDirectory)).mode & 0o777, 0o700);
+    assert.equal((await stat(second.runtimeDirectory)).mode & 0o777, 0o700);
+
+    await first.cleanup();
+    await second.cleanup();
+
+    await assert.rejects(access(first.runtimeDirectory));
+    await assert.rejects(access(second.runtimeDirectory));
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("createNodeDesktopBrowserConformanceDeps forwards the darwin temp prefix chosen by createBrowserSkillRuntime", async () => {
+  const seenPrefixes: string[] = [];
+  const deps = createNodeRunnerDeps({
+    platform: "darwin",
+    arch: "arm64",
+    processVersion: "v24.15.0",
+    env: {},
+    makeTempDirectoryImpl: async (prefix: string) => {
+      seenPrefixes.push(prefix);
+      return `${prefix}fixture`;
+    },
+  });
+
+  const runtime = await createBrowserSkillRuntime({
+    platform: deps.platform,
+    makeTempDirectory: deps.makeTempDirectory,
+  });
+
+  assert.deepEqual(seenPrefixes, ["/tmp/qm-bsk-"]);
+  assert.equal(runtime.runtimeDirectory, "/tmp/qm-bsk-fixture");
+  assert.equal(runtime.bskHome, runtime.runtimeDirectory);
+  assert.ok(runtime.daemonSocketPath.length < darwinBrowserSkillSocketPathLimit);
+});
+
+test("browserSkillRuntimeLayout preserves nested bsk-home outside darwin", () => {
+  assert.deepEqual(browserSkillRuntimeLayout("linux", "/runtime-root"), {
+    runtimeDirectory: "/runtime-root",
+    bskHome: "/runtime-root/bsk-home",
+    daemonSocketPath: "/runtime-root/bsk-home/run/daemon.sock",
+  });
 });
 
 test("writes reproducible provenance for the pinned BrowserSkill runtime", async () => {

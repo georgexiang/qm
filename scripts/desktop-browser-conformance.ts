@@ -33,6 +33,16 @@ export interface ChromeLaunchPlan {
   args: string[];
 }
 
+export interface BrowserSkillRuntimeLayout {
+  runtimeDirectory: string;
+  bskHome: string;
+  daemonSocketPath: string;
+}
+
+export interface BrowserSkillRuntime extends BrowserSkillRuntimeLayout {
+  cleanup(): Promise<void>;
+}
+
 interface SourceBuildProvenance {
   kind: "source-build";
   target: string;
@@ -180,10 +190,12 @@ export interface DesktopBrowserConformanceDeps {
   arch: string;
   processVersion: string;
   env: NodeJS.ProcessEnv;
+  tempParentDir?: string;
   ensureExecutable(file: string, label: string): Promise<void>;
   ensureDirectory(directory: string, label: string): Promise<void>;
   makeDirectory(directory: string): Promise<void>;
-  makeTempDirectory(): Promise<string>;
+  makeTempDirectory(prefix: string): Promise<string>;
+  setDirectoryPermissions?(directory: string, mode: number): Promise<void>;
   startFixtureServer(): Promise<{ server: unknown; url: string }>;
   getExecutableVersion(file: string): Promise<string>;
   getSourceCommit(sourceDir: string): Promise<string>;
@@ -253,6 +265,53 @@ const errorOutput = (error: JsonCommandErrorLike): string | undefined => {
 };
 
 const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+export const darwinBrowserSkillSocketPathLimit = 100;
+
+const browserSkillRuntimePrefix = (platform: string, tempParentDir?: string): string =>
+  join(tempParentDir ?? "/tmp", platform === "darwin" ? "qm-bsk-" : "qm-browser-skill-conformance-");
+
+export const browserSkillRuntimeLayout = (platform: string, runtimeDirectory: string): BrowserSkillRuntimeLayout => {
+  const bskHome = platform === "darwin" ? runtimeDirectory : join(runtimeDirectory, "bsk-home");
+  return {
+    runtimeDirectory,
+    bskHome,
+    daemonSocketPath: join(bskHome, "run", "daemon.sock"),
+  };
+};
+
+export async function createBrowserSkillRuntime(options: {
+  platform: string;
+  tempParentDir?: string;
+  makeTempDirectory(prefix: string): Promise<string>;
+  setDirectoryPermissions?: (directory: string, mode: number) => Promise<void>;
+  removeRuntimeDirectory?: (directory: string) => Promise<void>;
+}): Promise<BrowserSkillRuntime> {
+  let runtimeDirectory: string | null = null;
+  try {
+    runtimeDirectory = await options.makeTempDirectory(
+      browserSkillRuntimePrefix(options.platform, options.tempParentDir),
+    );
+    await options.setDirectoryPermissions?.(runtimeDirectory, 0o700);
+    const layout = browserSkillRuntimeLayout(options.platform, runtimeDirectory);
+    if (options.platform === "darwin" && layout.daemonSocketPath.length >= darwinBrowserSkillSocketPathLimit) {
+      throw new Error(
+        `BrowserSkill daemon socket path exceeded darwin limit (${layout.daemonSocketPath.length} >= ${darwinBrowserSkillSocketPathLimit})`,
+      );
+    }
+    return {
+      ...layout,
+      cleanup: async () => {
+        if (options.removeRuntimeDirectory) await options.removeRuntimeDirectory(layout.runtimeDirectory);
+      },
+    };
+  } catch (error) {
+    if (runtimeDirectory !== null && options.removeRuntimeDirectory) {
+      await options.removeRuntimeDirectory(runtimeDirectory).catch(() => undefined);
+    }
+    throw error;
+  }
+}
 
 const isTimeoutError = (error: JsonCommandErrorLike): boolean =>
   error?.code === "ABORT_ERR" || error?.name === "AbortError" || error?.code === "ETIMEDOUT";
@@ -647,7 +706,7 @@ export async function runDesktopBrowserConformance(
   if (sourceTreeStatus) throw new Error("BrowserSkill source tree must be clean");
   await deps.makeDirectory(options.outDir);
 
-  let runtimeDirectory: string | null = null;
+  let runtime: BrowserSkillRuntime | null = null;
   let environment: NodeJS.ProcessEnv | null = null;
   let immediateEnvironment: NodeJS.ProcessEnv | null = null;
   let fixture: { server: unknown; url: string } | null = null;
@@ -711,11 +770,17 @@ export async function runDesktopBrowserConformance(
   };
 
   try {
-    runtimeDirectory = await deps.makeTempDirectory();
+    runtime = await createBrowserSkillRuntime({
+      platform: deps.platform,
+      tempParentDir: deps.tempParentDir,
+      makeTempDirectory: deps.makeTempDirectory,
+      setDirectoryPermissions: deps.setDirectoryPermissions,
+      removeRuntimeDirectory: deps.removeRuntimeDirectory,
+    });
     environment = {
       ...deps.env,
       BSK_AUTO_UPDATE: "off",
-      BSK_HOME: join(runtimeDirectory, "bsk-home"),
+      BSK_HOME: runtime.bskHome,
       RUST_LOG: "error",
     };
     immediateEnvironment = immediateBrowserQueryEnvironment(environment);
@@ -724,7 +789,7 @@ export async function runDesktopBrowserConformance(
     launch.launch = buildChromeLaunchPlan({
       chromePath: options.chromePath,
       extensionDir: options.extensionDir,
-      runtimeDirectory,
+      runtimeDirectory: runtime.runtimeDirectory,
     });
     const existingDaemon = await deps.readDaemonInfo(environment.BSK_HOME ?? "");
     daemonInfo = existingDaemon;
@@ -854,10 +919,8 @@ export async function runDesktopBrowserConformance(
       const error = await recordCleanup(cleanup, "fixture-server-stop", () => deps.stopFixtureServer(fixture!.server));
       if (error) cleanupErrors.push(error);
     }
-    if (runtimeDirectory) {
-      const error = await recordCleanup(cleanup, "runtime-dir-remove", () =>
-        deps.removeRuntimeDirectory(runtimeDirectory!),
-      );
+    if (runtime) {
+      const error = await recordCleanup(cleanup, "runtime-dir-remove", () => runtime!.cleanup());
       if (error) cleanupErrors.push(error);
     }
     const finalFailure = failure ?? cleanupErrors[0] ?? null;

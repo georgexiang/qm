@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { constants as fsConstants } from "node:fs";
 import {
@@ -189,6 +188,121 @@ const watchProcess = (child, name) =>
     child.once("exit", (code, signal) => resolve({ code, signal, name }));
   });
 
+export const createNodeDesktopBrowserConformanceDeps = ({
+  platform = process.platform,
+  arch = process.arch,
+  processVersion = process.version,
+  env = process.env,
+  makeTempDirectoryImpl = mkdtemp,
+} = {}) => ({
+  platform,
+  arch,
+  processVersion,
+  env,
+  ensureExecutable,
+  ensureDirectory,
+  makeDirectory: (directory) => mkdir(directory, { recursive: true }),
+  makeTempDirectory: (prefix) => makeTempDirectoryImpl(prefix),
+  startFixtureServer,
+  getExecutableVersion: async (file) =>
+    (await runTextCommand({ file, args: ["--version"], environment: process.env, timeoutMs: commandTimeoutMs })).trim(),
+  getSourceCommit: async (sourceDir) =>
+    await runTextCommand({
+      file: "git",
+      args: ["-C", sourceDir, "rev-parse", "HEAD"],
+      environment: process.env,
+      timeoutMs: commandTimeoutMs,
+    }),
+  getSourceTreeStatus: async (sourceDir) =>
+    await runTextCommand({
+      file: "git",
+      args: ["-C", sourceDir, "status", "--porcelain=v1", "--untracked-files=no"],
+      environment: process.env,
+      timeoutMs: commandTimeoutMs,
+    }),
+  startDaemon: async (bskPath, environment) => {
+    const child = spawn(bskPath, ["daemon", "start", "--foreground", "--port", "0", "--daemon-idle", "60s"], {
+      env: environment,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const daemonStderr = captureProcessStream(child.stderr);
+    const daemonExit = watchProcess(child, "BrowserSkill daemon");
+    return {
+      pid: child.pid ?? null,
+      readStderr: daemonStderr,
+      child,
+      daemonExit,
+    };
+  },
+  waitForDaemon: async ({ daemon, environment, timeoutMs }) => {
+    const home = environment.BSK_HOME ?? "";
+    return await waitForDaemonReadiness({
+      daemon,
+      timeoutMs: Math.max(timeoutMs, daemonReadyTimeoutMs),
+      pollIntervalMs: daemonPollIntervalMs,
+      readDaemonInfo: async () => await daemonInfo(home),
+      queryStatus: async () => await callDaemon(await daemonSocketPath(home), "system.status", {}, commandTimeoutMs),
+    });
+  },
+  spawnChrome: async (plan, environment) => {
+    const child = spawn(plan.file, plan.args, {
+      env: environment,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const chromeStderr = captureProcessStream(child.stderr);
+    const chromeExit = watchProcess(child, "Chrome");
+    return {
+      pid: child.pid ?? null,
+      readStderr: chromeStderr,
+      child,
+      chromeExit,
+    };
+  },
+  writeTextFile: writeFile,
+  waitForBrowser: ({ chrome, queryBrowsers }) =>
+    Promise.race([
+      waitForBrowser(queryBrowsers),
+      chrome.chromeExit.then(({ code, signal, name }) => {
+        throw new Error(`${name} exited before BrowserSkill connected (code=${code}, signal=${signal})`);
+      }),
+    ]),
+  captureFixtures: captureBrowserSkillConformanceFixtures,
+  runBrowserSkillCommand: (bskPath, argv, environment, timeoutMs) =>
+    runJsonCommand({ file: bskPath, args: argv, environment, timeoutMs }),
+  writeManifest: writeBrowserSkillConformanceManifest,
+  readDaemonInfo: daemonInfo,
+  queryDaemonStatus: async (_bskPath, environment, timeoutMs) => ({
+    ok: true,
+    output: await callDaemon(await daemonSocketPath(environment.BSK_HOME ?? ""), "system.status", {}, timeoutMs),
+  }),
+  queryBrowsers: async (_bskPath, environment, timeoutMs) => {
+    const output = await callDaemon(
+      await daemonSocketPath(environment.BSK_HOME ?? ""),
+      "browser.list",
+      { wait_for_browser_ms: 0 },
+      timeoutMs,
+    );
+    const browsers = output && typeof output === "object" && Array.isArray(output.browsers) ? output.browsers : output;
+    return { ok: true, output: browsers };
+  },
+  stopDaemon: async (daemon) =>
+    stopChildProcess({
+      child: daemon.child,
+      exit: daemon.daemonExit,
+      name: "BrowserSkill daemon",
+      timeoutMs: daemonStopTimeoutMs,
+    }),
+  stopChrome: async (chrome) =>
+    stopChildProcess({
+      child: chrome.child,
+      exit: chrome.chromeExit,
+      name: "Chrome",
+      timeoutMs: chromeStopTimeoutMs,
+    }),
+  stopFixtureServer: closeServer,
+  removeRuntimeDirectory: (directory) => rm(directory, { recursive: true, force: true }),
+});
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   await runDesktopBrowserConformance(
@@ -212,118 +326,7 @@ async function main() {
       releaseExtensionArchiveSha256: options["release-extension-archive-sha256"],
       commandTimeoutMs,
     },
-    {
-      platform: process.platform,
-      arch: process.arch,
-      processVersion: process.version,
-      env: process.env,
-      ensureExecutable,
-      ensureDirectory,
-      makeDirectory: (directory) => mkdir(directory, { recursive: true }),
-      makeTempDirectory: () => mkdtemp(join(tmpdir(), "qm-browser-skill-conformance-")),
-      startFixtureServer,
-      getExecutableVersion: async (file) =>
-        (
-          await runTextCommand({ file, args: ["--version"], environment: process.env, timeoutMs: commandTimeoutMs })
-        ).trim(),
-      getSourceCommit: async (sourceDir) =>
-        await runTextCommand({
-          file: "git",
-          args: ["-C", sourceDir, "rev-parse", "HEAD"],
-          environment: process.env,
-          timeoutMs: commandTimeoutMs,
-        }),
-      getSourceTreeStatus: async (sourceDir) =>
-        await runTextCommand({
-          file: "git",
-          args: ["-C", sourceDir, "status", "--porcelain=v1", "--untracked-files=no"],
-          environment: process.env,
-          timeoutMs: commandTimeoutMs,
-        }),
-      startDaemon: async (bskPath, environment) => {
-        const child = spawn(bskPath, ["daemon", "start", "--foreground", "--port", "0", "--daemon-idle", "60s"], {
-          env: environment,
-          stdio: ["ignore", "ignore", "pipe"],
-        });
-        const daemonStderr = captureProcessStream(child.stderr);
-        const daemonExit = watchProcess(child, "BrowserSkill daemon");
-        return {
-          pid: child.pid ?? null,
-          readStderr: daemonStderr,
-          child,
-          daemonExit,
-        };
-      },
-      waitForDaemon: async ({ daemon, environment, timeoutMs }) => {
-        const home = environment.BSK_HOME ?? "";
-        return await waitForDaemonReadiness({
-          daemon,
-          timeoutMs: Math.max(timeoutMs, daemonReadyTimeoutMs),
-          pollIntervalMs: daemonPollIntervalMs,
-          readDaemonInfo: async () => await daemonInfo(home),
-          queryStatus: async () =>
-            await callDaemon(await daemonSocketPath(home), "system.status", {}, commandTimeoutMs),
-        });
-      },
-      spawnChrome: async (plan, environment) => {
-        const child = spawn(plan.file, plan.args, {
-          env: environment,
-          stdio: ["ignore", "ignore", "pipe"],
-        });
-        const chromeStderr = captureProcessStream(child.stderr);
-        const chromeExit = watchProcess(child, "Chrome");
-        return {
-          pid: child.pid ?? null,
-          readStderr: chromeStderr,
-          child,
-          chromeExit,
-        };
-      },
-      writeTextFile: writeFile,
-      waitForBrowser: ({ chrome, queryBrowsers }) =>
-        Promise.race([
-          waitForBrowser(queryBrowsers),
-          chrome.chromeExit.then(({ code, signal, name }) => {
-            throw new Error(`${name} exited before BrowserSkill connected (code=${code}, signal=${signal})`);
-          }),
-        ]),
-      captureFixtures: captureBrowserSkillConformanceFixtures,
-      runBrowserSkillCommand: (bskPath, argv, environment, timeoutMs) =>
-        runJsonCommand({ file: bskPath, args: argv, environment, timeoutMs }),
-      writeManifest: writeBrowserSkillConformanceManifest,
-      readDaemonInfo: daemonInfo,
-      queryDaemonStatus: async (_bskPath, environment, timeoutMs) => ({
-        ok: true,
-        output: await callDaemon(await daemonSocketPath(environment.BSK_HOME ?? ""), "system.status", {}, timeoutMs),
-      }),
-      queryBrowsers: async (_bskPath, environment, timeoutMs) => {
-        const output = await callDaemon(
-          await daemonSocketPath(environment.BSK_HOME ?? ""),
-          "browser.list",
-          { wait_for_browser_ms: 0 },
-          timeoutMs,
-        );
-        const browsers =
-          output && typeof output === "object" && Array.isArray(output.browsers) ? output.browsers : output;
-        return { ok: true, output: browsers };
-      },
-      stopDaemon: async (daemon) =>
-        stopChildProcess({
-          child: daemon.child,
-          exit: daemon.daemonExit,
-          name: "BrowserSkill daemon",
-          timeoutMs: daemonStopTimeoutMs,
-        }),
-      stopChrome: async (chrome) =>
-        stopChildProcess({
-          child: chrome.child,
-          exit: chrome.chromeExit,
-          name: "Chrome",
-          timeoutMs: chromeStopTimeoutMs,
-        }),
-      stopFixtureServer: closeServer,
-      removeRuntimeDirectory: (directory) => rm(directory, { recursive: true, force: true }),
-    },
+    createNodeDesktopBrowserConformanceDeps(),
   );
 }
 
