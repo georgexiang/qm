@@ -12,13 +12,17 @@ import {
   runJsonCommand,
   stopChildProcess,
   runTextCommand,
+  waitForDaemonReadiness,
   writeBrowserSkillConformanceManifest,
 } from "./desktop-browser-conformance.ts";
 
 const expectedSourceCommit = "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c";
 const commandTimeoutMs = 15_000;
+const daemonReadyTimeoutMs = 15_000;
+const daemonPollIntervalMs = 250;
 const browserConnectTimeoutMs = 45_000;
 const browserPollIntervalMs = 1_000;
+const daemonStopTimeoutMs = 5_000;
 const chromeStopTimeoutMs = 5_000;
 
 const parseArgs = (argv) => {
@@ -45,11 +49,11 @@ const parseArgs = (argv) => {
   return options;
 };
 
-const captureProcessStream = (stream) => {
+const captureProcessStream = (stream, maxChars = 4096) => {
   let text = "";
   stream?.setEncoding?.("utf8");
   stream?.on?.("data", (chunk) => {
-    text += chunk;
+    text = `${text}${chunk}`.slice(-maxChars);
   });
   return () => text;
 };
@@ -236,8 +240,30 @@ async function main() {
           environment: process.env,
           timeoutMs: commandTimeoutMs,
         }),
-      startDaemon: async (bskPath, environment, timeoutMs) => {
-        await runTextCommand({ file: bskPath, args: ["daemon", "start"], environment, timeoutMs });
+      startDaemon: async (bskPath, environment) => {
+        const child = spawn(bskPath, ["daemon", "start", "--foreground", "--port", "0", "--daemon-idle", "60s"], {
+          env: environment,
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        const daemonStderr = captureProcessStream(child.stderr);
+        const daemonExit = watchProcess(child, "BrowserSkill daemon");
+        return {
+          pid: child.pid ?? null,
+          readStderr: daemonStderr,
+          child,
+          daemonExit,
+        };
+      },
+      waitForDaemon: async ({ daemon, environment, timeoutMs }) => {
+        const home = environment.BSK_HOME ?? "";
+        return await waitForDaemonReadiness({
+          daemon,
+          timeoutMs: Math.max(timeoutMs, daemonReadyTimeoutMs),
+          pollIntervalMs: daemonPollIntervalMs,
+          readDaemonInfo: async () => await daemonInfo(home),
+          queryStatus: async () =>
+            await callDaemon(await daemonSocketPath(home), "system.status", {}, commandTimeoutMs),
+        });
       },
       spawnChrome: async (plan, environment) => {
         const child = spawn(plan.file, plan.args, {
@@ -281,9 +307,13 @@ async function main() {
           output && typeof output === "object" && Array.isArray(output.browsers) ? output.browsers : output;
         return { ok: true, output: browsers };
       },
-      stopDaemon: async (bskPath, environment, timeoutMs) => {
-        await runTextCommand({ file: bskPath, args: ["daemon", "stop"], environment, timeoutMs });
-      },
+      stopDaemon: async (daemon) =>
+        stopChildProcess({
+          child: daemon.child,
+          exit: daemon.daemonExit,
+          name: "BrowserSkill daemon",
+          timeoutMs: daemonStopTimeoutMs,
+        }),
       stopChrome: async (chrome) =>
         stopChildProcess({
           child: chrome.child,

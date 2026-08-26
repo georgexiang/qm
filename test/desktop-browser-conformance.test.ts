@@ -13,6 +13,7 @@ import {
   runJsonCommand,
   runTextCommand,
   stopChildProcess,
+  waitForDaemonReadiness,
   writeBrowserSkillConformanceManifest,
 } from "../scripts/desktop-browser-conformance.ts";
 
@@ -501,6 +502,62 @@ test("runTextCommand wraps timeouts with stable command context", async () => {
   assert.ok(Date.now() - started < 400);
 });
 
+test("waitForDaemonReadiness allows readiness that takes longer than detached CLI startup", async () => {
+  const sleeps: number[] = [];
+  const daemon = {
+    readStderr: () => "",
+    daemonExit: new Promise<{ code: number | null; signal: NodeJS.Signals | null; name: string }>(() => undefined),
+  };
+  const statusCalls: string[] = [];
+  let now = 0;
+  let daemonInfoReads = 0;
+
+  const ready = await waitForDaemonReadiness({
+    daemon,
+    timeoutMs: 15_000,
+    pollIntervalMs: 1_000,
+    readDaemonInfo: async () => {
+      daemonInfoReads += 1;
+      if (daemonInfoReads < 5) return null;
+      return daemonRecord({ state: "ready-after-4s" });
+    },
+    queryStatus: async () => {
+      statusCalls.push("status");
+      return { ok: true, output: { state: "ready-after-4s" } };
+    },
+    now: () => now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+  });
+
+  assert.deepEqual(ready, daemonRecord({ state: "ready-after-4s" }));
+  assert.equal(statusCalls.length, 1);
+  assert.deepEqual(sleeps, [1000, 1000, 1000, 1000]);
+});
+
+test("waitForDaemonReadiness races daemon early exit and reports bounded stderr", async () => {
+  await assert.rejects(
+    waitForDaemonReadiness({
+      daemon: {
+        readStderr: () => "x".repeat(5000),
+        daemonExit: Promise.resolve({ code: 17, signal: null, name: "BrowserSkill daemon" }),
+      },
+      timeoutMs: 15_000,
+      readDaemonInfo: async () => null,
+      queryStatus: async () => ({ ok: true, output: { state: "never" } }),
+      sleep: async () => undefined,
+    }),
+    (error) => {
+      assert.match(String(error), /BrowserSkill daemon exited before readiness/);
+      assert.match(String(error), /code=17/);
+      assert.match(String(error), /stderr: x{256}$/);
+      return true;
+    },
+  );
+});
+
 test("setup failures before Chrome spawn still clean every acquired resource and preserve diagnostics", async () => {
   const calls: string[] = [];
   const writes = new Map<string, string>();
@@ -559,6 +616,11 @@ test("setup failures before Chrome spawn still clean every acquired resource and
         },
         startDaemon: async () => {
           calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return daemonRecord({ state: "before-cleanup" });
         },
         spawnChrome: async () => {
           calls.push("chrome:spawn");
@@ -700,6 +762,11 @@ test("pre-provenance failures still persist partial Chrome diagnostics and clean
         getSourceTreeStatus: async () => "",
         startDaemon: async () => {
           calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return daemonRecord({ state: "before-cleanup" });
         },
         spawnChrome: async () => {
           calls.push("chrome:spawn");
@@ -822,6 +889,11 @@ test("cleanup failures do not stop later teardown steps after a run failure", as
         getSourceTreeStatus: async () => "",
         startDaemon: async () => {
           calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return daemonRecord({ state: "before-cleanup" });
         },
         spawnChrome: async () => {
           calls.push("chrome:spawn");
@@ -930,6 +1002,11 @@ test("refuses to reuse daemon state that already exists before start", async () 
         getSourceTreeStatus: async () => "",
         startDaemon: async () => {
           calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return daemonRecord({ state: "wrong-pid" });
         },
         spawnChrome: async () => {
           calls.push("chrome:spawn");
@@ -1060,6 +1137,11 @@ test("fails closed when daemon ownership changes before browser polling", async 
         getSourceTreeStatus: async () => "",
         startDaemon: async () => {
           calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return owned;
         },
         spawnChrome: async () => {
           calls.push("chrome:spawn");
@@ -1085,7 +1167,6 @@ test("fails closed when daemon ownership changes before browser polling", async 
           calls.push("daemon:info");
           daemonInfoReads += 1;
           if (daemonInfoReads === 1) return null;
-          if (daemonInfoReads === 2) return owned;
           return replacement;
         },
         queryDaemonStatus: async () => {
@@ -1116,7 +1197,7 @@ test("fails closed when daemon ownership changes before browser polling", async 
   assert.equal(calls.includes("daemon:browsers"), false);
   assert.equal(calls.includes("runBrowserSkillCommand"), false);
   assert.equal(calls.includes("daemon:status:diagnostics"), false);
-  assert.equal(calls.includes("cleanup:daemon-stop"), false);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
   assert.deepEqual(JSON.parse(writes.get("/out/failure-diagnostics.json") ?? "null"), {
     error: "BrowserSkill daemon ownership lost before browser poll",
     chrome: {
@@ -1159,12 +1240,182 @@ test("fails closed when daemon ownership changes before browser polling", async 
       actual: replacement,
     },
     cleanup: [
-      { step: "daemon-stop", ok: false, error: "BrowserSkill daemon ownership lost before cleanup" },
+      { step: "daemon-stop", ok: true },
       { step: "chrome-stop", ok: true },
       { step: "fixture-server-stop", ok: true },
       { step: "runtime-dir-remove", ok: true },
     ],
   });
+});
+
+test("fails closed when daemon readiness publishes a different pid than the owned child", async () => {
+  const calls: string[] = [];
+
+  await assert.rejects(
+    runDesktopBrowserConformance(
+      {
+        sourceDir: "/source",
+        expectedSourceCommit: sourceCommit,
+        bskPath: "/tool/bsk",
+        extensionDir: "/tool/extension",
+        extensionZipPath: "/tool/extension.zip",
+        chromePath: "/tool/chrome",
+        chromeVersion: "152.0.7977.64",
+        chromeUrl:
+          "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip",
+        chromeArchiveSha256: "10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f",
+        outDir: "/out",
+        mode: "baseline-source-build",
+        commandTimeoutMs: 15_000,
+      },
+      {
+        platform: "darwin",
+        arch: "arm64",
+        processVersion: "v24.15.0",
+        env: {},
+        ensureExecutable: async () => undefined,
+        ensureDirectory: async () => undefined,
+        makeDirectory: async () => undefined,
+        makeTempDirectory: async () => "/runtime",
+        startFixtureServer: async () => ({ server: "fixture-server", url: "http://127.0.0.1:43123/" }),
+        getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
+        getSourceCommit: async () => sourceCommit,
+        getSourceTreeStatus: async () => "",
+        startDaemon: async () => {
+          calls.push("daemon:start");
+          return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+        },
+        waitForDaemon: async () => {
+          calls.push("daemon:wait");
+          return daemonRecord({ pid: 654, state: "wrong-pid" });
+        },
+        spawnChrome: async () => {
+          calls.push("chrome:spawn");
+          throw new Error("chrome should not spawn");
+        },
+        writeTextFile: async () => undefined,
+        waitForBrowser: async () => "browser-123",
+        captureFixtures: async () => {
+          throw new Error("capture should not run");
+        },
+        runBrowserSkillCommand: async () => ({ ok: true, output: {} }),
+        writeManifest: async () => undefined,
+        readDaemonInfo: async () => {
+          calls.push("daemon:info");
+          return calls.filter((call) => call === "daemon:info").length === 1
+            ? null
+            : daemonRecord({ pid: 654, state: "wrong-pid" });
+        },
+        queryDaemonStatus: async () => ({ ok: true, output: { state: "wrong-pid" } }),
+        queryBrowsers: async () => ({ ok: true, output: [] }),
+        stopDaemon: async () => {
+          calls.push("cleanup:daemon-stop");
+        },
+        stopChrome: async () => {
+          calls.push("cleanup:chrome-stop");
+        },
+        stopFixtureServer: async () => {
+          calls.push("cleanup:fixture-server-stop");
+        },
+        removeRuntimeDirectory: async () => {
+          calls.push("cleanup:runtime-dir-remove");
+        },
+      },
+    ),
+    /owned child pid 321.*daemon pid 654|daemon pid 654.*owned child pid 321/,
+  );
+
+  assert.equal(calls.includes("chrome:spawn"), false);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
+});
+
+test("cleanup stops the owned daemon child directly even if daemon.json changes before teardown", async () => {
+  const calls: string[] = [];
+  let daemonInfoReads = 0;
+
+  await runDesktopBrowserConformance(
+    {
+      sourceDir: "/source",
+      expectedSourceCommit: sourceCommit,
+      bskPath: "/tool/bsk",
+      extensionDir: "/tool/extension",
+      extensionZipPath: "/tool/extension.zip",
+      chromePath: "/tool/chrome",
+      chromeVersion: "152.0.7977.64",
+      chromeUrl:
+        "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip",
+      chromeArchiveSha256: "10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f",
+      outDir: "/out",
+      mode: "baseline-source-build",
+      commandTimeoutMs: 15_000,
+    },
+    {
+      platform: "darwin",
+      arch: "arm64",
+      processVersion: "v24.15.0",
+      env: {},
+      ensureExecutable: async () => undefined,
+      ensureDirectory: async () => undefined,
+      makeDirectory: async () => undefined,
+      makeTempDirectory: async () => "/runtime",
+      startFixtureServer: async () => ({ server: "fixture-server", url: "http://127.0.0.1:43123/" }),
+      getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
+      getSourceCommit: async () => sourceCommit,
+      getSourceTreeStatus: async () => "",
+      startDaemon: async () => {
+        calls.push("daemon:start");
+        return { pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) };
+      },
+      waitForDaemon: async () => {
+        calls.push("daemon:wait");
+        return daemonRecord({ state: "owned-before-cleanup" });
+      },
+      spawnChrome: async () => ({ pid: 999, readStderr: () => "" }),
+      writeTextFile: async () => undefined,
+      waitForBrowser: async () => "browser-123",
+      captureFixtures: async () => ({
+        fixtures: {
+          "session.start": { success: {}, error: {} },
+          navigate: { success: { text: "Phase F fixture" }, error: {} },
+          observe: { success: { text: "Phase F fixture" }, error: {} },
+          "session.stop": { success: {}, error: {} },
+        },
+        dynamic: {
+          sessionId: "session-1",
+          browserInstanceId: "browser-123",
+          agentWindowId: 7,
+          tabId: 9,
+          fixturePort: 43123,
+        },
+      }),
+      runBrowserSkillCommand: async () => ({ ok: true, output: {} }),
+      writeManifest: async () => {
+        calls.push("writeManifest");
+      },
+      readDaemonInfo: async () => {
+        daemonInfoReads += 1;
+        if (daemonInfoReads === 1) return null;
+        return daemonRecord({ pid: 654, sock_path: "/runtime/bsk-home/run/replacement.sock", state: "replacement" });
+      },
+      queryDaemonStatus: async () => ({ ok: true, output: { state: "owned-before-cleanup" } }),
+      queryBrowsers: async () => ({ ok: true, output: [{ instance_id: "browser-123" }] }),
+      stopDaemon: async () => {
+        calls.push("cleanup:daemon-stop");
+      },
+      stopChrome: async () => {
+        calls.push("cleanup:chrome-stop");
+      },
+      stopFixtureServer: async () => {
+        calls.push("cleanup:fixture-server-stop");
+      },
+      removeRuntimeDirectory: async () => {
+        calls.push("cleanup:runtime-dir-remove");
+      },
+    },
+  );
+
+  assert.equal(calls.includes("writeManifest"), true);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
 });
 
 test("fails closed when daemon ownership changes before fixture commands", async () => {
@@ -1208,7 +1459,8 @@ test("fails closed when daemon ownership changes before fixture commands", async
         getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
         getSourceCommit: async () => sourceCommit,
         getSourceTreeStatus: async () => "",
-        startDaemon: async () => undefined,
+        startDaemon: async () => ({ pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) }),
+        waitForDaemon: async () => owned,
         spawnChrome: async () => ({ pid: 321, readStderr: () => "" }),
         writeTextFile: async () => undefined,
         waitForBrowser: async ({ queryBrowsers }) => {
@@ -1229,7 +1481,7 @@ test("fails closed when daemon ownership changes before fixture commands", async
         readDaemonInfo: async () => {
           daemonInfoReads += 1;
           if (daemonInfoReads === 1) return null;
-          if (daemonInfoReads <= 3) return owned;
+          if (daemonInfoReads === 2) return owned;
           return replacement;
         },
         queryDaemonStatus: async () => {
@@ -1261,7 +1513,7 @@ test("fails closed when daemon ownership changes before fixture commands", async
   assert.equal(calls.includes("daemon:browsers"), true);
   assert.equal(calls.includes("runBrowserSkillCommand"), false);
   assert.equal(calls.includes("daemon:status:diagnostics"), false);
-  assert.equal(calls.includes("cleanup:daemon-stop"), false);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
 });
 
 test("failure diagnostics report ownership loss without querying replacement daemons", async () => {
@@ -1306,7 +1558,8 @@ test("failure diagnostics report ownership loss without querying replacement dae
         getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
         getSourceCommit: async () => sourceCommit,
         getSourceTreeStatus: async () => "",
-        startDaemon: async () => undefined,
+        startDaemon: async () => ({ pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) }),
+        waitForDaemon: async () => owned,
         spawnChrome: async () => ({ pid: 321, readStderr: () => "" }),
         writeTextFile: async (filePath, text) => {
           writes.set(filePath, text);
@@ -1334,7 +1587,6 @@ test("failure diagnostics report ownership loss without querying replacement dae
         readDaemonInfo: async () => {
           daemonInfoReads += 1;
           if (daemonInfoReads === 1) return null;
-          if (daemonInfoReads === 2) return owned;
           return replacement;
         },
         queryDaemonStatus: async () => {
@@ -1364,7 +1616,7 @@ test("failure diagnostics report ownership loss without querying replacement dae
 
   assert.equal(calls.includes("daemon:status:diagnostics"), false);
   assert.equal(calls.includes("daemon:browsers:diagnostics"), false);
-  assert.equal(calls.includes("cleanup:daemon-stop"), false);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
   const diagnostics = JSON.parse(writes.get("/out/failure-diagnostics.json") ?? "null");
   assert.deepEqual(diagnostics.daemon, replacement);
   assert.deepEqual(diagnostics.status, {
@@ -1381,7 +1633,7 @@ test("failure diagnostics report ownership loss without querying replacement dae
   });
 });
 
-test("cleanup refuses to stop a replacement daemon after a successful run", async () => {
+test("successful runs still stop the owned daemon child after daemon.json changes", async () => {
   const calls: string[] = [];
   const writes = new Map<string, string>();
   const owned = daemonRecord({ state: "owned-before-cleanup" });
@@ -1393,131 +1645,92 @@ test("cleanup refuses to stop a replacement daemon after a successful run", asyn
   });
   let daemonInfoReads = 0;
 
-  await assert.rejects(
-    runDesktopBrowserConformance(
-      {
-        sourceDir: "/source",
-        expectedSourceCommit: sourceCommit,
-        bskPath: "/tool/bsk",
-        extensionDir: "/tool/extension",
-        extensionZipPath: "/tool/extension.zip",
-        chromePath: "/tool/chrome",
-        chromeVersion: "152.0.7977.64",
-        chromeUrl:
-          "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip",
-        chromeArchiveSha256: "10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f",
-        outDir: "/out",
-        mode: "baseline-source-build",
-        commandTimeoutMs: 15_000,
+  await runDesktopBrowserConformance(
+    {
+      sourceDir: "/source",
+      expectedSourceCommit: sourceCommit,
+      bskPath: "/tool/bsk",
+      extensionDir: "/tool/extension",
+      extensionZipPath: "/tool/extension.zip",
+      chromePath: "/tool/chrome",
+      chromeVersion: "152.0.7977.64",
+      chromeUrl:
+        "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip",
+      chromeArchiveSha256: "10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f",
+      outDir: "/out",
+      mode: "baseline-source-build",
+      commandTimeoutMs: 15_000,
+    },
+    {
+      platform: "darwin",
+      arch: "arm64",
+      processVersion: "v24.15.0",
+      env: {},
+      ensureExecutable: async () => undefined,
+      ensureDirectory: async () => undefined,
+      makeDirectory: async () => undefined,
+      makeTempDirectory: async () => "/runtime",
+      startFixtureServer: async () => ({ server: "fixture-server", url: "http://127.0.0.1:43123/" }),
+      getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
+      getSourceCommit: async () => sourceCommit,
+      getSourceTreeStatus: async () => "",
+      startDaemon: async () => ({ pid: 321, readStderr: () => "", daemonExit: new Promise(() => undefined) }),
+      waitForDaemon: async () => owned,
+      spawnChrome: async () => ({ pid: 321, readStderr: () => "" }),
+      writeTextFile: async (filePath, text) => {
+        writes.set(filePath, text);
       },
-      {
-        platform: "darwin",
-        arch: "arm64",
-        processVersion: "v24.15.0",
-        env: {},
-        ensureExecutable: async () => undefined,
-        ensureDirectory: async () => undefined,
-        makeDirectory: async () => undefined,
-        makeTempDirectory: async () => "/runtime",
-        startFixtureServer: async () => ({ server: "fixture-server", url: "http://127.0.0.1:43123/" }),
-        getExecutableVersion: async () => "Google Chrome for Testing 152.0.7977.64",
-        getSourceCommit: async () => sourceCommit,
-        getSourceTreeStatus: async () => "",
-        startDaemon: async () => undefined,
-        spawnChrome: async () => ({ pid: 321, readStderr: () => "" }),
-        writeTextFile: async (filePath, text) => {
-          writes.set(filePath, text);
+      waitForBrowser: async () => "browser-123",
+      captureFixtures: async () => ({
+        fixtures: {
+          "session.start": { success: {}, error: {} },
+          navigate: { success: { text: "Phase F fixture" }, error: {} },
+          observe: { success: { text: "Phase F fixture" }, error: {} },
+          "session.stop": { success: {}, error: {} },
         },
-        waitForBrowser: async () => "browser-123",
-        captureFixtures: async () => ({
-          fixtures: {
-            "session.start": { success: {}, error: {} },
-            navigate: { success: { text: "Phase F fixture" }, error: {} },
-            observe: { success: { text: "Phase F fixture" }, error: {} },
-            "session.stop": { success: {}, error: {} },
-          },
-          dynamic: {
-            sessionId: "session-1",
-            browserInstanceId: "browser-123",
-            agentWindowId: 7,
-            tabId: 9,
-            fixturePort: 43123,
-          },
-        }),
-        runBrowserSkillCommand: async () => ({ ok: true, output: {} }),
-        writeManifest: async () => {
-          calls.push("writeManifest");
+        dynamic: {
+          sessionId: "session-1",
+          browserInstanceId: "browser-123",
+          agentWindowId: 7,
+          tabId: 9,
+          fixturePort: 43123,
         },
-        readDaemonInfo: async () => {
-          daemonInfoReads += 1;
-          if (daemonInfoReads === 1) return null;
-          if (daemonInfoReads === 2) return owned;
-          return replacement;
-        },
-        queryDaemonStatus: async () => ({ ok: true, output: { state: "unused" } }),
-        queryBrowsers: async () => ({ ok: true, output: [{ instance_id: "browser-123" }] }),
-        stopDaemon: async () => {
-          calls.push("cleanup:daemon-stop");
-        },
-        stopChrome: async () => {
-          calls.push("cleanup:chrome-stop");
-        },
-        stopFixtureServer: async () => {
-          calls.push("cleanup:fixture-server-stop");
-        },
-        removeRuntimeDirectory: async () => {
-          calls.push("cleanup:runtime-dir-remove");
-        },
+      }),
+      runBrowserSkillCommand: async () => ({ ok: true, output: {} }),
+      writeManifest: async () => {
+        calls.push("writeManifest");
       },
-    ),
-    /BrowserSkill daemon ownership lost before cleanup/,
+      readDaemonInfo: async () => {
+        daemonInfoReads += 1;
+        if (daemonInfoReads === 1) return null;
+        if (daemonInfoReads === 2) return owned;
+        return replacement;
+      },
+      queryDaemonStatus: async () => ({ ok: true, output: { state: "unused" } }),
+      queryBrowsers: async () => ({ ok: true, output: [{ instance_id: "browser-123" }] }),
+      stopDaemon: async () => {
+        calls.push("cleanup:daemon-stop");
+      },
+      stopChrome: async () => {
+        calls.push("cleanup:chrome-stop");
+      },
+      stopFixtureServer: async () => {
+        calls.push("cleanup:fixture-server-stop");
+      },
+      removeRuntimeDirectory: async () => {
+        calls.push("cleanup:runtime-dir-remove");
+      },
+    },
   );
 
   assert.equal(calls.includes("writeManifest"), true);
-  assert.equal(calls.includes("cleanup:daemon-stop"), false);
+  assert.equal(calls.includes("cleanup:daemon-stop"), true);
   assert.deepEqual(calls.slice(-3), [
     "cleanup:chrome-stop",
     "cleanup:fixture-server-stop",
     "cleanup:runtime-dir-remove",
   ]);
-  assert.deepEqual(JSON.parse(writes.get("/out/failure-diagnostics.json") ?? "null"), {
-    error: "BrowserSkill daemon ownership lost before cleanup",
-    chrome: {
-      chromePath: "/tool/chrome",
-      launch: {
-        file: "/tool/chrome",
-        args: [
-          "--user-data-dir=/runtime/chrome-profile",
-          "--disable-extensions-except=/tool/extension",
-          "--load-extension=/tool/extension",
-          "--no-first-run",
-          "--no-default-browser-check",
-          "about:blank",
-        ],
-      },
-      pid: 321,
-      mode: "baseline-source-build",
-      platform: "darwin-arm64",
-      stderr: "",
-      provenance: {
-        version: "152.0.7977.64",
-        downloadUrl:
-          "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip",
-        archiveSha256: "10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f",
-        executableVersion: "Google Chrome for Testing 152.0.7977.64",
-        complete: true,
-      },
-    },
-    daemon: replacement,
-    status: null,
-    browsers: null,
-    cleanup: [
-      { step: "daemon-stop", ok: false, error: "BrowserSkill daemon ownership lost before cleanup" },
-      { step: "chrome-stop", ok: true },
-      { step: "fixture-server-stop", ok: true },
-      { step: "runtime-dir-remove", ok: true },
-    ],
-  });
+  assert.equal(writes.has("/out/failure-diagnostics.json"), false);
 });
 
 test("buildFailureDiagnostics keeps launch, browser, daemon, and cleanup evidence together", () => {

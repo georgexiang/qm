@@ -150,6 +150,13 @@ export interface DesktopBrowserConformanceChromeHandle {
   chromeExit?: Promise<{ code: number | null; signal: NodeJS.Signals | null; name: string }>;
 }
 
+export interface DesktopBrowserConformanceDaemonHandle {
+  pid: number | null;
+  readStderr: () => string;
+  child?: KillableProcess;
+  daemonExit?: Promise<{ code: number | null; signal: NodeJS.Signals | null; name: string }>;
+}
+
 interface DesktopBrowserFailureEvidence {
   daemon: unknown;
   status: unknown;
@@ -181,7 +188,16 @@ export interface DesktopBrowserConformanceDeps {
   getExecutableVersion(file: string): Promise<string>;
   getSourceCommit(sourceDir: string): Promise<string>;
   getSourceTreeStatus(sourceDir: string): Promise<string>;
-  startDaemon(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<void>;
+  startDaemon(
+    bskPath: string,
+    environment: NodeJS.ProcessEnv,
+    timeoutMs: number,
+  ): Promise<DesktopBrowserConformanceDaemonHandle>;
+  waitForDaemon(options: {
+    daemon: DesktopBrowserConformanceDaemonHandle;
+    environment: NodeJS.ProcessEnv;
+    timeoutMs: number;
+  }): Promise<unknown>;
   spawnChrome(plan: ChromeLaunchPlan, environment: NodeJS.ProcessEnv): Promise<DesktopBrowserConformanceChromeHandle>;
   writeTextFile(filePath: string, text: string): Promise<void>;
   waitForBrowser(options: {
@@ -206,7 +222,7 @@ export interface DesktopBrowserConformanceDeps {
   readDaemonInfo(home: string): Promise<unknown>;
   queryDaemonStatus(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<unknown>;
   queryBrowsers(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<unknown>;
-  stopDaemon(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<void>;
+  stopDaemon(daemon: DesktopBrowserConformanceDaemonHandle, timeoutMs: number): Promise<void>;
   stopChrome(chrome: DesktopBrowserConformanceChromeHandle): Promise<void>;
   stopFixtureServer(server: unknown): Promise<void>;
   removeRuntimeDirectory(directory: string): Promise<void>;
@@ -368,6 +384,92 @@ export async function stopChildProcess(options: {
 
 export function immediateBrowserQueryEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...environment, BSK_BROWSER_WAIT_MS: "0" };
+}
+
+const sleepFor = async (timeoutMs: number): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+};
+
+const boundedTail = (text: string, maxChars: number): string => {
+  if (maxChars <= 0 || text.length <= maxChars) return text;
+  return text.slice(-maxChars);
+};
+
+const daemonExitedBeforeReadinessError = (
+  exit: { code: number | null; signal: NodeJS.Signals | null; name: string },
+  readStderr: () => string,
+  stderrTailChars: number,
+): Error => {
+  const stderr = boundedTail(readStderr().trim(), stderrTailChars);
+  return new Error(
+    `${exit.name} exited before readiness (code=${exit.code}, signal=${exit.signal})${stderr ? `; stderr: ${stderr}` : ""}`,
+  );
+};
+
+const raceDaemonExit = async <T>(
+  daemon: Pick<DesktopBrowserConformanceDaemonHandle, "daemonExit" | "readStderr">,
+  operation: Promise<T>,
+  stderrTailChars: number,
+): Promise<T> => {
+  if (!daemon.daemonExit) return await operation;
+  const result = await Promise.race([
+    operation.then((value) => ({ kind: "value" as const, value })),
+    daemon.daemonExit.then((exit) => ({ kind: "exit" as const, exit })),
+  ]);
+  if (result.kind === "exit") {
+    throw daemonExitedBeforeReadinessError(result.exit, daemon.readStderr, stderrTailChars);
+  }
+  return result.value;
+};
+
+export async function waitForDaemonReadiness(options: {
+  daemon: Pick<DesktopBrowserConformanceDaemonHandle, "daemonExit" | "readStderr">;
+  timeoutMs: number;
+  pollIntervalMs?: number;
+  stderrTailChars?: number;
+  readDaemonInfo: () => Promise<unknown>;
+  queryStatus: () => Promise<unknown>;
+  now?: () => number;
+  sleep?: (timeoutMs: number) => Promise<void>;
+}): Promise<unknown> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? sleepFor;
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 250);
+  const stderrTailChars = options.stderrTailChars ?? 256;
+  const deadline = now() + options.timeoutMs;
+  let lastStatusError: unknown = null;
+  let exited: { code: number | null; signal: NodeJS.Signals | null; name: string } | null = null;
+
+  options.daemon.daemonExit?.then((exit) => {
+    exited = exit;
+  });
+
+  const throwIfExited = (): void => {
+    if (!exited) return;
+    throw daemonExitedBeforeReadinessError(exited, options.daemon.readStderr, stderrTailChars);
+  };
+
+  while (true) {
+    throwIfExited();
+    const info = await raceDaemonExit(options.daemon, options.readDaemonInfo(), stderrTailChars);
+    throwIfExited();
+    if (info !== null) {
+      try {
+        await raceDaemonExit(options.daemon, Promise.resolve(options.queryStatus()), stderrTailChars);
+        throwIfExited();
+        return info;
+      } catch (error) {
+        lastStatusError = error;
+      }
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    await raceDaemonExit(options.daemon, sleep(Math.min(pollIntervalMs, remaining)), stderrTailChars);
+  }
+
+  throw new Error(
+    `BrowserSkill daemon did not become ready within ${options.timeoutMs}ms${lastStatusError ? `: ${describeError(lastStatusError)}` : ""}`,
+  );
 }
 
 const sourceBuildProvenance = (sourceDir: string): SourceBuildProvenance => ({
@@ -549,6 +651,7 @@ export async function runDesktopBrowserConformance(
   let environment: NodeJS.ProcessEnv | null = null;
   let immediateEnvironment: NodeJS.ProcessEnv | null = null;
   let fixture: { server: unknown; url: string } | null = null;
+  let daemon: DesktopBrowserConformanceDaemonHandle | null = null;
   let chrome: DesktopBrowserConformanceChromeHandle | null = null;
   let daemonInfo: unknown = null;
   let daemonIdentityOwned: DesktopBrowserDaemonIdentity | null = null;
@@ -575,6 +678,7 @@ export async function runDesktopBrowserConformance(
     mode,
     platform: `${deps.platform}-${deps.arch}`,
   };
+  const daemonLaunchRecord: { pid: number | null; identity: JsonObject | null } = { pid: null, identity: null };
 
   const readOwnedDaemon = async (fresh = false): Promise<DesktopBrowserDaemonEvidence> => {
     if (!environment) return { info: null, owned: false, identity: null };
@@ -628,8 +732,12 @@ export async function runDesktopBrowserConformance(
       throw new Error("BrowserSkill runtime home was not clean before daemon start");
     }
     daemonHomeCheckedClean = true;
-    await deps.startDaemon(options.bskPath, environment, options.commandTimeoutMs);
-    const startedDaemon = await deps.readDaemonInfo(environment.BSK_HOME ?? "");
+    daemon = await deps.startDaemon(options.bskPath, environment, options.commandTimeoutMs);
+    const startedDaemon = await deps.waitForDaemon({
+      daemon,
+      environment,
+      timeoutMs: options.commandTimeoutMs,
+    });
     daemonInfo = startedDaemon;
     if (startedDaemon === null) {
       throw new Error("BrowserSkill daemon start did not publish daemon.json before Chrome launch");
@@ -640,10 +748,20 @@ export async function runDesktopBrowserConformance(
         "BrowserSkill daemon start did not publish a verifiable daemon.json identity before Chrome launch",
       );
     }
+    if (daemon.pid === null) {
+      throw new Error("BrowserSkill daemon child pid was unavailable before Chrome launch");
+    }
+    if (daemonIdentityOwned.pid !== daemon.pid) {
+      throw new Error(
+        `BrowserSkill daemon readiness published daemon pid ${daemonIdentityOwned.pid} instead of owned child pid ${daemon.pid}`,
+      );
+    }
     daemonAcquired = true;
+    daemonLaunchRecord.pid = daemon.pid;
+    daemonLaunchRecord.identity = daemonIdentityEvidence(daemonIdentityOwned);
     await deps.writeTextFile(
       join(options.outDir, "launch.json"),
-      `${JSON.stringify({ ...launch, browser: chromeProvenance }, null, 2)}\n`,
+      `${JSON.stringify({ ...launch, daemon: daemonLaunchRecord, browser: chromeProvenance }, null, 2)}\n`,
     );
     chrome = await deps.spawnChrome(launch.launch, environment);
     launch.pid = chrome.pid ?? null;
@@ -722,15 +840,11 @@ export async function runDesktopBrowserConformance(
         browsers,
       };
     }
-    if (daemonAcquired && environment) {
+    if (daemon) {
       const error = await recordCleanup(cleanup, "daemon-stop", () =>
-        deps.stopDaemon(options.bskPath, environment!, options.commandTimeoutMs),
+        deps.stopDaemon(daemon!, options.commandTimeoutMs),
       );
       if (error) cleanupErrors.push(error);
-    } else if (daemonIdentityOwned !== null) {
-      const error = new Error(ownershipLostMessage("cleanup"));
-      cleanup.push({ step: "daemon-stop", ok: false, error: describeError(error) });
-      cleanupErrors.push(error);
     }
     if (chrome) {
       const error = await recordCleanup(cleanup, "chrome-stop", () => deps.stopChrome(chrome!));
