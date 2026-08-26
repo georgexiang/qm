@@ -156,6 +156,18 @@ interface DesktopBrowserFailureEvidence {
   browsers: unknown;
 }
 
+interface DesktopBrowserDaemonIdentity {
+  pid: number;
+  sockPath: string;
+  startedAtEpochSecs: number;
+}
+
+interface DesktopBrowserDaemonEvidence {
+  info: unknown;
+  owned: boolean;
+  identity: DesktopBrowserDaemonIdentity | null;
+}
+
 export interface DesktopBrowserConformanceDeps {
   platform: string;
   arch: string;
@@ -169,7 +181,7 @@ export interface DesktopBrowserConformanceDeps {
   getExecutableVersion(file: string): Promise<string>;
   getSourceCommit(sourceDir: string): Promise<string>;
   getSourceTreeStatus(sourceDir: string): Promise<string>;
-  probeDaemonStatus(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ ok: boolean; output: JsonObject }>;
+  startDaemon(bskPath: string, environment: NodeJS.ProcessEnv, timeoutMs: number): Promise<void>;
   spawnChrome(plan: ChromeLaunchPlan, environment: NodeJS.ProcessEnv): Promise<DesktopBrowserConformanceChromeHandle>;
   writeTextFile(filePath: string, text: string): Promise<void>;
   waitForBrowser(options: {
@@ -178,6 +190,7 @@ export interface DesktopBrowserConformanceDeps {
     immediateEnvironment: NodeJS.ProcessEnv;
     chrome: DesktopBrowserConformanceChromeHandle;
     timeoutMs: number;
+    queryBrowsers: () => Promise<{ ok: boolean; output: JsonObject }>;
   }): Promise<string>;
   captureFixtures(
     run: BrowserSkillCommandRunner,
@@ -409,6 +422,92 @@ const jsonOrNull = async (run: () => Promise<unknown>): Promise<unknown> => {
   }
 };
 
+const daemonIdentity = (info: unknown): DesktopBrowserDaemonIdentity | null => {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return null;
+  const pid = (info as JsonObject)["pid"];
+  const sockPath = (info as JsonObject)["sock_path"];
+  const startedAtEpochSecs = (info as JsonObject)["started_at_epoch_secs"];
+  if (
+    typeof pid !== "number" ||
+    !Number.isInteger(pid) ||
+    typeof sockPath !== "string" ||
+    typeof startedAtEpochSecs !== "number" ||
+    !Number.isInteger(startedAtEpochSecs)
+  )
+    return null;
+  return { pid, sockPath, startedAtEpochSecs };
+};
+
+const sameDaemonIdentity = (
+  expected: DesktopBrowserDaemonIdentity,
+  actual: DesktopBrowserDaemonIdentity | null,
+): actual is DesktopBrowserDaemonIdentity =>
+  actual !== null &&
+  actual.pid === expected.pid &&
+  actual.sockPath === expected.sockPath &&
+  actual.startedAtEpochSecs === expected.startedAtEpochSecs;
+
+const daemonIdentityEvidence = (identity: DesktopBrowserDaemonIdentity): JsonObject => ({
+  pid: identity.pid,
+  sock_path: identity.sockPath,
+  started_at_epoch_secs: identity.startedAtEpochSecs,
+});
+
+const ownershipLostMessage = (step: string): string => `BrowserSkill daemon ownership lost before ${step}`;
+
+const ownershipLostEvidence = (
+  step: string,
+  expected: DesktopBrowserDaemonIdentity,
+  actualInfo: unknown,
+): JsonObject => ({
+  ok: false,
+  error: ownershipLostMessage(step),
+  expected: daemonIdentityEvidence(expected),
+  actual: actualInfo,
+});
+
+const daemonEvidence = async (options: {
+  environment: NodeJS.ProcessEnv;
+  deps: DesktopBrowserConformanceDeps;
+  daemonHomeCheckedClean: boolean;
+  daemonOwned: boolean;
+  daemonInfo: unknown;
+  expectedIdentity: DesktopBrowserDaemonIdentity | null;
+}): Promise<DesktopBrowserDaemonEvidence> => {
+  if (options.daemonInfo !== null) {
+    const identity = daemonIdentity(options.daemonInfo);
+    if (options.expectedIdentity !== null) {
+      return {
+        info: options.daemonInfo,
+        owned: sameDaemonIdentity(options.expectedIdentity, identity),
+        identity,
+      };
+    }
+    return {
+      info: options.daemonInfo,
+      owned: options.daemonOwned || options.daemonHomeCheckedClean,
+      identity,
+    };
+  }
+  if (options.expectedIdentity === null && !options.daemonOwned && !options.daemonHomeCheckedClean) {
+    return { info: null, owned: false, identity: null };
+  }
+  const info = await options.deps.readDaemonInfo(options.environment.BSK_HOME ?? "");
+  const identity = daemonIdentity(info);
+  if (options.expectedIdentity !== null) {
+    return {
+      info,
+      owned: sameDaemonIdentity(options.expectedIdentity, identity),
+      identity,
+    };
+  }
+  return {
+    info,
+    owned: options.daemonOwned || (options.daemonHomeCheckedClean && info !== null),
+    identity,
+  };
+};
+
 const recordCleanup = async (
   cleanup: { step: string; ok: boolean; error?: string }[],
   step: string,
@@ -451,6 +550,9 @@ export async function runDesktopBrowserConformance(
   let immediateEnvironment: NodeJS.ProcessEnv | null = null;
   let fixture: { server: unknown; url: string } | null = null;
   let chrome: DesktopBrowserConformanceChromeHandle | null = null;
+  let daemonInfo: unknown = null;
+  let daemonIdentityOwned: DesktopBrowserDaemonIdentity | null = null;
+  let daemonHomeCheckedClean = false;
   let daemonAcquired = false;
   let failure: unknown = null;
   const cleanup: { step: string; ok: boolean; error?: string }[] = [];
@@ -474,6 +576,36 @@ export async function runDesktopBrowserConformance(
     platform: `${deps.platform}-${deps.arch}`,
   };
 
+  const readOwnedDaemon = async (fresh = false): Promise<DesktopBrowserDaemonEvidence> => {
+    if (!environment) return { info: null, owned: false, identity: null };
+    const state = await daemonEvidence({
+      environment,
+      deps,
+      daemonHomeCheckedClean,
+      daemonOwned: daemonAcquired,
+      daemonInfo: fresh && daemonIdentityOwned !== null ? null : daemonInfo,
+      expectedIdentity: daemonIdentityOwned,
+    });
+    daemonInfo = state.info;
+    daemonAcquired = state.owned;
+    return state;
+  };
+
+  const requireOwnedDaemon = async (step: string): Promise<void> => {
+    if (daemonIdentityOwned === null) return;
+    const state = await readOwnedDaemon(true);
+    if (!state.owned) throw new Error(ownershipLostMessage(step));
+  };
+
+  const runOwnedBrowserSkillCommand = async (
+    argv: string[],
+    environmentOverride: NodeJS.ProcessEnv,
+    step: string,
+  ): Promise<{ ok: boolean; output: JsonObject }> => {
+    await requireOwnedDaemon(step);
+    return await deps.runBrowserSkillCommand(options.bskPath, argv, environmentOverride, options.commandTimeoutMs);
+  };
+
   try {
     runtimeDirectory = await deps.makeTempDirectory();
     environment = {
@@ -490,8 +622,24 @@ export async function runDesktopBrowserConformance(
       extensionDir: options.extensionDir,
       runtimeDirectory,
     });
-    const daemonStatus = await deps.probeDaemonStatus(options.bskPath, immediateEnvironment, options.commandTimeoutMs);
-    if (!daemonStatus.ok) throw new Error("BrowserSkill daemon did not respond before Chrome launch");
+    const existingDaemon = await deps.readDaemonInfo(environment.BSK_HOME ?? "");
+    daemonInfo = existingDaemon;
+    if (existingDaemon !== null) {
+      throw new Error("BrowserSkill runtime home was not clean before daemon start");
+    }
+    daemonHomeCheckedClean = true;
+    await deps.startDaemon(options.bskPath, environment, options.commandTimeoutMs);
+    const startedDaemon = await deps.readDaemonInfo(environment.BSK_HOME ?? "");
+    daemonInfo = startedDaemon;
+    if (startedDaemon === null) {
+      throw new Error("BrowserSkill daemon start did not publish daemon.json before Chrome launch");
+    }
+    daemonIdentityOwned = daemonIdentity(startedDaemon);
+    if (daemonIdentityOwned === null) {
+      throw new Error(
+        "BrowserSkill daemon start did not publish a verifiable daemon.json identity before Chrome launch",
+      );
+    }
     daemonAcquired = true;
     await deps.writeTextFile(
       join(options.outDir, "launch.json"),
@@ -505,9 +653,16 @@ export async function runDesktopBrowserConformance(
       immediateEnvironment,
       chrome,
       timeoutMs: options.commandTimeoutMs,
+      queryBrowsers: async () => {
+        await requireOwnedDaemon("browser poll");
+        return (await deps.queryBrowsers(options.bskPath, immediateEnvironment!, options.commandTimeoutMs)) as {
+          ok: boolean;
+          output: JsonObject;
+        };
+      },
     });
     const captured = await deps.captureFixtures(
-      (argv) => deps.runBrowserSkillCommand(options.bskPath, argv, environment!, options.commandTimeoutMs),
+      (argv) => runOwnedBrowserSkillCommand(argv, environment!, "fixture command"),
       { browserInstanceId, fixtureUrl: fixture.url },
     );
     if (
@@ -541,15 +696,30 @@ export async function runDesktopBrowserConformance(
     failure = error;
   } finally {
     let failureEvidence: DesktopBrowserFailureEvidence | null = null;
+    let daemonState: DesktopBrowserDaemonEvidence | null = null;
+    if (environment) {
+      daemonState = await readOwnedDaemon(true);
+      daemonAcquired = daemonState.owned;
+    }
     if (failure !== null && environment && immediateEnvironment) {
-      failureEvidence = {
-        daemon: await deps.readDaemonInfo(environment.BSK_HOME ?? ""),
-        status: await jsonOrNull(() =>
+      const failureDaemon = daemonState?.info ?? null;
+      let status: unknown = null;
+      let browsers: unknown = null;
+      if (daemonIdentityOwned !== null && !daemonAcquired) {
+        status = ownershipLostEvidence("diagnostics", daemonIdentityOwned, failureDaemon);
+        browsers = ownershipLostEvidence("diagnostics", daemonIdentityOwned, failureDaemon);
+      } else if (daemonAcquired) {
+        status = await jsonOrNull(() =>
           deps.queryDaemonStatus(options.bskPath, immediateEnvironment!, options.commandTimeoutMs),
-        ),
-        browsers: await jsonOrNull(() =>
+        );
+        browsers = await jsonOrNull(() =>
           deps.queryBrowsers(options.bskPath, immediateEnvironment!, options.commandTimeoutMs),
-        ),
+        );
+      }
+      failureEvidence = {
+        daemon: failureDaemon,
+        status,
+        browsers,
       };
     }
     if (daemonAcquired && environment) {
@@ -557,6 +727,10 @@ export async function runDesktopBrowserConformance(
         deps.stopDaemon(options.bskPath, environment!, options.commandTimeoutMs),
       );
       if (error) cleanupErrors.push(error);
+    } else if (daemonIdentityOwned !== null) {
+      const error = new Error(ownershipLostMessage("cleanup"));
+      cleanup.push({ step: "daemon-stop", ok: false, error: describeError(error) });
+      cleanupErrors.push(error);
     }
     if (chrome) {
       const error = await recordCleanup(cleanup, "chrome-stop", () => deps.stopChrome(chrome!));
@@ -567,15 +741,25 @@ export async function runDesktopBrowserConformance(
       if (error) cleanupErrors.push(error);
     }
     if (runtimeDirectory) {
-      const error = await recordCleanup(cleanup, "runtime-dir-remove", () => deps.removeRuntimeDirectory(runtimeDirectory!));
+      const error = await recordCleanup(cleanup, "runtime-dir-remove", () =>
+        deps.removeRuntimeDirectory(runtimeDirectory!),
+      );
       if (error) cleanupErrors.push(error);
     }
-    if (failureEvidence) {
+    const finalFailure = failure ?? cleanupErrors[0] ?? null;
+    if (finalFailure !== null && failureEvidence === null) {
+      failureEvidence = {
+        daemon: daemonState?.info ?? null,
+        status: null,
+        browsers: null,
+      };
+    }
+    if (failureEvidence && finalFailure !== null) {
       await deps.writeTextFile(
         join(options.outDir, "failure-diagnostics.json"),
         `${JSON.stringify(
           buildFailureDiagnostics({
-            error: failure,
+            error: finalFailure,
             launch,
             chromeProvenance,
             chromeStderr: chrome?.readStderr() ?? "",
@@ -735,7 +919,10 @@ export async function writeBrowserSkillConformanceManifest(options: ManifestOpti
       ),
     };
   } else {
-    if (!validateReleaseAsset(options.artifactProvenance.cli) || !validateReleaseAsset(options.artifactProvenance.extension)) {
+    if (
+      !validateReleaseAsset(options.artifactProvenance.cli) ||
+      !validateReleaseAsset(options.artifactProvenance.extension)
+    ) {
       throw new Error("release smoke provenance requires pinned CLI and extension version, URL, and checksum");
     }
     artifactProvenance = {

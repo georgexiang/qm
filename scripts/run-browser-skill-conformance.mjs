@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { constants as fsConstants } from "node:fs";
@@ -83,15 +85,10 @@ const ensureDirectory = async (directory, label) => {
   if (!info.isDirectory()) throw new Error(`${label} is not a directory at ${directory}`);
 };
 
-const waitForBrowser = async (bskPath, environment) => {
+const waitForBrowser = async (queryBrowsers) => {
   const deadline = Date.now() + browserConnectTimeoutMs;
   while (Date.now() < deadline) {
-    const result = await runJsonCommand({
-      file: bskPath,
-      args: ["--json", "browsers"],
-      environment,
-      timeoutMs: commandTimeoutMs,
-    });
+    const result = await queryBrowsers();
     if (result.ok && Array.isArray(result.output) && result.output.length === 1) {
       const instanceId = result.output[0]?.instance_id;
       if (typeof instanceId === "string") return instanceId;
@@ -118,6 +115,69 @@ const startFixtureServer = async () => {
 };
 
 const closeServer = (server) => new Promise((resolve) => server.close(resolve));
+
+const callDaemon = async (sockPath, method, params, timeoutMs) =>
+  await new Promise((resolve, reject) => {
+    const requestId = `qm-${randomUUID()}`;
+    const socket = createConnection(sockPath);
+    let settled = false;
+    let buffer = "";
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeAllListeners();
+      socket.end();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish(new Error(`daemon IPC ${method} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify({ id: requestId, method, params })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex < 0) return;
+      const line = buffer.slice(0, newlineIndex).trim();
+      if (!line) {
+        finish(new Error(`daemon IPC ${method} returned an empty response`));
+        return;
+      }
+      try {
+        const frame = JSON.parse(line);
+        if (frame?.id !== requestId) {
+          finish(new Error(`daemon IPC ${method} returned response id ${String(frame?.id)} instead of ${requestId}`));
+          return;
+        }
+        if (frame && typeof frame === "object" && "error" in frame && frame.error) {
+          const message = typeof frame.error.message === "string" ? frame.error.message : JSON.stringify(frame.error);
+          finish(new Error(`daemon IPC ${method} failed: ${message}`));
+          return;
+        }
+        if (!frame || typeof frame !== "object" || !("result" in frame)) {
+          finish(new Error(`daemon IPC ${method} returned a malformed response`));
+          return;
+        }
+        finish(null, frame.result);
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    socket.once("error", (error) => finish(error));
+  });
+
+const daemonSocketPath = async (home) => {
+  const info = await daemonInfo(home);
+  if (!info || typeof info.sock_path !== "string" || info.sock_path.length === 0) {
+    throw new Error("no live daemon (daemon.json missing or stale)");
+  }
+  return info.sock_path;
+};
 
 const watchProcess = (child, name) =>
   new Promise((resolve, reject) => {
@@ -158,9 +218,17 @@ async function main() {
       makeDirectory: (directory) => mkdir(directory, { recursive: true }),
       makeTempDirectory: () => mkdtemp(join(tmpdir(), "qm-browser-skill-conformance-")),
       startFixtureServer,
-      getExecutableVersion: async (file) => (await runTextCommand({ file, args: ["--version"], environment: process.env, timeoutMs: commandTimeoutMs })).trim(),
+      getExecutableVersion: async (file) =>
+        (
+          await runTextCommand({ file, args: ["--version"], environment: process.env, timeoutMs: commandTimeoutMs })
+        ).trim(),
       getSourceCommit: async (sourceDir) =>
-        await runTextCommand({ file: "git", args: ["-C", sourceDir, "rev-parse", "HEAD"], environment: process.env, timeoutMs: commandTimeoutMs }),
+        await runTextCommand({
+          file: "git",
+          args: ["-C", sourceDir, "rev-parse", "HEAD"],
+          environment: process.env,
+          timeoutMs: commandTimeoutMs,
+        }),
       getSourceTreeStatus: async (sourceDir) =>
         await runTextCommand({
           file: "git",
@@ -168,8 +236,9 @@ async function main() {
           environment: process.env,
           timeoutMs: commandTimeoutMs,
         }),
-      probeDaemonStatus: (bskPath, environment, timeoutMs) =>
-        runJsonCommand({ file: bskPath, args: ["--json", "status"], environment, timeoutMs }),
+      startDaemon: async (bskPath, environment, timeoutMs) => {
+        await runTextCommand({ file: bskPath, args: ["daemon", "start"], environment, timeoutMs });
+      },
       spawnChrome: async (plan, environment) => {
         const child = spawn(plan.file, plan.args, {
           env: environment,
@@ -185,9 +254,9 @@ async function main() {
         };
       },
       writeTextFile: writeFile,
-      waitForBrowser: ({ bskPath, immediateEnvironment, chrome }) =>
+      waitForBrowser: ({ chrome, queryBrowsers }) =>
         Promise.race([
-          waitForBrowser(bskPath, immediateEnvironment),
+          waitForBrowser(queryBrowsers),
           chrome.chromeExit.then(({ code, signal, name }) => {
             throw new Error(`${name} exited before BrowserSkill connected (code=${code}, signal=${signal})`);
           }),
@@ -197,15 +266,31 @@ async function main() {
         runJsonCommand({ file: bskPath, args: argv, environment, timeoutMs }),
       writeManifest: writeBrowserSkillConformanceManifest,
       readDaemonInfo: daemonInfo,
-      queryDaemonStatus: (bskPath, environment, timeoutMs) =>
-        runJsonCommand({ file: bskPath, args: ["--json", "status"], environment, timeoutMs }),
-      queryBrowsers: (bskPath, environment, timeoutMs) =>
-        runJsonCommand({ file: bskPath, args: ["--json", "browsers"], environment, timeoutMs }),
+      queryDaemonStatus: async (_bskPath, environment, timeoutMs) => ({
+        ok: true,
+        output: await callDaemon(await daemonSocketPath(environment.BSK_HOME ?? ""), "system.status", {}, timeoutMs),
+      }),
+      queryBrowsers: async (_bskPath, environment, timeoutMs) => {
+        const output = await callDaemon(
+          await daemonSocketPath(environment.BSK_HOME ?? ""),
+          "browser.list",
+          { wait_for_browser_ms: 0 },
+          timeoutMs,
+        );
+        const browsers =
+          output && typeof output === "object" && Array.isArray(output.browsers) ? output.browsers : output;
+        return { ok: true, output: browsers };
+      },
       stopDaemon: async (bskPath, environment, timeoutMs) => {
         await runTextCommand({ file: bskPath, args: ["daemon", "stop"], environment, timeoutMs });
       },
       stopChrome: async (chrome) =>
-        stopChildProcess({ child: chrome.child, exit: chrome.chromeExit, name: "Chrome", timeoutMs: chromeStopTimeoutMs }),
+        stopChildProcess({
+          child: chrome.child,
+          exit: chrome.chromeExit,
+          name: "Chrome",
+          timeoutMs: chromeStopTimeoutMs,
+        }),
       stopFixtureServer: closeServer,
       removeRuntimeDirectory: (directory) => rm(directory, { recursive: true, force: true }),
     },

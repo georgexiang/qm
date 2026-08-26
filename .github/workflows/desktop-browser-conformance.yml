@@ -43,7 +43,7 @@ jobs:
       - name: Verify runner architecture
         run: test "$(uname -m)" = arm64
       - name: Install QM dependencies
-        run: npm ci --ignore-scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check out pinned BrowserSkill source
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/Tencent/BrowserSkill.git "$RUNNER_TEMP/BrowserSkill"
@@ -51,9 +51,9 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/BrowserSkill" rev-parse HEAD)" = "$BROWSERSKILL_COMMIT"
       - name: Build pinned CLI and Extension
         run: |
-          corepack enable
+          corepack enable >/dev/null 2>&1
           cd "$RUNNER_TEMP/BrowserSkill"
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --reporter=append-only
           cargo build --release --locked -p bsk --target aarch64-apple-darwin
           pnpm ext:build:zip
           pnpm ext:test
