@@ -17,7 +17,7 @@ test("Desktop Browser waiting state remains one updateable activity item", () =>
     status: "waiting_for_broker",
     connectCommand: "qm-host-broker connect https://qm.example.com",
     actionAuthority: "turn-authority",
-    actions: ["continue", "cancel"],
+    actions: ["cancel"],
   });
   const items = buildTimeline({ status: "complete", activity: [activity] });
 

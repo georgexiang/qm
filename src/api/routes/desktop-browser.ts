@@ -58,18 +58,41 @@ async function reserveRegistration(ctx: ApiCtx): Promise<void> {
 
 async function confirmRegistration(ctx: ApiCtx): Promise<void> {
   const body = isObj(ctx.body) ? ctx.body : {};
+  const requested = typeof body.principalId === "string" ? body.principalId.trim() : "";
+  if (ctx.capability && requested !== ctx.capability.actorId) {
+    return sendJson(ctx.res, 404, { error: "not_found" });
+  }
+  const principalId = ctx.capability?.actorId ?? requested;
   const authorityId = typeof body.authorityId === "string" ? body.authorityId : "";
+  const taskId = typeof body.taskId === "string" ? body.taskId : "";
+  const confirmationFingerprint = typeof body.confirmationFingerprint === "string" ? body.confirmationFingerprint : "";
+  if (!principalId || !authorityId || !taskId || !confirmationFingerprint) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "principalId, authorityId, taskId, and confirmationFingerprint required",
+    });
+  }
+  const result = await ctx.app.desktopBrowserConfirmRegistration(ctx.params.id!, principalId, authorityId, {
+    taskId,
+    confirmationFingerprint,
+  });
+  if (result.status === "refused") return sendJson(ctx.res, 409, { error: "conflict", message: result.reason });
+  return sendJson(ctx.res, 200, result);
+}
+
+async function stageRegistrationConfirmation(ctx: ApiCtx): Promise<void> {
+  const body = isObj(ctx.body) ? ctx.body : {};
   let browserRuntimeStatus: "ready" | "offline" | "" = "";
   if (body.browserRuntimeStatus === "ready") browserRuntimeStatus = "ready";
   else if (body.browserRuntimeStatus === "offline") browserRuntimeStatus = "offline";
   const envelope = isObj(body.envelope) ? body.envelope : null;
-  if (!authorityId || !browserRuntimeStatus || !envelope) {
+  if (!browserRuntimeStatus || !envelope) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
-      message: "authorityId, browserRuntimeStatus, and envelope required",
+      message: "browserRuntimeStatus and envelope required",
     });
   }
-  const result = await ctx.app.desktopBrowserConfirmRegistration(ctx.params.id!, authorityId, {
+  const result = await ctx.app.desktopBrowserStageRegistrationConfirmation(ctx.params.id!, {
     browserRuntimeStatus,
     envelope: envelope as unknown as DesktopBrowserRegistrationConfirmationEnvelope,
   });
@@ -104,6 +127,12 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/desktop-browser/tasks/:id/registration-reservations",
     auth: "source",
     handle: reserveRegistration,
+  },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/registrations/:id/confirmation-envelope",
+    auth: "source",
+    handle: stageRegistrationConfirmation,
   },
   { method: "POST", path: "/v1/desktop-browser/registrations/:id/confirm", auth: "source", handle: confirmRegistration },
   {

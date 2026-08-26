@@ -20,6 +20,10 @@ import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
 import type { DesktopBrowserRegistrationConfirmationEnvelope } from "qm-desktop-browser-contracts";
+import {
+  projectDesktopBrowserActivityReply,
+  projectDesktopBrowserTaskActivity,
+} from "../desktop-browser/task-activity.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -41,6 +45,7 @@ export function createTurnMethods(
   | "turn"
   | "desktopBrowserTaskAction"
   | "desktopBrowserReserveRegistration"
+  | "desktopBrowserStageRegistrationConfirmation"
   | "desktopBrowserConfirmRegistration"
   | "desktopBrowserMarkRegistrationOffline"
   | "getApproval"
@@ -66,19 +71,20 @@ export function createTurnMethods(
     replayOrphanedRunSignals,
   } = h;
   const { shouldRouteToSpine, markTriggerHandled, addressedWakeText } = ambient;
-  const waitingActivity = (taskId: string, actionAuthority: string, sessionId?: string) => {
-    const connectCommand = `qm-host-broker connect ${deps.publicWebUrl}`;
+  const waitingActivity = async (
+    task: Pick<NonNullable<Awaited<ReturnType<typeof deps.desktopBrowserTasks.get>>>, "id" | "status" | "authorityId">,
+    sessionId?: string,
+  ) => {
+    const desktopBrowserActivity = projectDesktopBrowserTaskActivity(
+      task,
+      deps.publicWebUrl,
+      await deps.desktopBrowserDeviceRegistry.taskRegistration(task.id),
+    );
     return {
       status: "ok" as const,
       ...(sessionId ? { sessionId } : {}),
-      reply: `No Host Broker is connected. Start it on the customer desktop:\n\n${connectCommand}`,
-      desktopBrowserActivity: {
-        taskId,
-        status: "waiting_for_broker" as const,
-        connectCommand,
-        actionAuthority,
-        actions: ["continue", "cancel"] as Array<"continue" | "cancel">,
-      },
+      reply: projectDesktopBrowserActivityReply(desktopBrowserActivity),
+      desktopBrowserActivity,
     };
   };
   async function withCurrentWaitingTask<T>(
@@ -340,7 +346,7 @@ export function createTurnMethods(
               sessionId: session.id,
               threadRef: conversation.threadRef,
             });
-            const response = waitingActivity(task.id, task.authorityId, session.id);
+            const response = await waitingActivity(task, session.id);
             await deps.sessions
               .append(leaseAttempt.lease, {
                 type: "assistant",
@@ -627,13 +633,7 @@ export function createTurnMethods(
             status: "ok",
             sessionId: canceled.sessionId,
             reply: "Desktop Browser Task canceled.",
-            desktopBrowserActivity: {
-              taskId: canceled.id,
-              status: "canceled",
-              connectCommand: `qm-host-broker connect ${deps.publicWebUrl}`,
-              actionAuthority: canceled.authorityId,
-              actions: [],
-            },
+            desktopBrowserActivity: projectDesktopBrowserTaskActivity(canceled, deps.publicWebUrl, null),
           };
           await deps.sessions
             .append(leaseAttempt.lease!, {
@@ -690,19 +690,51 @@ export function createTurnMethods(
       });
     },
 
-    async desktopBrowserConfirmRegistration(registrationId, authorityId, input) {
+    async desktopBrowserStageRegistrationConfirmation(registrationId, input) {
+      return deps.desktopBrowserDeviceRegistry.stageConfirmation({
+        registrationId,
+        browserRuntimeStatus: input.browserRuntimeStatus,
+        envelope: input.envelope as unknown as DesktopBrowserRegistrationConfirmationEnvelope,
+      });
+    },
+
+    async desktopBrowserConfirmRegistration(registrationId, principalId, authorityId, input) {
       const registration = await deps.desktopBrowserDeviceRegistry.get(registrationId);
       if (!registration) return { status: "refused", reason: "desktop browser registration not found" };
+      const task = await deps.desktopBrowserTasks.get(registration.waitingTaskId);
+      const actor = deps.identity.classify(principalId);
+      if (!task || task.actorId !== actor.id || !constantTimeEqual(task.authorityId, authorityId)) {
+        return { status: "refused", reason: "Desktop Browser Task not found" };
+      }
       return withCurrentWaitingTask(
         registration.waitingTaskId,
         authorityId,
-        async () =>
-          deps.desktopBrowserDeviceRegistry.confirm({
+        async (currentTask) => {
+          if (currentTask.id !== input.taskId) {
+            return { status: "refused", reason: "desktop browser registration task no longer matches" } as const;
+          }
+          if (!constantTimeEqual(registration.confirmationFingerprint, input.confirmationFingerprint)) {
+            return { status: "refused", reason: "desktop browser registration fingerprint no longer matches" } as const;
+          }
+          const staged = await deps.desktopBrowserDeviceRegistry.stagedConfirmation(registrationId);
+          if (!staged) return { status: "refused", reason: "waiting for local confirmation" } as const;
+          const result = await deps.desktopBrowserDeviceRegistry.confirm({
             registrationId,
             authorityId,
-            browserRuntimeStatus: input.browserRuntimeStatus,
-            envelope: input.envelope as unknown as DesktopBrowserRegistrationConfirmationEnvelope,
-          }),
+            browserRuntimeStatus: staged.browserRuntimeStatus,
+            envelope: staged.envelope,
+          });
+          if (result.status !== "ok") return result;
+          return {
+            status: "ok" as const,
+            device: result.device,
+            desktopBrowserActivity: projectDesktopBrowserTaskActivity(
+              currentTask,
+              deps.publicWebUrl,
+              await deps.desktopBrowserDeviceRegistry.taskRegistration(currentTask.id),
+            ),
+          };
+        },
         async () => {
           if (registration.status === "pending") {
             await deps.desktopBrowserDeviceRegistry.invalidate(registrationId);

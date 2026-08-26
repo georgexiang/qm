@@ -13,6 +13,10 @@ import { type ArtifactHome } from "./artifact-share.ts";
 import { randomUUID } from "node:crypto";
 import { MAX_ATTACHMENT_BYTES, mimeFromName, safeAttachmentName } from "../core/attachments.ts";
 import { projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
+import {
+  projectDesktopBrowserActivityReply,
+  projectDesktopBrowserTaskActivity,
+} from "../desktop-browser/task-activity.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { toFileItem, type ScopeDeployment, type SessionSearchHit } from "./app-types.ts";
@@ -84,23 +88,18 @@ export function createSessionMethods(
     if (!tasks.length) return entries;
     const projected = entries.slice();
     for (const task of tasks) {
-      const desktopBrowserActivity = {
-        taskId: task.id,
-        status: task.status,
-        connectCommand: `qm-host-broker connect ${deps.publicWebUrl}`,
-        actionAuthority: task.authorityId,
-        actions: task.status === "waiting_for_broker" ? (["continue", "cancel"] as const) : [],
-      };
+      const desktopBrowserActivity = projectDesktopBrowserTaskActivity(
+        task,
+        deps.publicWebUrl,
+        await deps.desktopBrowserDeviceRegistry.taskRegistration(task.id),
+      );
       const latestIndex = projected.findLastIndex(
         (entry) =>
           entry.type === "assistant" &&
           (entry.payload as { desktopBrowserActivity?: { taskId?: string } } | null)?.desktopBrowserActivity?.taskId ===
             task.id,
       );
-      const text =
-        task.status === "canceled"
-          ? "Desktop Browser Task canceled."
-          : `No Host Broker is connected. Start it on the customer desktop:\n\n${desktopBrowserActivity.connectCommand}`;
+      const text = projectDesktopBrowserActivityReply(desktopBrowserActivity);
       if (latestIndex >= 0) {
         const entry = projected[latestIndex]!;
         projected[latestIndex] = {

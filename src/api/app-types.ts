@@ -28,6 +28,7 @@ import type { TaskStore, TaskStatus } from "../tasks/task-store.ts";
 import type { DesktopBrowserTaskStore } from "../desktop-browser/browser-task-store.ts";
 import type {
   DesktopBrowserDeviceRegistry,
+  DesktopBrowserTaskRegistrationProjection,
   DesktopBrowserSharedProfileProjection,
 } from "../desktop-browser/device-registry.ts";
 import type {
@@ -275,12 +276,26 @@ export interface App {
   >;
   desktopBrowserConfirmRegistration(
     registrationId: string,
+    principalId: string,
     authorityId: string,
+    input: {
+      taskId: string;
+      confirmationFingerprint: string;
+    },
+  ): Promise<
+    | { status: "ok"; device: DesktopBrowserSharedProfileProjection; desktopBrowserActivity: TurnResult["desktopBrowserActivity"] }
+    | { status: "refused"; reason: string }
+  >;
+  desktopBrowserStageRegistrationConfirmation(
+    registrationId: string,
     input: {
       browserRuntimeStatus: "ready" | "offline";
       envelope: DesktopBrowserRegistrationConfirmationEnvelope;
     },
-  ): Promise<{ status: "ok"; device: DesktopBrowserSharedProfileProjection } | { status: "refused"; reason: string }>;
+  ): Promise<
+    | { status: "ok"; registration: DesktopBrowserTaskRegistrationProjection }
+    | { status: "refused"; reason: string }
+  >;
   desktopBrowserMarkRegistrationOffline(
     registrationId: string,
     input: {

@@ -323,10 +323,16 @@ export interface PendingApproval {
 
 export interface DesktopBrowserActivity {
   taskId: string;
-  status: "waiting_for_broker" | "canceled";
+  status: "waiting_for_broker" | "waiting_for_local_confirmation" | "registration_confirmed" | "canceled";
   connectCommand: string;
   actionAuthority: string;
-  actions: Array<"continue" | "cancel">;
+  actions: Array<"confirm" | "cancel">;
+  registration?: {
+    registrationId: string;
+    confirmationFingerprint: string;
+    expiresAt: string;
+    confirmReady: boolean;
+  };
   actionError?: string;
 }
 
@@ -381,6 +387,18 @@ export async function runDesktopBrowserTaskAction(
   return api(`/api/desktop-browser/tasks/${encodeURIComponent(taskId)}/actions`, {
     method: "POST",
     body: JSON.stringify({ authorityId, action }),
+  });
+}
+
+export async function confirmDesktopBrowserRegistration(
+  registrationId: string,
+  taskId: string,
+  authorityId: string,
+  confirmationFingerprint: string,
+): Promise<{ desktopBrowserActivity?: DesktopBrowserActivity; reason?: string }> {
+  return api(`/api/desktop-browser/registrations/${encodeURIComponent(registrationId)}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({ taskId, authorityId, confirmationFingerprint }),
   });
 }
 

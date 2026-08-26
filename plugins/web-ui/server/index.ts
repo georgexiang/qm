@@ -1650,6 +1650,37 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "POST",
+    path: "/api/desktop-browser/registrations/:id/confirm",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const id = c.params.id!;
+      if (!id || id.includes("/")) return json(res, 404, { error: "not_found" });
+      let taskId = "";
+      let authorityId = "";
+      let confirmationFingerprint = "";
+      try {
+        const body = JSON.parse(await readBody(req)) as {
+          taskId?: unknown;
+          authorityId?: unknown;
+          confirmationFingerprint?: unknown;
+        };
+        if (typeof body.taskId === "string") taskId = body.taskId;
+        if (typeof body.authorityId === "string") authorityId = body.authorityId;
+        if (typeof body.confirmationFingerprint === "string") confirmationFingerprint = body.confirmationFingerprint;
+      } catch (error) {
+        if (error instanceof PayloadTooLargeError) throw error;
+      }
+      if (!taskId || !authorityId || !confirmationFingerprint) return json(res, 400, { error: "bad_request" });
+      return relayCore(
+        res,
+        "POST",
+        `/v1/desktop-browser/registrations/${encodeURIComponent(id)}/confirm`,
+        JSON.stringify({ principalId: user, taskId, authorityId, confirmationFingerprint }),
+      );
+    },
+  },
+  {
+    method: "POST",
     path: "/api/turn",
     handle: async (c) => {
       const { req, res, user } = c;

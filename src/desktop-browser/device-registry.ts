@@ -43,9 +43,23 @@ export interface DesktopBrowserRegistrationRecord {
   publicDeviceFingerprint: string;
   operatingSystem: string;
   browserRuntimeStatus: "ready" | "offline";
+  pendingConfirmation:
+    | {
+        browserRuntimeStatus: "ready" | "offline";
+        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+        receivedAt: number;
+      }
+    | null;
   lastSeenAt: string;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface DesktopBrowserTaskRegistrationProjection {
+  registrationId: string;
+  confirmationFingerprint: string;
+  expiresAt: string;
+  status: "waiting_for_local_confirmation" | "ready_to_confirm" | "confirmed";
 }
 
 export interface DesktopBrowserTaskClaimRecord {
@@ -117,6 +131,19 @@ export interface DesktopBrowserDeviceRegistry {
   }): Promise<DesktopBrowserReservationResult>;
   challengeBinding(registrationId: string): Promise<DesktopBrowserChallengeBinding | null>;
   get(registrationId: string): Promise<DesktopBrowserRegistrationRecord | null>;
+  taskRegistration(waitingTaskId: string): Promise<DesktopBrowserTaskRegistrationProjection | null>;
+  stagedConfirmation(registrationId: string): Promise<
+    | {
+        browserRuntimeStatus: "ready" | "offline";
+        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+      }
+    | null
+  >;
+  stageConfirmation(input: {
+    registrationId: string;
+    browserRuntimeStatus: "ready" | "offline";
+    envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+  }): Promise<{ status: "ok"; registration: DesktopBrowserTaskRegistrationProjection } | DesktopBrowserRegistryRefusal>;
   confirm(input: {
     registrationId: string;
     authorityId: string;
@@ -178,6 +205,18 @@ function toProjection(record: DesktopBrowserRegistrationRecord): DesktopBrowserS
       browserRuntimeStatus: record.status === "online" ? record.browserRuntimeStatus : "offline",
       lastSeenAt: record.lastSeenAt,
     },
+  };
+}
+
+function taskRegistrationProjection(record: DesktopBrowserRegistrationRecord): DesktopBrowserTaskRegistrationProjection {
+  let status: DesktopBrowserTaskRegistrationProjection["status"] = "waiting_for_local_confirmation";
+  if (record.status === "online") status = "confirmed";
+  else if (record.pendingConfirmation) status = "ready_to_confirm";
+  return {
+    registrationId: record.registrationId,
+    confirmationFingerprint: record.confirmationFingerprint,
+    expiresAt: record.registrationTuple.expiresAt,
+    status,
   };
 }
 
@@ -270,6 +309,58 @@ function reservationView(record: DesktopBrowserRegistrationRecord): DesktopBrows
     verificationBytes,
     verificationBytesBase64: Buffer.from(verificationBytes).toString("base64"),
   };
+}
+
+function samePendingConfirmation(
+  left:
+    | {
+        browserRuntimeStatus: "ready" | "offline";
+        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+      }
+    | null,
+  right: {
+    browserRuntimeStatus: "ready" | "offline";
+    envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+  },
+): boolean {
+  if (!left) return false;
+  return (
+    left.browserRuntimeStatus === right.browserRuntimeStatus &&
+    constantTimeEqual(left.envelope.signature, right.envelope.signature) &&
+    sameRegistrationTuple(left.envelope.registrationTuple, right.envelope.registrationTuple) &&
+    constantTimeEqual(left.envelope.confirmationFingerprint, right.envelope.confirmationFingerprint)
+  );
+}
+
+function verifiedEnvelope(
+  record: DesktopBrowserRegistrationRecord,
+  inputEnvelope: DesktopBrowserRegistrationConfirmationEnvelope,
+): DesktopBrowserRegistrationConfirmationEnvelope | null {
+  let envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+  try {
+    envelope = parseDesktopBrowserRegistrationConfirmationEnvelope(inputEnvelope);
+  } catch {
+    return null;
+  }
+  if (
+    !sameRegistrationTuple(record.registrationTuple, envelope.registrationTuple) ||
+    !constantTimeEqual(record.confirmationFingerprint, envelope.confirmationFingerprint) ||
+    !constantTimeEqual(record.publicIdentity.devicePublicKey, envelope.publicIdentity.devicePublicKey)
+  ) {
+    return null;
+  }
+  try {
+    return verify(
+      null,
+      Buffer.from(encodeDesktopBrowserRegistrationConfirmationVerificationBytes(record.registrationTuple)),
+      decodeDevicePublicKey(record.registrationTuple.devicePublicKey),
+      Buffer.from(envelope.signature, "base64"),
+    )
+      ? envelope
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createDesktopBrowserDeviceRegistry(
@@ -371,6 +462,7 @@ export function createDesktopBrowserDeviceRegistry(
         publicDeviceFingerprint,
         operatingSystem: input.operatingSystem,
         browserRuntimeStatus: "offline",
+        pendingConfirmation: null,
         lastSeenAt: iso(createdAt),
         createdAt,
         updatedAt: createdAt,
@@ -415,6 +507,67 @@ export function createDesktopBrowserDeviceRegistry(
       return (await readState()).registrations[registrationId] ?? null;
     },
 
+    async taskRegistration(waitingTaskId) {
+      const registrations = Object.values((await readState()).registrations)
+        .filter((record) => record.waitingTaskId === waitingTaskId)
+        .filter((record) => {
+          if (record.status === "online") return true;
+          return record.status === "pending" && Date.parse(record.registrationTuple.expiresAt) > now();
+        })
+        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt);
+      return registrations[0] ? taskRegistrationProjection(registrations[0]) : null;
+    },
+
+    async stagedConfirmation(registrationId) {
+      const pending = (await readState()).registrations[registrationId]?.pendingConfirmation ?? null;
+      return pending
+        ? {
+            browserRuntimeStatus: pending.browserRuntimeStatus,
+            envelope: pending.envelope,
+          }
+        : null;
+    },
+
+    async stageConfirmation(input) {
+      const record = (await readState()).registrations[input.registrationId] ?? null;
+      if (!record) return { status: "refused", reason: "registration not found" };
+      if (record.status !== "pending") return { status: "refused", reason: "registration is no longer pending" };
+      if (Date.parse(record.registrationTuple.expiresAt) <= now() || record.authorityExpiresAt <= now()) {
+        await invalidate(input.registrationId);
+        return { status: "refused", reason: "registration reservation expired" };
+      }
+      const envelope = verifiedEnvelope(record, input.envelope);
+      if (!envelope) return { status: "refused", reason: "registration signature verification failed" };
+      const at = now();
+      return await updateState((state) => {
+        const stored = state.registrations[input.registrationId];
+        if (!stored) return { status: "refused", reason: "registration not found" };
+        if (stored.status !== "pending") return { status: "refused", reason: "registration is no longer pending" };
+        if (Date.parse(stored.registrationTuple.expiresAt) <= at || stored.authorityExpiresAt <= at) {
+          state.registrations[input.registrationId] = offlineRecord(stored, at);
+          return { status: "refused", reason: "registration reservation expired" };
+        }
+        const nextPending = {
+          browserRuntimeStatus: input.browserRuntimeStatus,
+          envelope,
+        };
+        if (stored.pendingConfirmation && !samePendingConfirmation(stored.pendingConfirmation, nextPending)) {
+          return { status: "refused", reason: "registration confirmation envelope already staged" };
+        }
+        const nextRecord = {
+          ...stored,
+          pendingConfirmation: {
+            browserRuntimeStatus: input.browserRuntimeStatus,
+            envelope,
+            receivedAt: stored.pendingConfirmation?.receivedAt ?? at,
+          },
+          updatedAt: at,
+        };
+        state.registrations[input.registrationId] = nextRecord;
+        return { status: "ok", registration: taskRegistrationProjection(nextRecord) } as const;
+      });
+    },
+
     async confirm(input) {
       const record = (await readState()).registrations[input.registrationId] ?? null;
       if (!record) return { status: "refused", reason: "registration not found" };
@@ -427,32 +580,11 @@ export function createDesktopBrowserDeviceRegistry(
         await invalidate(input.registrationId);
         return { status: "refused", reason: "registration reservation expired" };
       }
-      let envelope: DesktopBrowserRegistrationConfirmationEnvelope;
-      try {
-        envelope = parseDesktopBrowserRegistrationConfirmationEnvelope(input.envelope);
-      } catch {
-        return { status: "refused", reason: "registration confirmation envelope is invalid" };
-      }
-      if (
-        !sameRegistrationTuple(record.registrationTuple, envelope.registrationTuple) ||
-        !constantTimeEqual(record.confirmationFingerprint, envelope.confirmationFingerprint) ||
-        !constantTimeEqual(record.publicIdentity.devicePublicKey, envelope.publicIdentity.devicePublicKey)
-      ) {
+      const envelope = verifiedEnvelope(record, input.envelope);
+      if (!envelope) {
         await invalidate(input.registrationId);
-        return { status: "refused", reason: "registration tuple no longer matches reservation" };
+        return { status: "refused", reason: "registration signature verification failed" };
       }
-      let verified: boolean;
-      try {
-        verified = verify(
-          null,
-          Buffer.from(encodeDesktopBrowserRegistrationConfirmationVerificationBytes(record.registrationTuple)),
-          decodeDevicePublicKey(record.registrationTuple.devicePublicKey),
-          Buffer.from(envelope.signature, "base64"),
-        );
-      } catch {
-        verified = false;
-      }
-      if (!verified) return { status: "refused", reason: "registration signature verification failed" };
       const at = now();
       return await updateState<DesktopBrowserConfirmationResult>((state) => {
         const stored = state.registrations[input.registrationId];
@@ -501,6 +633,7 @@ export function createDesktopBrowserDeviceRegistry(
           ...stored,
           status: "online" as const,
           browserRuntimeStatus: input.browserRuntimeStatus,
+          pendingConfirmation: null,
           updatedAt: at,
           lastSeenAt: iso(at),
         };

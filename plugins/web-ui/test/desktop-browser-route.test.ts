@@ -26,10 +26,16 @@ const core = createServer((req: IncomingMessage, res) => {
         status: "ok",
         desktopBrowserActivity: {
           taskId: "task-1",
-          status: "waiting_for_broker",
+          status: "waiting_for_local_confirmation",
           connectCommand: "qm-host-broker connect https://qm.example.com",
           actionAuthority: "turn-authority",
-          actions: ["continue", "cancel"],
+          actions: ["confirm", "cancel"],
+          registration: {
+            registrationId: "reg-1",
+            confirmationFingerprint: "4f8c52de91a3b10c",
+            expiresAt: "2026-08-26T12:00:00.000Z",
+            confirmReady: true,
+          },
         },
       }),
     );
@@ -77,4 +83,28 @@ test("Continue is not an action endpoint until Ticket 09 implements resume", asy
   });
 
   assert.equal(response.status, 400);
+});
+
+test("Desktop Browser registration confirmation binds the signed-in WebUI principal", async () => {
+  const response = await fetch(`${base}/api/desktop-browser/registrations/reg-1/confirm`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      principalId: "mallory",
+      taskId: "task-1",
+      authorityId: "turn-authority",
+      confirmationFingerprint: "4f8c52de91a3b10c",
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  const call = calls.find((candidate) => new URL(candidate.url, "http://core").pathname.endsWith("/confirm"));
+  assert.ok(call);
+  assert.equal(call.method, "POST");
+  assert.deepEqual(call.body, {
+    principalId: "alice",
+    taskId: "task-1",
+    authorityId: "turn-authority",
+    confirmationFingerprint: "4f8c52de91a3b10c",
+  });
 });

@@ -53,6 +53,7 @@ import {
   makeOpenerStreamFn,
   makeRunResumeStreamFn,
   runApprovalTurn,
+  confirmDesktopBrowserRegistration,
   runDesktopBrowserTaskAction,
   TAIL_TURNS,
   type ApprovalDecision,
@@ -2013,7 +2014,35 @@ export function createChatSurface(
 
   function desktopBrowserTaskCard(activity: ToolActivity, work: WorkBlock): TemplateResult {
     const task = activity.payload as DesktopBrowserActivity;
-    const waiting = task.status === "waiting_for_broker";
+    const waiting = task.status === "waiting_for_broker" || task.status === "waiting_for_local_confirmation";
+    const confirm = async (): Promise<void> => {
+      if (!task.registration) return;
+      const before = task.actions;
+      activity.payload = { ...task, actions: [] };
+      work.activity = [...work.activity];
+      ctx.chat.redraw();
+      try {
+        const result = await confirmDesktopBrowserRegistration(
+          task.registration.registrationId,
+          task.taskId,
+          task.actionAuthority,
+          task.registration.confirmationFingerprint,
+        );
+        activity.payload = result.desktopBrowserActivity ?? {
+          ...task,
+          actions: before,
+          actionError: result.reason ?? "Desktop Browser registration confirmation failed.",
+        };
+      } catch (error) {
+        activity.payload = {
+          ...task,
+          actions: before,
+          actionError: errMessage(error, "Desktop Browser registration confirmation failed."),
+        };
+      }
+      work.activity = [...work.activity];
+      ctx.chat.redraw();
+    };
     const cancel = async (): Promise<void> => {
       const before = task.actions;
       activity.payload = { ...task, actions: [] };
@@ -2036,16 +2065,23 @@ export function createChatSurface(
       work.activity = [...work.activity];
       ctx.chat.redraw();
     };
+    let statusLabel = "Canceled";
+    if (task.status === "waiting_for_broker") statusLabel = "Waiting for Host Broker";
+    else if (task.status === "waiting_for_local_confirmation") statusLabel = "Waiting for local confirmation";
+    else if (task.status === "registration_confirmed") statusLabel = "Registration confirmed";
+    let statusClass = "ready";
+    if (waiting) statusClass = "waiting";
+    else if (task.status === "canceled") statusClass = "canceled";
     return html`<section class="desktop-browser-task" aria-label="Desktop Browser Task">
       <div class="desktop-browser-task-head">
         <span class="desktop-browser-task-icon">${icon(Monitor, 16)}</span>
         <span class="desktop-browser-task-title">Desktop browser</span>
-        <span class="desktop-browser-task-status ${waiting ? "waiting" : "canceled"}"
-          >${waiting ? "Waiting for Host Broker" : "Canceled"}</span
+        <span class="desktop-browser-task-status ${statusClass}"
+          >${statusLabel}</span
         >
       </div>
       ${
-        waiting
+        task.status !== "canceled"
           ? html`<div class="desktop-browser-command">
               <code>${task.connectCommand}</code>
               <button
@@ -2059,18 +2095,47 @@ export function createChatSurface(
             </div>`
           : nothing
       }
+      ${
+        task.registration
+          ? html`<div class="desktop-browser-registration">
+              <div class="desktop-browser-registration-row">
+                <span>Confirmation fingerprint</span>
+                <code>${task.registration.confirmationFingerprint}</code>
+              </div>
+              <div class="desktop-browser-registration-row">
+                <span>Registration expires</span>
+                <span>${new Date(task.registration.expiresAt).toLocaleString()}</span>
+              </div>
+            </div>`
+          : nothing
+      }
       ${task.actionError ? html`<div class="desktop-browser-task-error">${task.actionError}</div>` : nothing}
       ${
-        task.actions.length
+        task.status !== "canceled"
           ? html`<div class="desktop-browser-task-actions">
               <button
                 type="button"
                 class="desktop-browser-continue"
-                title="Continue becomes available after the Host Broker connects"
+                title="Continue stays disabled until Ticket09 implements resume"
                 disabled
               >
                 ${icon(Play, 14)}<span>Continue</span>
               </button>
+              ${
+                task.actions.includes("confirm")
+                  ? html`<button
+                      type="button"
+                      class="desktop-browser-confirm"
+                      title=${task.registration?.confirmReady
+                        ? "Confirm the matching Host Broker fingerprint"
+                        : "Waiting for the Host-signed confirmation envelope"}
+                      ?disabled=${!task.registration?.confirmReady}
+                      @click=${() => void confirm()}
+                    >
+                      ${icon(Check, 14)}<span>Confirm registration</span>
+                    </button>`
+                  : nothing
+              }
               <button type="button" class="desktop-browser-cancel" @click=${() => void cancel()}>
                 ${icon(Ban, 14)}<span>Cancel</span>
               </button>

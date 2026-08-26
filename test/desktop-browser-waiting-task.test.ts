@@ -1,6 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,7 +44,7 @@ test("an explicit Project desktop-browser turn creates one durable waiting activ
     status: "waiting_for_broker",
     connectCommand: "qm-host-broker connect https://qm.example.com",
     actionAuthority: result.desktopBrowserActivity.actionAuthority,
-    actions: ["continue", "cancel"],
+    actions: ["cancel"],
   });
   assert.match(result.reply ?? "", /qm-host-broker connect https:\/\/qm\.example\.com/);
 
@@ -93,6 +94,102 @@ test("an explicit Project desktop-browser turn creates one durable waiting activ
         event.status === "waiting_for_broker",
     ),
   );
+});
+
+test("waiting task activity replays reservation fingerprint and staged confirmation readiness through one card", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-confirmation-activity-")),
+      publicWebUrl: "https://qm.example.com",
+    }),
+  );
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  const project = await built.app.createProject("owner", "Confirmation Project");
+  assert.ok(project);
+  const created = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "owner", displayName: "Owner" },
+    conversation: {
+      kind: "group",
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:desktop-browser-confirmation-activity",
+      audience: [],
+    },
+    text: "/desktop-browser open the dashboard",
+  });
+  const taskId = created.desktopBrowserActivity?.taskId;
+  const authorityId = created.desktopBrowserActivity?.actionAuthority;
+  assert.ok(taskId);
+  assert.ok(authorityId);
+
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const reserved = await built.app.desktopBrowserReserveRegistration(taskId!, authorityId!, {
+    devicePublicKey: `ed25519:${Buffer.from(publicKey.export({ format: "der", type: "spki" })).toString("base64")}`,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+    operatingSystem: "macos-arm64",
+  });
+  assert.equal(reserved.status, "ok");
+  if (reserved.status !== "ok") return;
+
+  const afterReserve = await built.app.getSession(created.sessionId!);
+  const reservedActivity = afterReserve?.entries.findLast((entry) => entry.type === "assistant")?.payload as
+    | { desktopBrowserActivity?: { status?: string; registration?: { confirmReady?: boolean; confirmationFingerprint?: string } } }
+    | undefined;
+  assert.equal(reservedActivity?.desktopBrowserActivity?.status, "waiting_for_local_confirmation");
+  assert.equal(reservedActivity?.desktopBrowserActivity?.registration?.confirmReady, false);
+  assert.equal(
+    reservedActivity?.desktopBrowserActivity?.registration?.confirmationFingerprint,
+    reserved.reservation.confirmationFingerprint,
+  );
+
+  const envelope = {
+    registrationTuple: reserved.reservation.registrationTuple,
+    publicIdentity: reserved.reservation.publicIdentity,
+    confirmationFingerprint: reserved.reservation.confirmationFingerprint,
+    signatureAlgorithm: "ed25519" as const,
+    signature: Buffer.from(
+      sign(null, Buffer.from(reserved.reservation.verificationBytesBase64, "base64"), privateKey),
+    ).toString("base64"),
+  };
+  assert.deepEqual(
+    await built.app.desktopBrowserStageRegistrationConfirmation(
+      String(reserved.reservation.registrationTuple.registrationId),
+      {
+        browserRuntimeStatus: "ready",
+        envelope,
+      },
+    ),
+    {
+      status: "ok",
+      registration: {
+        registrationId: String(reserved.reservation.registrationTuple.registrationId),
+        confirmationFingerprint: reserved.reservation.confirmationFingerprint,
+        expiresAt: String(reserved.reservation.registrationTuple.expiresAt),
+        status: "ready_to_confirm",
+      },
+    },
+  );
+
+  const afterStage = await built.app.getSession(created.sessionId!);
+  const stagedActivity = afterStage?.entries.findLast((entry) => entry.type === "assistant")?.payload as
+    | { desktopBrowserActivity?: { status?: string; registration?: { confirmReady?: boolean } } }
+    | undefined;
+  assert.equal(stagedActivity?.desktopBrowserActivity?.status, "waiting_for_local_confirmation");
+  assert.equal(stagedActivity?.desktopBrowserActivity?.registration?.confirmReady, true);
+
+  const confirmed = await built.app.desktopBrowserConfirmRegistration(
+    String(reserved.reservation.registrationTuple.registrationId),
+    "owner",
+    authorityId!,
+    {
+      taskId: taskId!,
+      confirmationFingerprint: reserved.reservation.confirmationFingerprint,
+    },
+  );
+  assert.equal(confirmed.status, "ok");
+  assert.equal(confirmed.desktopBrowserActivity?.status, "registration_confirmed");
 });
 
 test("desktop browser routing stays explicit and current Project authorization fails closed", async () => {
