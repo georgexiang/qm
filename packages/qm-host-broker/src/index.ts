@@ -34,6 +34,8 @@ import {
 
 const MAX_RELAY_MESSAGE_BYTES = 64 * 1024;
 const RELAY_HANDSHAKE_TIMEOUT_MS = 10_000;
+const RECONNECT_BACKOFF_BASE_MS = 250;
+const RECONNECT_BACKOFF_MAX_MS = 5_000;
 const SAFE_DIR_MODE = 0o700;
 const SAFE_FILE_MODE = 0o600;
 
@@ -63,6 +65,7 @@ export interface HostBrokerStateSnapshot {
   currentTaskPresent: boolean;
   brokerInstanceId: string;
   browserInstanceId: string | null;
+  processEpoch: number | null;
   connectionEpoch: number | null;
   devicePublicKey: string;
   publicDeviceFingerprint: string | null;
@@ -84,6 +87,7 @@ export interface RegistrationConfirmationPreview {
 
 export interface HostBrokerSocket {
   addEventListener(type: "open" | "message" | "close" | "error", listener: (event?: unknown) => void): void;
+  removeEventListener?(type: "open" | "message" | "close" | "error", listener: (event?: unknown) => void): void;
   send(data: string): void;
   close(code?: number, reason?: string): void;
 }
@@ -108,6 +112,9 @@ export interface HostBrokerConnectionOptions {
   transport: HostBrokerTransport;
   maxMessageBytes?: number;
   handshakeTimeoutMs?: number;
+  signal?: AbortSignal;
+  scheduler?: HostBrokerScheduler;
+  processEpoch?: number | null;
   onStateChange?: (state: HostBrokerStateSnapshot) => void;
 }
 
@@ -120,6 +127,24 @@ export interface HostBrokerCliDeps {
   brokerVersion?: string;
   resolveRelayUrl?: (qmUrl: string) => string;
   runtime?: BrowserRuntimeMetadata;
+  signal?: AbortSignal;
+  scheduler?: HostBrokerScheduler;
+  reconnectBaseMs?: number;
+  reconnectMaxMs?: number;
+}
+
+export interface HostBrokerScheduler {
+  now(): number;
+  random(): number;
+  setTimeout(callback: () => void, ms: number): HostBrokerTimer;
+  clearTimeout(timer: HostBrokerTimer): void;
+}
+
+type HostBrokerTimer = ReturnType<typeof setTimeout>;
+
+interface HostBrokerConnectionRunResult {
+  reason: "retryable-close" | "settled" | "stopped";
+  ready: boolean;
 }
 
 interface DeviceIdentityFile {
@@ -146,6 +171,23 @@ const DEFAULT_RUNTIME: BrowserRuntimeMetadata = {
   extensionVersion: "unavailable",
   cliShapeHash: "unavailable",
 };
+
+const DEFAULT_SCHEDULER: HostBrokerScheduler = {
+  now: () => Date.now(),
+  random: () => Math.random(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (timer) => clearTimeout(timer),
+};
+
+class RetryableHostBrokerError extends Error {
+  readonly ready: boolean;
+
+  constructor(message: string, ready: boolean) {
+    super(message);
+    this.name = "RetryableHostBrokerError";
+    this.ready = ready;
+  }
+}
 
 function encodeDevicePublicKey(publicKey: ReturnType<typeof createPublicKey>): string {
   return `ed25519:${publicKey.export({ format: "der", type: "spki" }).toString("base64url")}`;
@@ -252,10 +294,16 @@ function saveState(dataDir: string, state: BrokerStateFile): void {
 
 function withLatestConfirmationPreview(dataDir: string, state: HostBrokerStateSnapshot): HostBrokerStateSnapshot {
   const stored = loadState(dataDir);
+  const keepPreview =
+    stored !== null &&
+    stored.deploymentCanonicalId === state.deploymentCanonicalId &&
+    stored.brokerInstanceId === state.brokerInstanceId &&
+    stored.browserInstanceId === state.browserInstanceId &&
+    stored.connectionEpoch === state.connectionEpoch;
   return {
     ...state,
-    publicDeviceFingerprint: stored?.publicDeviceFingerprint ?? state.publicDeviceFingerprint,
-    confirmationFingerprint: stored?.confirmationFingerprint ?? state.confirmationFingerprint,
+    publicDeviceFingerprint: keepPreview ? stored.publicDeviceFingerprint : null,
+    confirmationFingerprint: keepPreview ? stored.confirmationFingerprint : null,
   };
 }
 
@@ -269,6 +317,7 @@ function createInitialState(input: {
   devicePublicKey: string;
   publicDeviceFingerprint: string | null;
   confirmationFingerprint: string | null;
+  processEpoch: number | null;
   connectionEpoch: number | null;
 }): BrokerStateFile {
   return {
@@ -280,6 +329,7 @@ function createInitialState(input: {
     currentTaskPresent: false,
     brokerInstanceId: input.brokerInstanceId,
     browserInstanceId: input.browserInstanceId,
+    processEpoch: input.processEpoch,
     connectionEpoch: input.connectionEpoch,
     devicePublicKey: input.devicePublicKey,
     publicDeviceFingerprint: input.publicDeviceFingerprint,
@@ -346,6 +396,7 @@ function renderHumanState(state: HostBrokerStateSnapshot): string {
     `BrowserSkill status: ${state.browserSkillStatus}`,
     `Broker instance: ${state.brokerInstanceId}`,
     `Browser instance: ${state.browserInstanceId ?? "unbound"}`,
+    `Process epoch: ${state.processEpoch ?? "idle"}`,
     `Connection epoch: ${state.connectionEpoch ?? "unregistered"}`,
     `Confirmation fingerprint: ${state.confirmationFingerprint ?? "pending local confirmation"}`,
     `Public device fingerprint: ${state.publicDeviceFingerprint ?? "pending local confirmation"}`,
@@ -433,6 +484,72 @@ function defaultTransport(): HostBrokerTransport {
     connect(url: string) {
       return new WebSocket(url) as unknown as HostBrokerSocket;
     },
+  };
+}
+
+function isRetryableHostBrokerError(error: unknown): error is RetryableHostBrokerError {
+  return error instanceof RetryableHostBrokerError;
+}
+
+function nextProcessEpoch(existing: number | null | undefined, scheduler: HostBrokerScheduler): number {
+  return Math.max((existing ?? 0) + 1, scheduler.now());
+}
+
+function computeReconnectDelayMs(
+  consecutiveTransientFailures: number,
+  baseMs: number,
+  maxMs: number,
+  scheduler: HostBrokerScheduler,
+): number {
+  const exponent = Math.max(0, consecutiveTransientFailures);
+  const cappedBase = Math.min(maxMs, baseMs * 2 ** exponent);
+  return Math.max(1, Math.floor(cappedBase * (0.5 + scheduler.random() * 0.5)));
+}
+
+function waitForDelay(ms: number, signal: AbortSignal | undefined, scheduler: HostBrokerScheduler): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    let timer: HostBrokerTimer | null = null;
+    const finish = (value: boolean): void => {
+      if (timer !== null) scheduler.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(false);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timer = scheduler.setTimeout(() => finish(true), ms);
+  });
+}
+
+function closeDescription(code: number | null, reason: string | null): string {
+  const parts = [] as string[];
+  if (code !== null) parts.push(`code ${code}`);
+  if (reason) parts.push(`reason ${JSON.stringify(reason)}`);
+  return parts.length > 0 ? ` (${parts.join(", ")})` : "";
+}
+
+function closeEventDetails(event?: unknown): { code: number | null; reason: string | null } {
+  if (!event || typeof event !== "object") return { code: null, reason: null };
+  const code =
+    "code" in event && typeof (event as { code?: unknown }).code === "number" ? (event as { code: number }).code : null;
+  const reason =
+    "reason" in event && typeof (event as { reason?: unknown }).reason === "string"
+      ? (event as { reason: string }).reason
+      : null;
+  return { code, reason };
+}
+
+function classifySocketClose(
+  event: unknown,
+  ready: boolean,
+  locallyRequestedStop: boolean,
+): { result?: HostBrokerConnectionRunResult; error?: Error } {
+  const { code, reason } = closeEventDetails(event);
+  if (locallyRequestedStop) return { result: { reason: "stopped", ready } };
+  if (code === 1012) return { result: { reason: "retryable-close", ready } };
+  if (code === 1000) return { result: { reason: "settled", ready } };
+  return {
+    error: new Error(`host broker relay closed with a nonretryable code${closeDescription(code, reason)}`),
   };
 }
 
@@ -567,6 +684,7 @@ export class HostBrokerConnection {
       devicePublicKey: options.identity.devicePublicKey,
       publicDeviceFingerprint: options.publicDeviceFingerprint ?? null,
       confirmationFingerprint: options.confirmationFingerprint ?? null,
+      processEpoch: options.processEpoch ?? null,
       connectionEpoch: options.connectionEpoch ?? null,
     });
   }
@@ -579,32 +697,35 @@ export class HostBrokerConnection {
     this.options.onStateChange?.(this.snapshot());
   }
 
-  start(): Promise<void> {
+  start(): Promise<HostBrokerConnectionRunResult> {
     assertSecureRelayUrl(this.options.relayUrl);
     assertConnectableRuntime(this.options.runtime);
-    const socket = this.options.transport.connect(this.options.relayUrl);
-    return new Promise<void>((resolve, reject) => {
+    const scheduler = this.options.scheduler ?? DEFAULT_SCHEDULER;
+    if (this.options.signal?.aborted) {
+      this.snapshotState.brokerStatus = "disconnected";
+      this.emitState();
+      return Promise.resolve({ reason: "stopped", ready: false });
+    }
+    let socket: HostBrokerSocket;
+    try {
+      socket = this.options.transport.connect(this.options.relayUrl);
+    } catch (error) {
+      throw new RetryableHostBrokerError(error instanceof Error ? error.message : String(error), false);
+    }
+    return new Promise<HostBrokerConnectionRunResult>((resolve, reject) => {
       let settled = false;
       let challenged = false;
       let handshakeComplete = false;
-      const handshakeTimeout = setTimeout(() => {
-        finish(new Error("relay challenge timed out before host registration completed"));
+      let active = true;
+      let locallyRequestedStop = false;
+      const handshakeTimeout = scheduler.setTimeout(() => {
+        finish(
+          undefined,
+          new RetryableHostBrokerError("relay challenge timed out before host registration completed", challenged),
+        );
       }, this.options.handshakeTimeoutMs ?? RELAY_HANDSHAKE_TIMEOUT_MS);
-      const clearHandshakeTimeout = (): void => {
-        if (handshakeComplete) return;
-        handshakeComplete = true;
-        clearTimeout(handshakeTimeout);
-      };
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        clearHandshakeTimeout();
-        this.snapshotState.brokerStatus = "disconnected";
-        this.emitState();
-        if (error) reject(error);
-        else resolve();
-      };
-      socket.addEventListener("open", () => {
+      const openListener = () => {
+        if (!active) return;
         socket.send(
           encodeDesktopBrowserMessage({
             protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
@@ -621,8 +742,9 @@ export class HostBrokerConnection {
             },
           }),
         );
-      });
-      socket.addEventListener("message", (event) => {
+      };
+      const messageListener = (event?: unknown) => {
+        if (!active) return;
         try {
           const raw =
             event && typeof event === "object" && "data" in event ? String((event as { data: unknown }).data) : "";
@@ -651,12 +773,110 @@ export class HostBrokerConnection {
           }
           throw new Error(`unsupported relay message kind ${JSON.stringify(message.kind)}`);
         } catch (error) {
-          finish(error instanceof Error ? error : new Error(String(error)));
+          finish(undefined, error instanceof Error ? error : new Error(String(error)));
         }
-      });
-      socket.addEventListener("close", () => finish());
-      socket.addEventListener("error", () => finish(new Error("host broker transport failed")));
+      };
+      const closeListener = (event?: unknown) => {
+        if (!active) return;
+        const classified = classifySocketClose(
+          event,
+          challenged,
+          locallyRequestedStop || this.options.signal?.aborted === true,
+        );
+        finish(classified.result, classified.error);
+      };
+      const errorListener = () => {
+        if (!active) return;
+        finish(undefined, new RetryableHostBrokerError("host broker transport failed", challenged));
+      };
+      const detachListeners = (): void => {
+        active = false;
+        socket.removeEventListener?.("open", openListener);
+        socket.removeEventListener?.("message", messageListener);
+        socket.removeEventListener?.("close", closeListener);
+        socket.removeEventListener?.("error", errorListener);
+      };
+      const closeSocket = (code: number, reason: string): void => {
+        locallyRequestedStop = true;
+        try {
+          socket.close(code, reason);
+        } catch {
+          return;
+        }
+      };
+      const onAbort = (): void => {
+        try {
+          closeSocket(1000, "local stop");
+        } finally {
+          finish({ reason: "stopped", ready: challenged });
+        }
+      };
+      const clearHandshakeTimeout = (): void => {
+        if (handshakeComplete) return;
+        handshakeComplete = true;
+        scheduler.clearTimeout(handshakeTimeout);
+      };
+      const finish = (result?: HostBrokerConnectionRunResult, error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        detachListeners();
+        clearHandshakeTimeout();
+        this.options.signal?.removeEventListener("abort", onAbort);
+        if (!locallyRequestedStop) closeSocket(1000, error ? "local cleanup" : "settled");
+        this.snapshotState.brokerStatus = "disconnected";
+        this.emitState();
+        if (error) reject(error);
+        else resolve(result ?? { reason: "settled", ready: challenged });
+      };
+      this.options.signal?.addEventListener("abort", onAbort, { once: true });
+      socket.addEventListener("open", openListener);
+      socket.addEventListener("message", messageListener);
+      socket.addEventListener("close", closeListener);
+      socket.addEventListener("error", errorListener);
     });
+  }
+}
+
+async function runHostBrokerConnectionSupervisor(options: {
+  initialState: HostBrokerStateSnapshot;
+  dataDir: string;
+  signal: AbortSignal;
+  scheduler: HostBrokerScheduler;
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+  createConnection: (state: HostBrokerStateSnapshot) => HostBrokerConnection;
+}): Promise<HostBrokerStateSnapshot> {
+  let state = options.initialState;
+  let consecutiveTransientFailures = 0;
+  while (true) {
+    if (options.signal.aborted) return state;
+    const connection = options.createConnection(state);
+    try {
+      const result = await connection.start();
+      state = withLatestConfirmationPreview(options.dataDir, { ...state, ...connection.snapshot() });
+      saveState(options.dataDir, state);
+      if (result.reason !== "retryable-close") return state;
+      consecutiveTransientFailures = result.ready ? 0 : consecutiveTransientFailures + 1;
+    } catch (error) {
+      state = withLatestConfirmationPreview(options.dataDir, {
+        ...state,
+        ...connection.snapshot(),
+        brokerStatus: "disconnected",
+      });
+      saveState(options.dataDir, state);
+      if (!isRetryableHostBrokerError(error) || options.signal.aborted) {
+        throw error;
+      }
+      consecutiveTransientFailures = error.ready ? 0 : consecutiveTransientFailures + 1;
+    }
+    const delayMs = computeReconnectDelayMs(
+      consecutiveTransientFailures,
+      options.reconnectBaseMs,
+      options.reconnectMaxMs,
+      options.scheduler,
+    );
+    const shouldContinue = await waitForDelay(delayMs, options.signal, options.scheduler);
+    if (!shouldContinue) return state;
   }
 }
 
@@ -668,6 +888,8 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
   const stored = loadState(deps.dataDir);
   const brokerInstanceId = nextBrokerInstanceId(deps.brokerInstanceId ?? stored?.brokerInstanceId ?? null);
   const runtime = deps.runtime ?? DEFAULT_RUNTIME;
+  const scheduler = deps.scheduler ?? DEFAULT_SCHEDULER;
+  const storedProcessEpoch = stored?.processEpoch ?? null;
 
   if (command === "status") {
     ensureNoExtraArgs(rest);
@@ -683,6 +905,7 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         devicePublicKey: identity.devicePublicKey,
         publicDeviceFingerprint: null,
         confirmationFingerprint: null,
+        processEpoch: storedProcessEpoch,
         connectionEpoch: null,
       });
     writeOutput(deps.stdout, json, state);
@@ -723,6 +946,7 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         devicePublicKey: identity.devicePublicKey,
         publicDeviceFingerprint: preview.publicDeviceFingerprint,
         confirmationFingerprint: preview.confirmationFingerprint,
+        processEpoch: storedProcessEpoch,
         connectionEpoch: null,
       });
     const nextState: HostBrokerStateSnapshot = {
@@ -763,6 +987,7 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
     if (!qmUrl) throw new Error("connect requires the QM public URL");
     ensureNoExtraArgs(rest);
     const relayUrl = deps.resolveRelayUrl ? deps.resolveRelayUrl(qmUrl) : resolveRelayUrlDefault(qmUrl);
+    const processEpoch = nextProcessEpoch(stored?.processEpoch ?? null, scheduler);
     const initialState = createInitialState({
       qmUrl,
       relayUrl,
@@ -773,38 +998,60 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
       devicePublicKey: identity.devicePublicKey,
       publicDeviceFingerprint: stored?.publicDeviceFingerprint ?? null,
       confirmationFingerprint: stored?.confirmationFingerprint ?? null,
+      processEpoch,
       connectionEpoch: stored?.connectionEpoch ?? null,
     });
     saveState(deps.dataDir, initialState);
     if (!json) deps.stdout.write(`${renderHumanState(initialState)}\n`);
-    const connection = new HostBrokerConnection({
-      qmUrl,
-      relayUrl,
-      deploymentCanonicalId: stored?.deploymentCanonicalId ?? null,
-      brokerInstanceId,
-      brokerVersion: deps.brokerVersion ?? "0.0.0",
-      supportedProtocolVersions: [DESKTOP_BROWSER_PROTOCOL_VERSION],
-      supportedPolicyGrammarVersions: ["1.0"],
-      identity,
-      runtime,
-      connectionEpoch: stored?.connectionEpoch ?? null,
-      publicDeviceFingerprint: stored?.publicDeviceFingerprint ?? null,
-      confirmationFingerprint: stored?.confirmationFingerprint ?? null,
-      transport: deps.transport ?? defaultTransport(),
-      onStateChange(state) {
-        saveState(deps.dataDir, withLatestConfirmationPreview(deps.dataDir, { ...initialState, ...state }));
-      },
-    });
+    const createConnection = (state: HostBrokerStateSnapshot): HostBrokerConnection =>
+      new HostBrokerConnection({
+        qmUrl,
+        relayUrl,
+        deploymentCanonicalId: state.deploymentCanonicalId,
+        brokerInstanceId: state.brokerInstanceId,
+        brokerVersion: deps.brokerVersion ?? "0.0.0",
+        supportedProtocolVersions: [DESKTOP_BROWSER_PROTOCOL_VERSION],
+        supportedPolicyGrammarVersions: ["1.0"],
+        identity,
+        runtime,
+        connectionEpoch: state.connectionEpoch,
+        publicDeviceFingerprint: state.publicDeviceFingerprint,
+        confirmationFingerprint: state.confirmationFingerprint,
+        processEpoch: state.processEpoch,
+        transport: deps.transport ?? defaultTransport(),
+        signal: deps.signal,
+        scheduler,
+        onStateChange(nextState) {
+          saveState(deps.dataDir, withLatestConfirmationPreview(deps.dataDir, { ...state, ...nextState }));
+        },
+      });
     try {
-      await connection.start();
-      const finalState = withLatestConfirmationPreview(deps.dataDir, { ...initialState, ...connection.snapshot() });
-      saveState(deps.dataDir, finalState);
+      const finalState = deps.signal
+        ? await runHostBrokerConnectionSupervisor({
+            initialState,
+            dataDir: deps.dataDir,
+            signal: deps.signal,
+            scheduler,
+            reconnectBaseMs: deps.reconnectBaseMs ?? RECONNECT_BACKOFF_BASE_MS,
+            reconnectMaxMs: deps.reconnectMaxMs ?? RECONNECT_BACKOFF_MAX_MS,
+            createConnection,
+          })
+        : await (() => {
+            const connection = createConnection(initialState);
+            return connection.start().then(() => {
+              const oneShotState = withLatestConfirmationPreview(deps.dataDir, {
+                ...initialState,
+                ...connection.snapshot(),
+              });
+              saveState(deps.dataDir, oneShotState);
+              return oneShotState;
+            });
+          })();
       if (json) writeOutput(deps.stdout, true, finalState);
       return 0;
     } catch (error) {
       const failedState = withLatestConfirmationPreview(deps.dataDir, {
-        ...initialState,
-        ...connection.snapshot(),
+        ...(loadState(deps.dataDir) ?? initialState),
         brokerStatus: "disconnected" as const,
       });
       saveState(deps.dataDir, failedState);

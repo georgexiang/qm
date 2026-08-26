@@ -19,6 +19,7 @@ import {
   verifyHostChallengeResponseMessage,
   verifyRegistrationConfirmationEnvelopeSignature,
   type BrowserRuntimeMetadata,
+  type HostBrokerScheduler,
   type HostBrokerSocket,
   type HostBrokerTransport,
 } from "../packages/qm-host-broker/src/index.ts";
@@ -28,6 +29,8 @@ class FakeSocket implements HostBrokerSocket {
   readonly sent: string[] = [];
   closeCode: number | undefined;
   closeReason: string | undefined;
+  closeCalls = 0;
+  closed = false;
 
   addEventListener(type: "open" | "message" | "close" | "error", listener: (event?: unknown) => void): void {
     const current = this.listeners.get(type) ?? [];
@@ -35,25 +38,39 @@ class FakeSocket implements HostBrokerSocket {
     this.listeners.set(type, current);
   }
 
+  removeEventListener(type: "open" | "message" | "close" | "error", listener: (event?: unknown) => void): void {
+    const current = this.listeners.get(type) ?? [];
+    this.listeners.set(
+      type,
+      current.filter((entry) => entry !== listener),
+    );
+  }
+
   send(data: string): void {
     this.sent.push(data);
   }
 
   close(code?: number, reason?: string): void {
+    this.closeCalls += 1;
+    if (this.closed) return;
+    this.closed = true;
     this.closeCode = code;
     this.closeReason = reason;
     this.emit("close", { code, reason });
   }
 
   open(): void {
+    if (this.closed) return;
     this.emit("open");
   }
 
   message(data: string): void {
+    if (this.closed) return;
     this.emit("message", { data });
   }
 
   fail(): void {
+    if (this.closed) return;
     this.emit("error", new Error("socket failed"));
   }
 
@@ -74,6 +91,43 @@ class FakeTransport implements HostBrokerTransport {
   connect(url: string): HostBrokerSocket {
     assert.equal(url, this.expectedUrl);
     return this.socket;
+  }
+}
+
+class FakeScheduler implements HostBrokerScheduler {
+  nowMs = 0;
+  randomValues: number[] = [];
+  private nextId = 1;
+  private readonly timers = new Map<number, { runAt: number; callback: () => void }>();
+
+  now(): number {
+    return this.nowMs;
+  }
+
+  random(): number {
+    return this.randomValues.shift() ?? 0;
+  }
+
+  setTimeout(callback: () => void, ms: number): ReturnType<typeof setTimeout> {
+    const id = this.nextId++;
+    this.timers.set(id, { runAt: this.nowMs + ms, callback });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }
+
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void {
+    this.timers.delete(timer as unknown as number);
+  }
+
+  advance(ms: number): void {
+    this.nowMs += ms;
+    while (true) {
+      const due = [...this.timers.entries()]
+        .filter(([, timer]) => timer.runAt <= this.nowMs)
+        .sort((a, b) => a[1].runAt - b[1].runAt || a[0] - b[0])[0];
+      if (!due) return;
+      this.timers.delete(due[0]);
+      due[1].callback();
+    }
   }
 }
 
@@ -285,6 +339,7 @@ test("connect handshake sends shared hello and signed challenge response through
     currentTaskPresent: false,
     brokerInstanceId: "broker-local-1",
     browserInstanceId: "browser-primary",
+    processEpoch: null,
     connectionEpoch: 7,
     devicePublicKey: identity.devicePublicKey,
     publicDeviceFingerprint: null,
@@ -293,7 +348,7 @@ test("connect handshake sends shared hello and signed challenge response through
   });
 
   socket.close(1000, "done");
-  await running;
+  assert.deepEqual(await running, { reason: "settled", ready: true });
   assert.equal(connection.snapshot().brokerStatus, "disconnected");
 });
 
@@ -449,7 +504,7 @@ test("host challenge response signature fails if any signed binding field is mut
   }
 
   socket.close(1000, "done");
-  await running;
+  assert.deepEqual(await running, { reason: "settled", ready: true });
 });
 
 test("connect clears the handshake timeout after the validated challenge and keeps the WSS open", async () => {
@@ -766,7 +821,7 @@ test("connect preserves a newer authoritative epoch after a post-handshake trans
   await runHostBrokerCli(["confirmation", "--tuple-json", JSON.stringify(tuple), "--json"], baseDeps);
   const previewPayload = JSON.parse(stdoutChunks.join("")) as { confirmationFingerprint: string };
 
-  socket1.close(1000, "rotate");
+  socket1.close(1012, "service restart");
   await firstConnect;
 
   const secondConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -816,6 +871,344 @@ test("connect preserves a newer authoritative epoch after a post-handshake trans
   assert.equal(statusPayload.browserInstanceId, tuple.browserInstanceId);
   assert.equal(statusPayload.connectionEpoch, tuple.connectionEpoch + 1);
   assert.match(stderrChunks.join(""), /host broker transport failed/);
+});
+
+test("connect supervisor reconnects after 1012 service restart, keeps only one socket active, and advances the authoritative epoch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-supervisor-reconnect-"));
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const tuple = tupleForIdentity(identity.devicePublicKey);
+  const socket1 = new FakeSocket();
+  const socket2 = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  scheduler.randomValues = [0, 0];
+  let transportCall = 0;
+  const controller = new AbortController();
+  const baseDeps = {
+    dataDir: dir,
+    stdout: {
+      write(chunk: string) {
+        stdoutChunks.push(chunk);
+      },
+    },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, "wss://relay.example.com/v1/device");
+        transportCall += 1;
+        return transportCall === 1 ? socket1 : socket2;
+      },
+    } satisfies HostBrokerTransport,
+    resolveRelayUrl: () => "wss://relay.example.com/v1/device",
+    brokerInstanceId: tuple.brokerInstanceId,
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+    signal: controller.signal,
+    scheduler,
+    reconnectBaseMs: 200,
+    reconnectMaxMs: 1_000,
+  };
+
+  const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 1);
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const disconnectedStatus = JSON.parse(stdoutChunks.join("")) as {
+    brokerStatus: string;
+    processEpoch: number;
+    connectionEpoch: number | null;
+  };
+  assert.equal(disconnectedStatus.brokerStatus, "disconnected");
+  assert.equal(typeof disconnectedStatus.processEpoch, "number");
+  assert.equal(disconnectedStatus.connectionEpoch, null);
+
+  socket1.open();
+  socket1.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a",
+        challengeNonce: "nonce-1",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const readyStatus = JSON.parse(stdoutChunks.join("")) as {
+    brokerStatus: string;
+    processEpoch: number;
+    connectionEpoch: number;
+  };
+  assert.equal(readyStatus.brokerStatus, "ready");
+  assert.equal(readyStatus.processEpoch, disconnectedStatus.processEpoch);
+  assert.equal(readyStatus.connectionEpoch, tuple.connectionEpoch);
+
+  socket1.close(1012, "service restart");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 1);
+  assert.equal(socket1.closeCode, 1012);
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const backoffStatus = JSON.parse(stdoutChunks.join("")) as { brokerStatus: string; connectionEpoch: number };
+  assert.equal(backoffStatus.brokerStatus, "disconnected");
+  assert.equal(backoffStatus.connectionEpoch, tuple.connectionEpoch);
+
+  scheduler.advance(99);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 1);
+  scheduler.advance(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 2);
+
+  socket2.open();
+  socket2.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-b",
+        challengeNonce: "nonce-2",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch + 1,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const reconnectedStatus = JSON.parse(stdoutChunks.join("")) as {
+    brokerStatus: string;
+    connectionEpoch: number;
+    processEpoch: number;
+  };
+  assert.equal(reconnectedStatus.brokerStatus, "ready");
+  assert.equal(reconnectedStatus.connectionEpoch, tuple.connectionEpoch + 1);
+  assert.equal(reconnectedStatus.processEpoch, disconnectedStatus.processEpoch);
+
+  controller.abort();
+  assert.equal(await connectPromise, 0);
+  assert.equal(stderrChunks.length, 0);
+});
+
+test("connect supervisor aborts during backoff without opening a duplicate socket", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-supervisor-abort-"));
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const tuple = tupleForIdentity(identity.devicePublicKey);
+  const socket1 = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  scheduler.randomValues = [0];
+  let transportCall = 0;
+  const controller = new AbortController();
+  const baseDeps = {
+    dataDir: dir,
+    stdout: {
+      write(chunk: string) {
+        stdoutChunks.push(chunk);
+      },
+    },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, "wss://relay.example.com/v1/device");
+        transportCall += 1;
+        return socket1;
+      },
+    } satisfies HostBrokerTransport,
+    resolveRelayUrl: () => "wss://relay.example.com/v1/device",
+    brokerInstanceId: tuple.brokerInstanceId,
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+    signal: controller.signal,
+    scheduler,
+    reconnectBaseMs: 200,
+    reconnectMaxMs: 1_000,
+  };
+
+  const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.open();
+  socket1.fail();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 1);
+  assert.equal(socket1.closeCode, 1000);
+  assert.equal(socket1.closeReason, "local cleanup");
+
+  controller.abort();
+  assert.equal(await connectPromise, 0);
+  assert.equal(transportCall, 1);
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const statusPayload = JSON.parse(stdoutChunks.join("")) as { brokerStatus: string };
+  assert.equal(statusPayload.brokerStatus, "disconnected");
+  assert.equal(stderrChunks.length, 0);
+});
+
+test("connect supervisor fails closed on fatal close code without retry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-supervisor-fatal-close-"));
+  const stderrChunks: string[] = [];
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const tuple = tupleForIdentity(identity.devicePublicKey);
+  const socket1 = new FakeSocket();
+  const socket2 = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  let transportCall = 0;
+  const controller = new AbortController();
+  const baseDeps = {
+    dataDir: dir,
+    stdout: { write() {} },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, "wss://relay.example.com/v1/device");
+        transportCall += 1;
+        return transportCall === 1 ? socket1 : socket2;
+      },
+    } satisfies HostBrokerTransport,
+    resolveRelayUrl: () => "wss://relay.example.com/v1/device",
+    brokerInstanceId: tuple.brokerInstanceId,
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+    signal: controller.signal,
+    scheduler,
+    reconnectBaseMs: 200,
+    reconnectMaxMs: 1_000,
+  };
+
+  const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.open();
+  socket1.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a",
+        challengeNonce: "nonce-1",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  socket1.close(1008, "policy violation");
+  assert.equal(await connectPromise, 1);
+  assert.equal(transportCall, 1);
+  assert.equal(socket2.sent.length, 0);
+  assert.match(stderrChunks.join(""), /nonretryable code \(code 1008, reason "policy violation"\)/);
+});
+
+test("connect supervisor fails closed on a nonretryable lower-epoch challenge after reconnect", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-supervisor-nonretryable-"));
+  const stderrChunks: string[] = [];
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const tuple = tupleForIdentity(identity.devicePublicKey);
+  const socket1 = new FakeSocket();
+  const socket2 = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  scheduler.randomValues = [0, 0];
+  let transportCall = 0;
+  const controller = new AbortController();
+  const baseDeps = {
+    dataDir: dir,
+    stdout: { write() {} },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, "wss://relay.example.com/v1/device");
+        transportCall += 1;
+        return transportCall === 1 ? socket1 : socket2;
+      },
+    } satisfies HostBrokerTransport,
+    resolveRelayUrl: () => "wss://relay.example.com/v1/device",
+    brokerInstanceId: tuple.brokerInstanceId,
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+    signal: controller.signal,
+    scheduler,
+    reconnectBaseMs: 200,
+    reconnectMaxMs: 1_000,
+  };
+
+  const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.open();
+  socket1.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a",
+        challengeNonce: "nonce-1",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch + 1,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.close(1012, "service restart");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  scheduler.advance(100);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCall, 2);
+
+  socket2.open();
+  socket2.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-b",
+        challengeNonce: "nonce-2",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch,
+      },
+    }),
+  );
+
+  assert.equal(await connectPromise, 1);
+  assert.equal(transportCall, 2);
+  assert.match(stderrChunks.join(""), /connection epoch.*older|older.*connection epoch/i);
 });
 
 test("live connect stores authoritative binding and stale preview then confirm both fail after reconnect epoch change", async () => {
@@ -897,7 +1290,7 @@ test("live connect stores authoritative binding and stale preview then confirm b
   assert.equal(firstStatusPayload.connectionEpoch, tuple.connectionEpoch);
   assert.equal(firstStatusPayload.confirmationFingerprint, previewPayload.confirmationFingerprint);
 
-  socket1.close(1000, "rotate");
+  socket1.close(1012, "service restart");
   await firstConnect;
 
   const secondConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -1023,7 +1416,7 @@ test("live connect accepts an identical reconnect idempotently without altering 
   assert.equal(firstStatusPayload.confirmationFingerprint, previewPayload.confirmationFingerprint);
   assert.equal(firstStatusPayload.publicDeviceFingerprint, previewPayload.publicDeviceFingerprint);
 
-  socket1.close(1000, "rotate");
+  socket1.close(1012, "service restart");
   await firstConnect;
 
   const secondConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -1130,7 +1523,7 @@ test("replayed lower-epoch relay challenges are rejected and cannot roll back st
   await runHostBrokerCli(["confirmation", "--tuple-json", JSON.stringify(tuple), "--json"], baseDeps);
   const previewPayload = JSON.parse(stdoutChunks.join("")) as { confirmationFingerprint: string };
 
-  socket1.close(1000, "rotate");
+  socket1.close(1012, "service restart");
   await firstConnect;
 
   const higherEpochTuple = { ...tuple, connectionEpoch: tuple.connectionEpoch + 1 };
@@ -1151,8 +1544,23 @@ test("replayed lower-epoch relay challenges are rejected and cannot roll back st
       },
     }),
   );
-  socket2.close(1000, "rotate");
+  socket2.close(1012, "service restart");
   assert.equal(await secondConnect, 0);
+
+  socket2.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-b-stale",
+        challengeNonce: "nonce-stale",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: higherEpochTuple.connectionEpoch + 1,
+      },
+    }),
+  );
 
   const replayedLowerEpochConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
   await new Promise((resolve) => setImmediate(resolve));
@@ -1200,4 +1608,106 @@ test("replayed lower-epoch relay challenges are rejected and cannot roll back st
   assert.equal(statusPayload.brokerInstanceId, tuple.brokerInstanceId);
   assert.equal(statusPayload.browserInstanceId, tuple.browserInstanceId);
   assert.equal(statusPayload.connectionEpoch, higherEpochTuple.connectionEpoch);
+});
+
+test("late stale frames after a retryable close are ignored and do not mutate persisted state", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-stale-frame-ignored-"));
+  const stdoutChunks: string[] = [];
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const tuple = tupleForIdentity(identity.devicePublicKey);
+  const socket1 = new FakeSocket();
+  const socket2 = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  scheduler.randomValues = [0, 0];
+  let transportCall = 0;
+  const controller = new AbortController();
+  const baseDeps = {
+    dataDir: dir,
+    stdout: {
+      write(chunk: string) {
+        stdoutChunks.push(chunk);
+      },
+    },
+    stderr: { write() {} },
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, "wss://relay.example.com/v1/device");
+        transportCall += 1;
+        return transportCall === 1 ? socket1 : socket2;
+      },
+    } satisfies HostBrokerTransport,
+    resolveRelayUrl: () => "wss://relay.example.com/v1/device",
+    brokerInstanceId: tuple.brokerInstanceId,
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+    signal: controller.signal,
+    scheduler,
+    reconnectBaseMs: 200,
+    reconnectMaxMs: 1_000,
+  };
+
+  const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.open();
+  socket1.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a",
+        challengeNonce: "nonce-1",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  socket1.close(1012, "service restart");
+  await new Promise((resolve) => setImmediate(resolve));
+  scheduler.advance(100);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket1.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a-stale",
+        challengeNonce: "nonce-stale",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch + 9,
+      },
+    }),
+  );
+  assert.equal(transportCall, 2);
+
+  socket2.open();
+  socket2.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-b",
+        challengeNonce: "nonce-2",
+        deploymentCanonicalId: tuple.deploymentCanonicalId,
+        brokerInstanceId: tuple.brokerInstanceId,
+        browserInstanceId: tuple.browserInstanceId,
+        connectionEpoch: tuple.connectionEpoch + 1,
+      },
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  stdoutChunks.length = 0;
+  await runHostBrokerCli(["status", "--json"], baseDeps);
+  const statusPayload = JSON.parse(stdoutChunks.join("")) as { connectionEpoch: number; brokerStatus: string };
+  assert.equal(statusPayload.brokerStatus, "ready");
+  assert.equal(statusPayload.connectionEpoch, tuple.connectionEpoch + 1);
+
+  controller.abort();
+  assert.equal(await connectPromise, 0);
 });
