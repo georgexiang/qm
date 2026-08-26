@@ -19,6 +19,7 @@ import { selectableCatalogForHarness, selectableModelCatalog } from "../model/mo
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
+import type { DesktopBrowserRegistrationConfirmationEnvelope } from "qm-desktop-browser-contracts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -39,6 +40,9 @@ export function createTurnMethods(
   App,
   | "turn"
   | "desktopBrowserTaskAction"
+  | "desktopBrowserReserveRegistration"
+  | "desktopBrowserConfirmRegistration"
+  | "desktopBrowserMarkRegistrationOffline"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -77,6 +81,38 @@ export function createTurnMethods(
       },
     };
   };
+  async function withCurrentWaitingTask<T>(
+    taskId: string,
+    authorityId: string,
+    fn: (task: NonNullable<Awaited<ReturnType<typeof deps.desktopBrowserTasks.get>>>) => Promise<T>,
+    onDrift?: () => Promise<void>,
+  ): Promise<T | { status: "refused"; reason: string }> {
+    const task = await deps.desktopBrowserTasks.get(taskId);
+    if (!task) {
+      await onDrift?.();
+      return { status: "refused", reason: "Desktop Browser Task not found" };
+    }
+    const locked = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+      await deps.identity.refresh();
+      const actor = deps.identity.classify(task.actorId);
+      const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+      if (
+        task.status !== "waiting_for_broker" ||
+        project.orgId !== orgIdOf() ||
+        String(project.updatedAt) !== task.projectMembershipVersion ||
+        !currentMembers.has(actor.id) ||
+        !deps.identity.isInternal(actor) ||
+        !deps.identity.isInternal(deps.identity.classify(project.ownerId)) ||
+        !constantTimeEqual(task.authorityId, authorityId) ||
+        task.authorityExpiresAt <= Date.now()
+      ) {
+        await onDrift?.();
+        return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+      }
+      return fn(task);
+    });
+    return locked ?? { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+  }
   return {
     async turn(req: TurnRequest): Promise<TurnResult> {
       await deps.identity.refresh();
@@ -623,6 +659,65 @@ export function createTurnMethods(
       } finally {
         await deps.sessions.releaseLease(leaseAttempt.lease);
       }
+    },
+
+    async desktopBrowserReserveRegistration(taskId, authorityId, input) {
+      return withCurrentWaitingTask(taskId, authorityId, async (task) => {
+        const reserved = await deps.desktopBrowserDeviceRegistry.reserve({
+          waitingTaskId: task.id,
+          actorId: task.actorId,
+          projectId: task.projectId,
+          membershipEpoch: Number(task.projectMembershipVersion),
+          authorityId: task.authorityId,
+          authorityExpiresAt: task.authorityExpiresAt,
+          devicePublicKey: input.devicePublicKey,
+          brokerInstanceId: input.brokerInstanceId,
+          browserInstanceId: input.browserInstanceId,
+          connectionEpoch: input.connectionEpoch,
+          operatingSystem: input.operatingSystem,
+        });
+        if (reserved.status === "refused") return reserved;
+        return {
+          status: "ok" as const,
+          reservation: {
+            registrationTuple: reserved.reservation.registrationTuple,
+            publicIdentity: reserved.reservation.publicIdentity,
+            confirmationFingerprint: reserved.reservation.confirmationFingerprint,
+            publicDeviceFingerprint: reserved.reservation.publicDeviceFingerprint,
+            verificationBytesBase64: reserved.reservation.verificationBytesBase64,
+          },
+        };
+      });
+    },
+
+    async desktopBrowserConfirmRegistration(registrationId, authorityId, input) {
+      const registration = await deps.desktopBrowserDeviceRegistry.get(registrationId);
+      if (!registration) return { status: "refused", reason: "desktop browser registration not found" };
+      return withCurrentWaitingTask(
+        registration.waitingTaskId,
+        authorityId,
+        async () =>
+          deps.desktopBrowserDeviceRegistry.confirm({
+            registrationId,
+            authorityId,
+            browserRuntimeStatus: input.browserRuntimeStatus,
+            envelope: input.envelope as unknown as DesktopBrowserRegistrationConfirmationEnvelope,
+          }),
+        async () => {
+          if (registration.status === "pending") {
+            await deps.desktopBrowserDeviceRegistry.invalidate(registrationId);
+          }
+        },
+      );
+    },
+
+    async desktopBrowserMarkRegistrationOffline(registrationId, input) {
+      return deps.desktopBrowserDeviceRegistry.markOffline({
+        registrationId,
+        brokerInstanceId: input.brokerInstanceId,
+        browserInstanceId: input.browserInstanceId,
+        connectionEpoch: input.connectionEpoch,
+      });
     },
 
     subscribeSessionStates(cb) {

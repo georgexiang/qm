@@ -10,7 +10,7 @@ import {
   type DesktopBrowserRegistrationReservationTuple,
 } from "./index.ts";
 
-export const phaseFContractFixtures: readonly DesktopBrowserMessage[] = [
+export const phaseFContractFixtures = [
   {
     protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
     kind: "core.authority",
@@ -80,7 +80,7 @@ export const phaseFContractFixtures: readonly DesktopBrowserMessage[] = [
       currentTaskPresent: true,
     },
   },
-];
+] as const satisfies readonly DesktopBrowserMessage[];
 
 export const desktopBrowserRegistrationReservationTupleFixture: DesktopBrowserRegistrationReservationTuple = {
   registrationProtocolVersion: DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,

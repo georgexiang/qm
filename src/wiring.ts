@@ -186,6 +186,10 @@ import { createMemoryTaskStore } from "./tasks/memory-task-store.ts";
 import { createPostgresTaskStore } from "./tasks/postgres-task-store.ts";
 import type { TaskStore } from "./tasks/task-store.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTaskStore } from "./desktop-browser/browser-task-store.ts";
+import {
+  createDesktopBrowserDeviceRegistry,
+  type DesktopBrowserDeviceRegistry,
+} from "./desktop-browser/device-registry.ts";
 import { createMemoryStrategy } from "./memory/strategy.ts";
 import { createOrchestrator, egressClaimAllowingControlPlane, type OrchestratorDeps } from "./core/orchestrator.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, EGRESS_PROXY_AUD } from "./auth/capability-token.ts";
@@ -323,6 +327,7 @@ export interface BuiltApp {
   signals: RunSignalStore;
   tasks: TaskStore;
   desktopBrowserTasks: DesktopBrowserTaskStore;
+  desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   sessionStateBus: SessionStateBus;
   runtime: Runtime;
   config: ScopedConfigStore;
@@ -724,7 +729,16 @@ export function buildApp(
       ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
       : createMemoryRunSignalStore();
   const tasks = config.databaseUrl ? createPostgresTaskStore(config.databaseUrl) : createMemoryTaskStore();
+  if (config.production && !config.databaseUrl) {
+    throw new Error("Desktop Browser registration requires DATABASE_URL in production");
+  }
   const desktopBrowserTasks = createDesktopBrowserTaskStore(artifactMap("desktop_browser_tasks"));
+  const desktopBrowserDeviceRegistry = createDesktopBrowserDeviceRegistry(
+    {
+      state: artifactMap("desktop_browser_device_registry_state"),
+    },
+    { deploymentCanonicalId: config.publicWebUrl ?? "qm://deployments/local" },
+  );
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
@@ -1149,6 +1163,7 @@ export function buildApp(
     signals: runSignals,
     tasks,
     desktopBrowserTasks,
+    desktopBrowserDeviceRegistry,
     modelGateway,
     modelCredentials,
     customProviders,
@@ -1482,6 +1497,7 @@ export function buildApp(
     signals: runSignals,
     tasks,
     desktopBrowserTasks,
+    desktopBrowserDeviceRegistry,
     sessionStateBus,
     runtime,
     config: configStore,
