@@ -21,7 +21,7 @@ export interface DesktopBrowserSharedProfileProjection {
   device: DesktopBrowserOnlineDeviceProjection;
 }
 
-export interface DesktopBrowserChallengeBinding {
+interface DesktopBrowserChallengeBinding {
   registrationId: string;
   devicePublicKey: string;
   brokerInstanceId: string;
@@ -30,7 +30,7 @@ export interface DesktopBrowserChallengeBinding {
   expiresAt: string;
 }
 
-export interface DesktopBrowserRegistrationRecord {
+interface DesktopBrowserRegistrationRecord {
   registrationId: string;
   waitingTaskId: string;
   actorId: string;
@@ -45,13 +45,11 @@ export interface DesktopBrowserRegistrationRecord {
   publicDeviceFingerprint: string;
   operatingSystem: string;
   browserRuntimeStatus: "ready" | "offline";
-  pendingConfirmation:
-    | {
-        browserRuntimeStatus: "ready" | "offline";
-        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
-        receivedAt: number;
-      }
-    | null;
+  pendingConfirmation: {
+    browserRuntimeStatus: "ready" | "offline";
+    envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+    receivedAt: number;
+  } | null;
   lastSeenAt: string;
   createdAt: number;
   updatedAt: number;
@@ -64,7 +62,7 @@ export interface DesktopBrowserTaskRegistrationProjection {
   status: "waiting_for_local_confirmation" | "ready_to_confirm" | "confirmed";
 }
 
-export interface DesktopBrowserTaskClaimRecord {
+interface DesktopBrowserTaskClaimRecord {
   waitingTaskId: string;
   registrationId: string;
   projectId: string;
@@ -78,7 +76,7 @@ export interface DesktopBrowserTaskClaimRecord {
   claimedAt: number;
 }
 
-export interface DesktopBrowserProjectHeadRecord {
+interface DesktopBrowserProjectHeadRecord {
   projectId: string;
   registrationId: string;
   updatedAt: number;
@@ -95,7 +93,7 @@ export interface DesktopBrowserDeviceRegistryBacking {
   state: DurableMap<DesktopBrowserDeviceRegistryState>;
 }
 
-export interface DesktopBrowserReservationView {
+interface DesktopBrowserReservationView {
   registrationTuple: DesktopBrowserRegistrationReservationTuple;
   publicIdentity: DesktopBrowserPublicIdentity;
   confirmationFingerprint: string;
@@ -132,13 +130,10 @@ export interface DesktopBrowserDeviceRegistry {
   challengeBinding(registrationId: string): Promise<DesktopBrowserChallengeBinding | null>;
   get(registrationId: string): Promise<DesktopBrowserRegistrationRecord | null>;
   taskRegistration(waitingTaskId: string): Promise<DesktopBrowserTaskRegistrationProjection | null>;
-  stagedConfirmation(registrationId: string): Promise<
-    | {
-        browserRuntimeStatus: "ready" | "offline";
-        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
-      }
-    | null
-  >;
+  stagedConfirmation(registrationId: string): Promise<{
+    browserRuntimeStatus: "ready" | "offline";
+    envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+  } | null>;
   stageConfirmation(input: {
     registrationId: string;
     browserRuntimeStatus: "ready" | "offline";
@@ -246,7 +241,9 @@ function toProjection(record: DesktopBrowserRegistrationRecord): DesktopBrowserS
   };
 }
 
-function taskRegistrationProjection(record: DesktopBrowserRegistrationRecord): DesktopBrowserTaskRegistrationProjection {
+function taskRegistrationProjection(
+  record: DesktopBrowserRegistrationRecord,
+): DesktopBrowserTaskRegistrationProjection {
   let status: DesktopBrowserTaskRegistrationProjection["status"] = "waiting_for_local_confirmation";
   if (record.status === "online") status = "confirmed";
   else if (record.pendingConfirmation) status = "ready_to_confirm";
@@ -350,12 +347,10 @@ function reservationView(record: DesktopBrowserRegistrationRecord): DesktopBrows
 }
 
 function samePendingConfirmation(
-  left:
-    | {
-        browserRuntimeStatus: "ready" | "offline";
-        envelope: DesktopBrowserRegistrationConfirmationEnvelope;
-      }
-    | null,
+  left: {
+    browserRuntimeStatus: "ready" | "offline";
+    envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+  } | null,
   right: {
     browserRuntimeStatus: "ready" | "offline";
     envelope: DesktopBrowserRegistrationConfirmationEnvelope;

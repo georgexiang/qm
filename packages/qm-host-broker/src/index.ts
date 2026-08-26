@@ -34,7 +34,7 @@ import {
   type DesktopBrowserRegistrationReservationTuple,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
-} from "../../desktop-browser-contracts/src/index.ts";
+} from "qm-desktop-browser-contracts";
 
 const MAX_RELAY_MESSAGE_BYTES = 64 * 1024;
 const RELAY_HANDSHAKE_TIMEOUT_MS = 10_000;
