@@ -1,7 +1,10 @@
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
 import { type ApiCtx, type Route } from "./route.ts";
-import type { DesktopBrowserRegistrationConfirmationEnvelope } from "qm-desktop-browser-contracts";
+import type {
+  DesktopBrowserRegistrationConfirmationEnvelope,
+  DesktopBrowserRelayConnectionProjection,
+} from "qm-desktop-browser-contracts";
 
 async function taskAction(ctx: ApiCtx): Promise<void> {
   const body = isObj(ctx.body) ? ctx.body : {};
@@ -42,7 +45,8 @@ async function reserveRegistration(ctx: ApiCtx): Promise<void> {
   ) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
-      message: "authorityId, devicePublicKey, brokerInstanceId, browserInstanceId, connectionEpoch, and operatingSystem required",
+      message:
+        "authorityId, devicePublicKey, brokerInstanceId, browserInstanceId, connectionEpoch, and operatingSystem required",
     });
   }
   const result = await ctx.app.desktopBrowserReserveRegistration(ctx.params.id!, authorityId, {
@@ -120,7 +124,70 @@ async function markRegistrationOffline(ctx: ApiCtx): Promise<void> {
   return sendJson(ctx.res, 200, result);
 }
 
+async function resolveRelayBinding(ctx: ApiCtx): Promise<void> {
+  const body = isObj(ctx.body) ? ctx.body : {};
+  const devicePublicKey = typeof body.devicePublicKey === "string" ? body.devicePublicKey : "";
+  const brokerInstanceId = typeof body.brokerInstanceId === "string" ? body.brokerInstanceId : "";
+  if (!devicePublicKey || !brokerInstanceId) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "devicePublicKey and brokerInstanceId required",
+    });
+  }
+  const result = await ctx.app.desktopBrowserResolveRelayBinding({ devicePublicKey, brokerInstanceId });
+  if (result.status === "refused") return sendJson(ctx.res, 404, { error: "not_found", message: result.reason });
+  return sendJson(ctx.res, 200, { binding: result.binding });
+}
+
+async function relayReady(ctx: ApiCtx): Promise<void> {
+  return sendJson(ctx.res, 200, { ok: true });
+}
+
+function parseRelayProjection(body: unknown): DesktopBrowserRelayConnectionProjection | null {
+  if (!isObj(body)) return null;
+  const projection = isObj(body.projection) ? body.projection : null;
+  if (!projection) return null;
+  if (
+    typeof projection.connectionId !== "string" ||
+    typeof projection.publicDeviceFingerprint !== "string" ||
+    typeof projection.brokerInstanceId !== "string" ||
+    typeof projection.browserInstanceId !== "string" ||
+    typeof projection.connectionEpoch !== "number" ||
+    (projection.registrationState !== "pending" && projection.registrationState !== "registered") ||
+    typeof projection.protocolVersion !== "string" ||
+    typeof projection.policyGrammarVersion !== "string" ||
+    typeof projection.brokerVersion !== "string" ||
+    typeof projection.bskVersion !== "string" ||
+    typeof projection.extensionVersion !== "string" ||
+    typeof projection.cliShapeHash !== "string" ||
+    typeof projection.lastSeenAt !== "string"
+  ) {
+    return null;
+  }
+  return projection as unknown as DesktopBrowserRelayConnectionProjection;
+}
+
+async function publishRelayConnection(ctx: ApiCtx): Promise<void> {
+  const projection = parseRelayProjection(ctx.body);
+  if (!projection || projection.connectionId !== ctx.params.id) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "projection with matching connectionId required",
+    });
+  }
+  await ctx.app.desktopBrowserPublishRelayConnection(projection);
+  ctx.res.statusCode = 204;
+  ctx.res.end();
+}
+
+async function clearRelayConnection(ctx: ApiCtx): Promise<void> {
+  await ctx.app.desktopBrowserClearRelayConnection(ctx.params.id!);
+  ctx.res.statusCode = 204;
+  ctx.res.end();
+}
+
 export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "source", handle: relayReady },
   { method: "POST", path: "/v1/desktop-browser/tasks/:id/actions", auth: "source", handle: taskAction },
   {
     method: "POST",
@@ -140,5 +207,23 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/desktop-browser/registrations/:id/offline",
     auth: "source",
     handle: markRegistrationOffline,
+  },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/relay/bindings/resolve",
+    auth: "source",
+    handle: resolveRelayBinding,
+  },
+  {
+    method: "PUT",
+    path: "/v1/desktop-browser/relay/connections/:id",
+    auth: "source",
+    handle: publishRelayConnection,
+  },
+  {
+    method: "DELETE",
+    path: "/v1/desktop-browser/relay/connections/:id",
+    auth: "source",
+    handle: clearRelayConnection,
   },
 ];

@@ -19,7 +19,10 @@ import { selectableCatalogForHarness, selectableModelCatalog } from "../model/mo
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
-import type { DesktopBrowserRegistrationConfirmationEnvelope } from "qm-desktop-browser-contracts";
+import type {
+  DesktopBrowserRegistrationConfirmationEnvelope,
+  DesktopBrowserRelayConnectionProjection,
+} from "qm-desktop-browser-contracts";
 import {
   projectDesktopBrowserActivityReply,
   projectDesktopBrowserTaskActivity,
@@ -48,6 +51,9 @@ export function createTurnMethods(
   | "desktopBrowserStageRegistrationConfirmation"
   | "desktopBrowserConfirmRegistration"
   | "desktopBrowserMarkRegistrationOffline"
+  | "desktopBrowserResolveRelayBinding"
+  | "desktopBrowserPublishRelayConnection"
+  | "desktopBrowserClearRelayConnection"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -750,6 +756,22 @@ export function createTurnMethods(
         browserInstanceId: input.browserInstanceId,
         connectionEpoch: input.connectionEpoch,
       });
+    },
+
+    async desktopBrowserResolveRelayBinding(input) {
+      const binding = await deps.desktopBrowserDeviceRegistry.relayBinding(input);
+      if (!binding) return { status: "refused", reason: "desktop browser relay binding not found" };
+      return { status: "ok", binding };
+    },
+
+    async desktopBrowserPublishRelayConnection(projection) {
+      await deps.desktopBrowserDeviceRegistry.publishRelayConnection(
+        projection as DesktopBrowserRelayConnectionProjection,
+      );
+    },
+
+    async desktopBrowserClearRelayConnection(connectionId) {
+      await deps.desktopBrowserDeviceRegistry.clearRelayConnection(connectionId);
     },
 
     subscribeSessionStates(cb) {

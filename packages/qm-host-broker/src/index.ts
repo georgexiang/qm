@@ -13,9 +13,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { isIP } from "node:net";
 import { dirname, join } from "node:path";
 import {
+  DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
+  DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_RELAY_WSS_PATH,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   decodeDesktopBrowserMessage,
@@ -38,6 +42,8 @@ const RECONNECT_BACKOFF_BASE_MS = 250;
 const RECONNECT_BACKOFF_MAX_MS = 5_000;
 const SAFE_DIR_MODE = 0o700;
 const SAFE_FILE_MODE = 0o600;
+const HOST_BROKER_RELAY_URL_ENV = "QM_HOST_BROKER_RELAY_URL";
+const HOST_BROKER_RELAY_WSS_PATH_ENV = "QM_HOST_BROKER_RELAY_WSS_PATH";
 
 export const HOST_BROKER_CONTROL_NOTICE =
   "QM controls the browser on this device. The browser profile is shared across this deployment.";
@@ -412,10 +418,57 @@ function writeOutput(
   stdout.write(`${json ? JSON.stringify(payload) : renderHumanState(payload as HostBrokerStateSnapshot)}\n`);
 }
 
-function resolveRelayUrlDefault(qmUrl: string): string {
-  const target = new URL("/v1/device", qmUrl);
+function assertRelayWssPath(path: string): void {
+  if (!path.startsWith("/") || path.length === 1) {
+    throw new Error(`${HOST_BROKER_RELAY_WSS_PATH_ENV} must start with / and must not be /`);
+  }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalizedHostname = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (normalizedHostname === "localhost" || normalizedHostname === "::1" || normalizedHostname === "0:0:0:0:0:0:0:1") {
+    return true;
+  }
+  return isIP(normalizedHostname) === 4 && normalizedHostname.startsWith("127.");
+}
+
+function assertRelayUrlOverride(relayUrl: string): void {
+  const target = new URL(relayUrl);
+  if (target.protocol !== "wss:" && target.protocol !== "ws:") {
+    throw new Error(`${HOST_BROKER_RELAY_URL_ENV} must use ws:// or wss://`);
+  }
+  if (target.protocol === "ws:" && !isLoopbackHostname(target.hostname)) {
+    throw new Error(`${HOST_BROKER_RELAY_URL_ENV} may use ws:// only for loopback hosts`);
+  }
+  if (target.username || target.password) {
+    throw new Error(`${HOST_BROKER_RELAY_URL_ENV} must not include credentials`);
+  }
+  if (target.search || target.hash) {
+    throw new Error(`${HOST_BROKER_RELAY_URL_ENV} must not include query or fragment components`);
+  }
+  if (!target.pathname.startsWith("/")) {
+    throw new Error(`${HOST_BROKER_RELAY_URL_ENV} must include an absolute websocket path`);
+  }
+}
+
+function resolveRelayUrlDefault(qmUrl: string, relayWssPath: string = DESKTOP_BROWSER_RELAY_WSS_PATH): string {
+  const target = new URL(relayWssPath, qmUrl);
   target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
   return target.toString();
+}
+
+export function resolveRelayUrlFromEnv(qmUrl: string, env: NodeJS.ProcessEnv = process.env): string {
+  const relayUrlOverride = env[HOST_BROKER_RELAY_URL_ENV]?.trim();
+  if (relayUrlOverride) {
+    assertRelayUrlOverride(relayUrlOverride);
+    return new URL(relayUrlOverride).toString();
+  }
+  const relayWssPathOverride = env[HOST_BROKER_RELAY_WSS_PATH_ENV]?.trim();
+  if (relayWssPathOverride) {
+    assertRelayWssPath(relayWssPathOverride);
+    return resolveRelayUrlDefault(qmUrl, relayWssPathOverride);
+  }
+  return resolveRelayUrlDefault(qmUrl);
 }
 
 function assertConnectableRuntime(runtime: BrowserRuntimeMetadata): void {
@@ -1010,8 +1063,8 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         deploymentCanonicalId: state.deploymentCanonicalId,
         brokerInstanceId: state.brokerInstanceId,
         brokerVersion: deps.brokerVersion ?? "0.0.0",
-        supportedProtocolVersions: [DESKTOP_BROWSER_PROTOCOL_VERSION],
-        supportedPolicyGrammarVersions: ["1.0"],
+        supportedProtocolVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS],
+        supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
         identity,
         runtime,
         connectionEpoch: state.connectionEpoch,

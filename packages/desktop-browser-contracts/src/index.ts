@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
 import { fromJSONSchema } from "zod";
 
 export interface CoreAuthorityMessage {
@@ -124,6 +124,44 @@ export interface DesktopBrowserOnlineDeviceProjection {
   lastSeenAt: string;
 }
 
+export interface DesktopBrowserRelayRegistryBinding {
+  registrationId: string;
+  registrationState: "pending" | "registered";
+  devicePublicKey: string;
+  brokerInstanceId: string;
+  browserInstanceId: string;
+  connectionEpoch: number;
+}
+
+export interface DesktopBrowserRelayConnectionProjection {
+  connectionId: string;
+  publicDeviceFingerprint: string;
+  brokerInstanceId: string;
+  browserInstanceId: string;
+  connectionEpoch: number;
+  registrationState: "pending" | "registered";
+  protocolVersion: string;
+  policyGrammarVersion: string;
+  brokerVersion: string;
+  bskVersion: string;
+  extensionVersion: string;
+  cliShapeHash: string;
+  lastSeenAt: string;
+}
+
+export interface DesktopBrowserRelayBindingResolveRequest {
+  devicePublicKey: string;
+  brokerInstanceId: string;
+}
+
+export interface DesktopBrowserRelayBindingResolveResponse {
+  binding: DesktopBrowserRelayRegistryBinding;
+}
+
+export interface DesktopBrowserRelayConnectionPublishRequest {
+  projection: DesktopBrowserRelayConnectionProjection;
+}
+
 export type DesktopBrowserMessage =
   | CoreAuthorityMessage
   | HostHelloMessage
@@ -136,8 +174,14 @@ export type DesktopBrowserMessage =
 type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
 
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS = [DESKTOP_BROWSER_PROTOCOL_VERSION] as const;
+export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS = [
+  DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
+] as const;
 export const DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION = "1.0" as const;
 export const DESKTOP_BROWSER_PUBLIC_IDENTITY_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_RELAY_WSS_PATH = "/v1/device" as const;
 
 const PROTOCOL_VERSION_PATTERN = "^([0-9]{1,9})\\.[0-9]{1,9}$";
 const CANONICAL_PROTOCOL_VERSION_PATTERN = "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$";
@@ -768,4 +812,30 @@ export function encodeHostChallengeResponseSigningBytes(message: {
       challengeNonce: message.payload.challengeNonce,
     }),
   );
+}
+
+function decodeHostChallengeResponsePublicKey(devicePublicKey: string) {
+  if (!devicePublicKey.startsWith("ed25519:")) {
+    throw new Error("devicePublicKey must use ed25519:<base64-spki-der>");
+  }
+  return createPublicKey({
+    key: Buffer.from(devicePublicKey.slice("ed25519:".length), "base64"),
+    format: "der",
+    type: "spki",
+  });
+}
+
+export function verifyHostChallengeResponseMessage(message: HostChallengeResponseMessage): boolean {
+  try {
+    const parsed = decodeDesktopBrowserMessage(JSON.stringify(message), message.protocolVersion);
+    if (parsed.kind !== "host.challenge-response") return false;
+    return verify(
+      null,
+      Buffer.from(encodeHostChallengeResponseSigningBytes(parsed)),
+      decodeHostChallengeResponsePublicKey(parsed.payload.devicePublicKey),
+      Buffer.from(parsed.payload.signature, "base64url"),
+    );
+  } catch {
+    return false;
+  }
 }

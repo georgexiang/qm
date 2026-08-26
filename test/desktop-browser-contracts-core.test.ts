@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { test } from "node:test";
 import {
   DESKTOP_BROWSER_PROTOCOL_VERSION,
   decodeDesktopBrowserMessage,
   desktopBrowserMessageSchemas,
+  encodeHostChallengeResponseSigningBytes,
   encodeDesktopBrowserMessage,
+  verifyHostChallengeResponseMessage,
   isDesktopBrowserProtocolCompatible,
+  type DesktopBrowserRelayConnectionProjection,
+  type DesktopBrowserRelayRegistryBinding,
   type DesktopBrowserMessage,
 } from "qm-desktop-browser-contracts";
 
@@ -147,4 +152,72 @@ test("Core publishes one schema for every Phase F message kind", () => {
 test("Core normalizes bounded protocol majors without numeric conversion", () => {
   assert.equal(isDesktopBrowserProtocolCompatible("000000001.0", "1.0"), true);
   assert.equal(isDesktopBrowserProtocolCompatible("000000002.0", "1.0"), false);
+});
+
+test("Core fails host challenge-response verification when any signed tuple field is mutated", () => {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const devicePublicKey = `ed25519:${Buffer.from(publicKey.export({ format: "der", type: "spki" })).toString("base64")}`;
+  const payload = {
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+    challengeNonce: "nonce-1",
+  };
+  const message = {
+    protocolVersion: "1.0",
+    kind: "host.challenge-response",
+    payload: {
+      ...payload,
+      signatureAlgorithm: "ed25519",
+      signature: Buffer.from(
+        sign(
+          null,
+          Buffer.from(encodeHostChallengeResponseSigningBytes({ protocolVersion: "1.0", payload })),
+          privateKey,
+        ),
+      ).toString("base64url"),
+    },
+  } satisfies DesktopBrowserMessage;
+
+  assert.equal(verifyHostChallengeResponseMessage(message), true);
+  assert.equal(
+    verifyHostChallengeResponseMessage({
+      ...message,
+      payload: { ...message.payload, browserInstanceId: "browser-secondary" },
+    }),
+    false,
+  );
+});
+
+test("Core relay adapter contracts keep the raw device key out of connection projection payloads", () => {
+  const binding: DesktopBrowserRelayRegistryBinding = {
+    registrationId: "reg-1",
+    registrationState: "registered",
+    devicePublicKey: "ed25519:device-public-key-abc",
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+  };
+  const projection: DesktopBrowserRelayConnectionProjection = {
+    connectionId: "connection-1",
+    publicDeviceFingerprint: "fp-1",
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+    registrationState: "pending",
+    protocolVersion: "1.2",
+    policyGrammarVersion: "1.1",
+    brokerVersion: "0.0.0-test",
+    bskVersion: "bsk-1",
+    extensionVersion: "ext-1",
+    cliShapeHash: "shape-1",
+    lastSeenAt: "2026-08-26T12:00:00.000Z",
+  };
+
+  assert.equal(binding.registrationState, "registered");
+  assert.equal("devicePublicKey" in projection, false);
+  assert.equal(projection.registrationState, "pending");
 });

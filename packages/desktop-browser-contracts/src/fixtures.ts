@@ -3,6 +3,8 @@ import {
   DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
+  type DesktopBrowserRelayConnectionProjection,
+  type DesktopBrowserRelayRegistryBinding,
   type DesktopBrowserMessage,
   type DesktopBrowserOnlineDeviceProjection,
   type DesktopBrowserPublicIdentity,
@@ -129,4 +131,29 @@ export const desktopBrowserOnlineDeviceProjectionFixture: DesktopBrowserOnlineDe
   status: "online",
   browserRuntimeStatus: "ready",
   lastSeenAt: "2026-08-26T11:58:00.000Z",
+};
+
+export const desktopBrowserRelayRegistryBindingFixture: DesktopBrowserRelayRegistryBinding = {
+  registrationId: desktopBrowserRegistrationReservationTupleFixture.registrationId,
+  registrationState: "pending",
+  devicePublicKey: desktopBrowserRegistrationReservationTupleFixture.devicePublicKey,
+  brokerInstanceId: desktopBrowserRegistrationReservationTupleFixture.brokerInstanceId,
+  browserInstanceId: desktopBrowserRegistrationReservationTupleFixture.browserInstanceId,
+  connectionEpoch: desktopBrowserRegistrationReservationTupleFixture.connectionEpoch,
+};
+
+export const desktopBrowserRelayConnectionProjectionFixture: DesktopBrowserRelayConnectionProjection = {
+  connectionId: "connection-1",
+  publicDeviceFingerprint: computeDesktopBrowserPublicDeviceFingerprint(desktopBrowserPublicIdentityFixture),
+  brokerInstanceId: desktopBrowserPublicIdentityFixture.brokerInstanceId,
+  browserInstanceId: desktopBrowserPublicIdentityFixture.browserInstanceId,
+  connectionEpoch: desktopBrowserRegistrationReservationTupleFixture.connectionEpoch,
+  registrationState: "registered",
+  protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
+  policyGrammarVersion: "1.0",
+  brokerVersion: "0.1.0",
+  bskVersion: "bsk-1",
+  extensionVersion: "extension-1",
+  cliShapeHash: "shape-1",
+  lastSeenAt: "2026-08-26T11:59:00.000Z",
 };

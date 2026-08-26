@@ -6,6 +6,8 @@ import {
   encodeDesktopBrowserRegistrationConfirmationVerificationBytes,
   projectDesktopBrowserPublicIdentity,
   parseDesktopBrowserRegistrationConfirmationEnvelope,
+  type DesktopBrowserRelayConnectionProjection,
+  type DesktopBrowserRelayRegistryBinding,
   type DesktopBrowserOnlineDeviceProjection,
   type DesktopBrowserPublicIdentity,
   type DesktopBrowserRegistrationConfirmationEnvelope,
@@ -86,6 +88,7 @@ interface DesktopBrowserDeviceRegistryState {
   registrations: Record<string, DesktopBrowserRegistrationRecord>;
   taskClaims: Record<string, DesktopBrowserTaskClaimRecord>;
   projectHeads: Record<string, DesktopBrowserProjectHeadRecord>;
+  relayConnections: Record<string, DesktopBrowserRelayConnectionProjection>;
 }
 
 export interface DesktopBrowserDeviceRegistryBacking {
@@ -104,16 +107,13 @@ export interface DesktopBrowserReservationView {
 type DesktopBrowserRegistryRefusal = { status: "refused"; reason: string };
 
 type DesktopBrowserReservationResult =
-  | { status: "ok"; reservation: DesktopBrowserReservationView }
-  | DesktopBrowserRegistryRefusal;
+  { status: "ok"; reservation: DesktopBrowserReservationView } | DesktopBrowserRegistryRefusal;
 
 type DesktopBrowserConfirmationResult =
-  | { status: "ok"; device: DesktopBrowserSharedProfileProjection }
-  | DesktopBrowserRegistryRefusal;
+  { status: "ok"; device: DesktopBrowserSharedProfileProjection } | DesktopBrowserRegistryRefusal;
 
 type DesktopBrowserOfflineResult =
-  | { status: "ok"; device: DesktopBrowserSharedProfileProjection }
-  | DesktopBrowserRegistryRefusal;
+  { status: "ok"; device: DesktopBrowserSharedProfileProjection } | DesktopBrowserRegistryRefusal;
 
 export interface DesktopBrowserDeviceRegistry {
   reserve(input: {
@@ -158,6 +158,12 @@ export interface DesktopBrowserDeviceRegistry {
   }): Promise<DesktopBrowserOfflineResult>;
   invalidate(registrationId: string): Promise<void>;
   projectProjection(projectId: string): Promise<DesktopBrowserSharedProfileProjection | null>;
+  relayBinding(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+  }): Promise<DesktopBrowserRelayRegistryBinding | null>;
+  publishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
+  clearRelayConnection(connectionId: string): Promise<void>;
 }
 
 function iso(at: number): string {
@@ -173,7 +179,7 @@ export type DesktopBrowserConfirmMutationPoint =
 const REGISTRY_STATE_ID = "desktop-browser-device-registry";
 
 function emptyRegistryState(): DesktopBrowserDeviceRegistryState {
-  return { registrations: {}, taskClaims: {}, projectHeads: {} };
+  return { registrations: {}, taskClaims: {}, projectHeads: {}, relayConnections: {} };
 }
 
 function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBrowserDeviceRegistryState {
@@ -181,7 +187,39 @@ function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBr
     registrations: { ...state.registrations },
     taskClaims: { ...state.taskClaims },
     projectHeads: { ...state.projectHeads },
+    relayConnections: { ...state.relayConnections },
   };
+}
+
+function relayBindingFromRecord(record: DesktopBrowserRegistrationRecord): DesktopBrowserRelayRegistryBinding | null {
+  if (record.status === "pending") {
+    return {
+      registrationId: record.registrationId,
+      registrationState: "pending",
+      devicePublicKey: record.registrationTuple.devicePublicKey,
+      brokerInstanceId: record.registrationTuple.brokerInstanceId,
+      browserInstanceId: record.registrationTuple.browserInstanceId,
+      connectionEpoch: record.registrationTuple.connectionEpoch,
+    };
+  }
+  if (record.status !== "online") return null;
+  return {
+    registrationId: record.registrationId,
+    registrationState: "registered",
+    devicePublicKey: record.registrationTuple.devicePublicKey,
+    brokerInstanceId: record.registrationTuple.brokerInstanceId,
+    browserInstanceId: record.registrationTuple.browserInstanceId,
+    connectionEpoch: record.registrationTuple.connectionEpoch,
+  };
+}
+
+function compareRelayBindings(
+  left: DesktopBrowserRelayRegistryBinding,
+  right: DesktopBrowserRelayRegistryBinding,
+): number {
+  if (left.connectionEpoch !== right.connectionEpoch) return right.connectionEpoch - left.connectionEpoch;
+  if (left.registrationState !== right.registrationState) return left.registrationState === "registered" ? -1 : 1;
+  return left.registrationId.localeCompare(right.registrationId);
 }
 
 function offlineRecord(record: DesktopBrowserRegistrationRecord, at: number): DesktopBrowserRegistrationRecord {
@@ -684,6 +722,39 @@ export function createDesktopBrowserDeviceRegistry(
     async projectProjection(projectId) {
       const record = currentProjectHead(await readState(), projectId);
       return record ? toProjection(record) : null;
+    },
+
+    async relayBinding(input) {
+      const at = now();
+      const state = await readState();
+      const bindings = Object.values(state.registrations)
+        .filter(
+          (record) =>
+            record.registrationTuple.devicePublicKey === input.devicePublicKey &&
+            record.registrationTuple.brokerInstanceId === input.brokerInstanceId,
+        )
+        .filter((record) => {
+          if (record.status === "pending") {
+            return Date.parse(record.registrationTuple.expiresAt) > at && record.authorityExpiresAt > at;
+          }
+          return record.status === "online";
+        })
+        .map(relayBindingFromRecord)
+        .filter((binding): binding is DesktopBrowserRelayRegistryBinding => binding !== null)
+        .sort(compareRelayBindings);
+      return bindings[0] ?? null;
+    },
+
+    async publishRelayConnection(projection) {
+      await updateState((state) => {
+        state.relayConnections[projection.connectionId] = { ...projection };
+      });
+    },
+
+    async clearRelayConnection(connectionId) {
+      await updateState((state) => {
+        delete state.relayConnections[connectionId];
+      });
     },
   };
 }

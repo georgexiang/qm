@@ -1,13 +1,29 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { chmodSync, mkdtempSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
+  DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
+  DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
+  DESKTOP_BROWSER_RELAY_WSS_PATH,
+  computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   decodeDesktopBrowserMessage,
+  projectDesktopBrowserPublicIdentity,
   type HostChallengeResponseMessage,
 } from "../packages/desktop-browser-contracts/src/index.ts";
+import {
+  DesktopBrowserRelayService,
+  type DesktopBrowserRelayBinding,
+  type DesktopBrowserRelayProjection,
+  type DesktopBrowserRelayRegistryAdapter,
+  type DesktopBrowserRelaySocket,
+} from "../packages/qm-broker-relay/src/index.ts";
+import { createDesktopBrowserRelayServer } from "../packages/qm-broker-relay/src/server.ts";
 import { desktopBrowserRegistrationReservationTupleFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import {
   HOST_BROKER_CONTROL_NOTICE,
@@ -16,6 +32,7 @@ import {
   createRegistrationConfirmationPreview,
   confirmRegistration,
   runHostBrokerCli,
+  resolveRelayUrlFromEnv,
   verifyHostChallengeResponseMessage,
   verifyRegistrationConfirmationEnvelopeSignature,
   type BrowserRuntimeMetadata,
@@ -23,6 +40,7 @@ import {
   type HostBrokerSocket,
   type HostBrokerTransport,
 } from "../packages/qm-host-broker/src/index.ts";
+import WebSocket from "ws";
 
 class FakeSocket implements HostBrokerSocket {
   private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
@@ -131,6 +149,84 @@ class FakeScheduler implements HostBrokerScheduler {
   }
 }
 
+class MemoryRegistryAdapter implements DesktopBrowserRelayRegistryAdapter {
+  readonly published = new Map<string, DesktopBrowserRelayProjection>();
+  readonly cleared: string[] = [];
+  readonly bindings = new Map<string, DesktopBrowserRelayBinding>();
+
+  async resolveBinding(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+  }): Promise<DesktopBrowserRelayBinding | null> {
+    return this.bindings.get(`${input.devicePublicKey}\u0000${input.brokerInstanceId}`) ?? null;
+  }
+
+  async publishConnection(projection: DesktopBrowserRelayProjection): Promise<void> {
+    this.published.set(projection.connectionId, projection);
+  }
+
+  async clearConnection(connectionId: string): Promise<void> {
+    this.cleared.push(connectionId);
+    this.published.delete(connectionId);
+  }
+
+  setBinding(binding: DesktopBrowserRelayBinding): void {
+    this.bindings.set(`${binding.devicePublicKey}\u0000${binding.brokerInstanceId}`, binding);
+  }
+}
+
+class LinkedSocket implements HostBrokerSocket, DesktopBrowserRelaySocket {
+  private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+  private peer: LinkedSocket | null = null;
+  private closed = false;
+
+  attachPeer(peer: LinkedSocket): void {
+    this.peer = peer;
+  }
+
+  addEventListener(type: "open" | "message" | "close" | "error" | "pong", listener: (event?: unknown) => void): void {
+    const current = this.listeners.get(type) ?? [];
+    current.push(listener);
+    this.listeners.set(type, current);
+  }
+
+  send(data: string): void {
+    this.peer?.emit("message", { data });
+  }
+
+  close(code?: number, reason?: string): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close", { code, reason });
+    this.peer?.closeFromPeer(code, reason);
+  }
+
+  ping(): void {
+    this.emit("pong");
+  }
+
+  open(): void {
+    this.emit("open");
+  }
+
+  private closeFromPeer(code?: number, reason?: string): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close", { code, reason });
+  }
+
+  private emit(type: string, event?: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+function createLinkedSocketPair(): { host: LinkedSocket; relay: LinkedSocket } {
+  const host = new LinkedSocket();
+  const relay = new LinkedSocket();
+  host.attachPeer(relay);
+  relay.attachPeer(host);
+  return { host, relay };
+}
 function runtime(): BrowserRuntimeMetadata {
   return {
     browserInstanceId: "browser-primary",
@@ -148,6 +244,290 @@ function tupleForIdentity(devicePublicKey: string) {
     expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
   };
 }
+
+async function flushAsyncWork(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function waitFor<T>(read: () => T | undefined, label: string): Promise<T> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const value = read();
+    if (value !== undefined) return value;
+    await flushAsyncWork();
+    await delay(10);
+  }
+  throw new Error(`${label} did not become available`);
+}
+
+test("connect defaults the relay URL to the shared QM device websocket path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-default-relay-url-"));
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const socket = new FakeSocket();
+
+  const running = runHostBrokerCli(["connect", "https://qm.example.com"], {
+    dataDir: dir,
+    stdout: {
+      write(chunk: string) {
+        stdoutChunks.push(chunk);
+      },
+    },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: new FakeTransport(socket, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`),
+    brokerInstanceId: "broker-default",
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.open();
+  socket.close(1000, "done");
+  assert.equal(await running, 0);
+  assert.equal(stderrChunks.length, 0);
+  assert.match(stdoutChunks.join(""), /Relay URL: wss:\/\/qm\.example\.com\/v1\/device/);
+});
+
+test("host relay URL override accepts a safe wss URL with a custom path and host connects", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-relay-url-override-"));
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const socket = new FakeSocket();
+  const relayUrl = "wss://relay.example.com/custom/device";
+
+  const running = runHostBrokerCli(["connect", "https://qm.example.com"], {
+    dataDir: dir,
+    stdout: {
+      write(chunk: string) {
+        stdoutChunks.push(chunk);
+      },
+    },
+    stderr: {
+      write(chunk: string) {
+        stderrChunks.push(chunk);
+      },
+    },
+    transport: new FakeTransport(socket, relayUrl),
+    resolveRelayUrl: (qmUrl) =>
+      resolveRelayUrlFromEnv(qmUrl, {
+        QM_HOST_BROKER_RELAY_URL: relayUrl,
+      }),
+    brokerInstanceId: "broker-default",
+    brokerVersion: "0.0.0-test",
+    runtime: runtime(),
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.open();
+  socket.close(1000, "done");
+  assert.equal(await running, 0);
+  assert.equal(stderrChunks.length, 0);
+  assert.match(stdoutChunks.join(""), /Relay URL: wss:\/\/relay\.example\.com\/custom\/device/);
+});
+
+test("host relay URL override rejects credentials, query, fragment, and insecure non-loopback ws targets", () => {
+  assert.throws(
+    () =>
+      resolveRelayUrlFromEnv("https://qm.example.com", {
+        QM_HOST_BROKER_RELAY_URL: "wss://user:pass@relay.example.com/custom/device",
+      }),
+    /QM_HOST_BROKER_RELAY_URL must not include credentials/,
+  );
+  assert.throws(
+    () =>
+      resolveRelayUrlFromEnv("https://qm.example.com", {
+        QM_HOST_BROKER_RELAY_URL: "wss://relay.example.com/custom/device?debug=1",
+      }),
+    /QM_HOST_BROKER_RELAY_URL must not include query or fragment components/,
+  );
+  assert.throws(
+    () =>
+      resolveRelayUrlFromEnv("https://qm.example.com", {
+        QM_HOST_BROKER_RELAY_URL: "wss://relay.example.com/custom/device#fragment",
+      }),
+    /QM_HOST_BROKER_RELAY_URL must not include query or fragment components/,
+  );
+  assert.throws(
+    () =>
+      resolveRelayUrlFromEnv("https://qm.example.com", {
+        QM_HOST_BROKER_RELAY_URL: "ws://relay.example.com/custom/device",
+      }),
+    /QM_HOST_BROKER_RELAY_URL may use ws:\/\/ only for loopback hosts/,
+  );
+});
+
+test("default host support interoperates with the default relay handshake through the socket seam", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-default-relay-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-default-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS],
+    supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
+    registry,
+    createNonce: () => "nonce-default-1",
+    createConnectionId: () => "connection-default-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS],
+    supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+  await flushAsyncWork();
+  const published = await waitFor(() => registry.published.get("connection-default-1"), "default relay publication");
+
+  assert.deepEqual(published, {
+    connectionId: "connection-default-1",
+    publicDeviceFingerprint: computeDesktopBrowserPublicDeviceFingerprint(
+      projectDesktopBrowserPublicIdentity({
+        registrationProtocolVersion: published.protocolVersion as `${number}.${number}`,
+        deploymentCanonicalId: "qm://deployments/example",
+        registrationId: published.connectionId,
+        actorId: "projection",
+        originatingProjectId: "projection",
+        membershipEpoch: 0,
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: published.brokerInstanceId,
+        browserInstanceId: published.browserInstanceId,
+        connectionEpoch: published.connectionEpoch,
+        expiresAt: published.lastSeenAt,
+      }),
+    ),
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+    registrationState: "registered",
+    protocolVersion: DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS[0],
+    policyGrammarVersion: DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS[0],
+    brokerVersion: "0.0.0-test",
+    bskVersion: runtime().bskVersion,
+    extensionVersion: runtime().extensionVersion,
+    cliShapeHash: runtime().cliShapeHash,
+    lastSeenAt: published.lastSeenAt,
+  });
+
+  sockets.host.close(1000, "done");
+  await running;
+});
+
+test("host relay path override validates and interoperates with a custom relay websocket path", async () => {
+  assert.throws(
+    () => resolveRelayUrlFromEnv("https://qm.example.com", { QM_HOST_BROKER_RELAY_WSS_PATH: "relay" }),
+    /QM_HOST_BROKER_RELAY_WSS_PATH must start with \//,
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-relay-path-override-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-override-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS],
+    supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
+    registry,
+    createNonce: () => "nonce-override-1",
+    createConnectionId: () => "connection-override-1",
+  });
+  const server = createDesktopBrowserRelayServer({
+    host: "127.0.0.1",
+    port: 0,
+    path: "/relay",
+    service,
+    adapterReadiness: { check: async () => {} },
+    storageReadiness: { check: async () => {} },
+    shutdownDrainMs: 50,
+  });
+  await server.listen();
+
+  try {
+    const port = (server.server.address() as AddressInfo).port;
+    const qmUrl = `http://127.0.0.1:${port}`;
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    let liveSocket: WebSocket | null = null;
+    const connectionOpened = once(server.wsServer, "connection");
+    const priorNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "test";
+    const running = runHostBrokerCli(["connect", qmUrl], {
+      dataDir: dir,
+      stdout: {
+        write(chunk: string) {
+          stdoutChunks.push(chunk);
+        },
+      },
+      stderr: {
+        write(chunk: string) {
+          stderrChunks.push(chunk);
+        },
+      },
+      transport: {
+        connect(url: string): HostBrokerSocket {
+          liveSocket = new WebSocket(url);
+          return liveSocket as unknown as HostBrokerSocket;
+        },
+      },
+      resolveRelayUrl: (nextQmUrl) =>
+        resolveRelayUrlFromEnv(nextQmUrl, {
+          QM_HOST_BROKER_RELAY_WSS_PATH: "/relay",
+        }),
+      brokerInstanceId: "broker-local-1",
+      brokerVersion: "0.0.0-test",
+      runtime: runtime(),
+    }).finally(() => {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    });
+
+    await connectionOpened;
+    const published = await waitFor(() => registry.published.get("connection-override-1"), "custom relay publication");
+    assert.equal(published.policyGrammarVersion, "1.0");
+    assert.match(stdoutChunks.join(""), new RegExp(`Relay URL: ws://127\\.0\\.0\\.1:${port}/relay`));
+    assert.equal(stderrChunks.length, 0);
+
+    const socketToClose = liveSocket as WebSocket | null;
+    socketToClose?.close(1000, "done");
+    assert.equal(await running, 0);
+  } finally {
+    await server.shutdown();
+  }
+});
 
 test("device identity creates atomically with mode 0600 and reloads the same key", async () => {
   const dir = mkdtempSync(join(tmpdir(), "host-broker-id-"));
