@@ -491,4 +491,11 @@ export interface TurnResult {
   attachments?: OutgoingAttachment[];
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
+  desktopBrowserActivity?: {
+    taskId: string;
+    status: "waiting_for_broker" | "canceled";
+    connectCommand: string;
+    actionAuthority: string;
+    actions: Array<"continue" | "cancel">;
+  };
 }

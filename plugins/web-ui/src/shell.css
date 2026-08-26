@@ -1786,6 +1786,88 @@ a.chat-row-open {
   gap: 18px;
 }
 
+.desktop-browser-task {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--foreground) 3%, var(--background));
+}
+.desktop-browser-task-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.desktop-browser-task-icon {
+  display: inline-flex;
+  color: var(--muted-foreground);
+}
+.desktop-browser-task-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.desktop-browser-task-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.desktop-browser-task-status.waiting {
+  color: var(--warning-foreground, #8a5a00);
+}
+.desktop-browser-task-status.canceled,
+.desktop-browser-task-error {
+  color: var(--destructive, #c0392b);
+}
+.desktop-browser-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+}
+.desktop-browser-command code {
+  min-width: 0;
+  overflow-x: auto;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--foreground) 7%, var(--background));
+  color: var(--foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.desktop-browser-task-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.desktop-browser-task-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  cursor: pointer;
+}
+.desktop-browser-task-actions button:hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--background));
+}
+.desktop-browser-cancel {
+  color: var(--destructive, #c0392b) !important;
+}
+.desktop-browser-task-error {
+  font-size: 13px;
+}
+
 .tool-row,
 .tool-row .tool-summary {
   display: flex;

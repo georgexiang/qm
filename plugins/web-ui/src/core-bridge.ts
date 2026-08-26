@@ -288,7 +288,14 @@ export interface SessionEntry {
 export interface ToolActivity {
   seq: number;
   parentSeq: number | null;
-  type: "tool_call" | "tool_result" | "approval_request" | "approval_resolved" | "thinking" | "text";
+  type:
+    | "tool_call"
+    | "tool_result"
+    | "approval_request"
+    | "approval_resolved"
+    | "thinking"
+    | "text"
+    | "desktop_browser_task";
   payload: unknown;
   createdAt: number;
   truncated?: boolean;
@@ -312,6 +319,25 @@ export interface PendingApproval {
   matched?: string;
   grantModes?: { session: boolean; always: boolean };
   blocksInput?: boolean;
+}
+
+export interface DesktopBrowserActivity {
+  taskId: string;
+  status: "waiting_for_broker" | "canceled";
+  connectCommand: string;
+  actionAuthority: string;
+  actions: Array<"continue" | "cancel">;
+  actionError?: string;
+}
+
+export function desktopBrowserActivityEntry(activity: DesktopBrowserActivity, createdAt = Date.now()): ToolActivity {
+  return {
+    seq: 0,
+    parentSeq: null,
+    type: "desktop_browser_task",
+    payload: activity,
+    createdAt,
+  };
 }
 
 export interface ApprovalDecision {
@@ -345,6 +371,17 @@ export interface TurnOptions {
   harness?: string;
   scopeId?: string | null;
   channelName?: string | null;
+}
+
+export async function runDesktopBrowserTaskAction(
+  taskId: string,
+  authorityId: string,
+  action: "cancel",
+): Promise<{ desktopBrowserActivity?: DesktopBrowserActivity; reason?: string }> {
+  return api(`/api/desktop-browser/tasks/${encodeURIComponent(taskId)}/actions`, {
+    method: "POST",
+    body: JSON.stringify({ authorityId, action }),
+  });
 }
 
 export interface ActiveRun {
@@ -732,7 +769,12 @@ async function drive(
       ? { text: "", attachments: [] as CoreAttachment[] }
       : await latestUserTurn(agent);
 
-    const submit = await api<{ status?: string; runId?: string; reply?: string }>("/api/turn", {
+    const submit = await api<{
+      status?: string;
+      runId?: string;
+      reply?: string;
+      desktopBrowserActivity?: DesktopBrowserActivity;
+    }>("/api/turn", {
       method: "POST",
       body: JSON.stringify({
         ...turnRequestBody(threadRef, text, model, agent, getTurnOptions, attachments),
@@ -744,6 +786,11 @@ async function drive(
     if (submit.runId) {
       await followRun(stream, partial, submit.runId, signal, notify, undefined, slot);
       return;
+    }
+
+    if (submit.desktopBrowserActivity) {
+      work.activity = [desktopBrowserActivityEntry(submit.desktopBrowserActivity)];
+      notify();
     }
 
     work.status = "complete";
@@ -1181,6 +1228,7 @@ const ACTIVITY_TYPES = new Set<string>([
   "approval_resolved",
   "thinking",
   "text",
+  "desktop_browser_task",
 ]);
 
 interface HistoryAttachment {
@@ -1222,6 +1270,13 @@ function userEntryText(payload: unknown): string | null {
 }
 
 export function entriesToMessages(entries: SessionEntry[], model: Model<Api>): AgentMessage[] {
+  const latestDesktopBrowserEntry = new Map<string, SessionEntry>();
+  for (const entry of entries) {
+    if (entry.type !== "assistant") continue;
+    const activity = (entry.payload as { desktopBrowserActivity?: DesktopBrowserActivity } | null)
+      ?.desktopBrowserActivity;
+    if (activity?.taskId) latestDesktopBrowserEntry.set(activity.taskId, entry);
+  }
   const out: AgentMessage[] = [];
   let pending: ToolActivity[] = [];
   let deliveryFiles: DeliveredFile[] = [];
@@ -1294,6 +1349,7 @@ export function entriesToMessages(entries: SessionEntry[], model: Model<Api>): A
       callId?: string;
       attachments?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
       files?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
+      desktopBrowserActivity?: DesktopBrowserActivity;
       hidden?: boolean;
       steered?: boolean;
     } | null;
@@ -1358,6 +1414,13 @@ export function entriesToMessages(entries: SessionEntry[], model: Model<Api>): A
         out.push(msg as AgentMessage);
       }
     } else if (e.type === "assistant") {
+      const desktopBrowserActivity = payload?.desktopBrowserActivity as DesktopBrowserActivity | undefined;
+      if (desktopBrowserActivity?.taskId && latestDesktopBrowserEntry.get(desktopBrowserActivity.taskId) !== e) {
+        continue;
+      }
+      if (desktopBrowserActivity?.taskId) {
+        pending.push(desktopBrowserActivityEntry(desktopBrowserActivity, e.createdAt));
+      }
       if (text || pending.length || heldPosts.size) {
         spillHeldPosts();
         if (posted && text) {

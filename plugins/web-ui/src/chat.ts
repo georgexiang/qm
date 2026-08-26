@@ -19,9 +19,11 @@ import {
   Files,
   GitFork,
   Maximize2,
+  Monitor,
   Paperclip,
   Pencil,
   Plug,
+  Play,
   Radar,
   RefreshCw,
   Rocket,
@@ -51,11 +53,13 @@ import {
   makeOpenerStreamFn,
   makeRunResumeStreamFn,
   runApprovalTurn,
+  runDesktopBrowserTaskAction,
   TAIL_TURNS,
   type ApprovalDecision,
   type AssistantWork,
   type CoreSession,
   type DeliveredFile,
+  type DesktopBrowserActivity,
   type PendingApproval,
   type SessionBackgroundOutput,
   type SessionBackgroundView,
@@ -1932,6 +1936,9 @@ export function createChatSurface(
         flushSeg();
         const text = ((it.activity.payload as { text?: string } | null)?.text ?? "").trim();
         if (text) parts.push(html`<div class="work-said">${markdown(text)}</div>`);
+      } else if (it.kind === "desktop_browser") {
+        flushSeg();
+        parts.push(desktopBrowserTaskCard(it.activity, work));
       } else {
         seg.push(it);
       }
@@ -1999,8 +2006,78 @@ export function createChatSurface(
     const stale = work.stale === true;
     if (item.kind === "thinking") return thinkingRow(item.activity);
     if (item.kind === "text") return messageRow(item.activity);
+    if (item.kind === "desktop_browser") return desktopBrowserTaskCard(item.activity, work);
     if (item.kind === "approval") return approvalMarker(item.approval);
     return toolRow(item.row, work, status, stale);
+  }
+
+  function desktopBrowserTaskCard(activity: ToolActivity, work: WorkBlock): TemplateResult {
+    const task = activity.payload as DesktopBrowserActivity;
+    const waiting = task.status === "waiting_for_broker";
+    const cancel = async (): Promise<void> => {
+      const before = task.actions;
+      activity.payload = { ...task, actions: [] };
+      work.activity = [...work.activity];
+      ctx.chat.redraw();
+      try {
+        const result = await runDesktopBrowserTaskAction(task.taskId, task.actionAuthority, "cancel");
+        activity.payload = result.desktopBrowserActivity ?? {
+          ...task,
+          actions: before,
+          actionError: result.reason ?? "Desktop Browser action failed.",
+        };
+      } catch (error) {
+        activity.payload = {
+          ...task,
+          actions: before,
+          actionError: errMessage(error, "Desktop Browser action failed."),
+        };
+      }
+      work.activity = [...work.activity];
+      ctx.chat.redraw();
+    };
+    return html`<section class="desktop-browser-task" aria-label="Desktop Browser Task">
+      <div class="desktop-browser-task-head">
+        <span class="desktop-browser-task-icon">${icon(Monitor, 16)}</span>
+        <span class="desktop-browser-task-title">Desktop browser</span>
+        <span class="desktop-browser-task-status ${waiting ? "waiting" : "canceled"}"
+          >${waiting ? "Waiting for Host Broker" : "Canceled"}</span
+        >
+      </div>
+      ${
+        waiting
+          ? html`<div class="desktop-browser-command">
+              <code>${task.connectCommand}</code>
+              <button
+                type="button"
+                class="icon-btn subtle"
+                title="Copy connect command"
+                @click=${(event: Event) => void copyMessage(task.connectCommand, event.currentTarget as HTMLButtonElement)}
+              >
+                ${icon(Copy, 14)}
+              </button>
+            </div>`
+          : nothing
+      }
+      ${task.actionError ? html`<div class="desktop-browser-task-error">${task.actionError}</div>` : nothing}
+      ${
+        task.actions.length
+          ? html`<div class="desktop-browser-task-actions">
+              <button
+                type="button"
+                class="desktop-browser-continue"
+                title="Continue becomes available after the Host Broker connects"
+                disabled
+              >
+                ${icon(Play, 14)}<span>Continue</span>
+              </button>
+              <button type="button" class="desktop-browser-cancel" @click=${() => void cancel()}>
+                ${icon(Ban, 14)}<span>Cancel</span>
+              </button>
+            </div>`
+          : nothing
+      }
+    </section>`;
   }
 
   function thinkingRow(activity: ToolActivity): TemplateResult {

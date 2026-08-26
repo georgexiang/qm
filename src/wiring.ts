@@ -185,6 +185,7 @@ import { createSecurityScreenProxy, type SecurityScreener } from "./security/sec
 import { createMemoryTaskStore } from "./tasks/memory-task-store.ts";
 import { createPostgresTaskStore } from "./tasks/postgres-task-store.ts";
 import type { TaskStore } from "./tasks/task-store.ts";
+import { createDesktopBrowserTaskStore, type DesktopBrowserTaskStore } from "./desktop-browser/browser-task-store.ts";
 import { createMemoryStrategy } from "./memory/strategy.ts";
 import { createOrchestrator, egressClaimAllowingControlPlane, type OrchestratorDeps } from "./core/orchestrator.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, EGRESS_PROXY_AUD } from "./auth/capability-token.ts";
@@ -321,6 +322,7 @@ export interface BuiltApp {
   runs: RunStore;
   signals: RunSignalStore;
   tasks: TaskStore;
+  desktopBrowserTasks: DesktopBrowserTaskStore;
   sessionStateBus: SessionStateBus;
   runtime: Runtime;
   config: ScopedConfigStore;
@@ -722,6 +724,7 @@ export function buildApp(
       ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
       : createMemoryRunSignalStore();
   const tasks = config.databaseUrl ? createPostgresTaskStore(config.databaseUrl) : createMemoryTaskStore();
+  const desktopBrowserTasks = createDesktopBrowserTaskStore(artifactMap("desktop_browser_tasks"));
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
@@ -1145,6 +1148,7 @@ export function buildApp(
     runActivity,
     signals: runSignals,
     tasks,
+    desktopBrowserTasks,
     modelGateway,
     modelCredentials,
     customProviders,
@@ -1477,6 +1481,7 @@ export function buildApp(
     runs,
     signals: runSignals,
     tasks,
+    desktopBrowserTasks,
     sessionStateBus,
     runtime,
     config: configStore,

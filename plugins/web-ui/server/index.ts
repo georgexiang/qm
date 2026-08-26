@@ -1625,6 +1625,31 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "POST",
+    path: "/api/desktop-browser/tasks/:id/actions",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const id = c.params.id!;
+      if (!id || id.includes("/")) return json(res, 404, { error: "not_found" });
+      let action: "cancel" | undefined;
+      let authorityId = "";
+      try {
+        const body = JSON.parse(await readBody(req)) as { action?: unknown; authorityId?: unknown };
+        if (body.action === "cancel") action = body.action;
+        if (typeof body.authorityId === "string") authorityId = body.authorityId;
+      } catch (error) {
+        if (error instanceof PayloadTooLargeError) throw error;
+      }
+      if (!action || !authorityId) return json(res, 400, { error: "bad_request" });
+      return relayCore(
+        res,
+        "POST",
+        `/v1/desktop-browser/tasks/${encodeURIComponent(id)}/actions`,
+        JSON.stringify({ principalId: user, authorityId, action }),
+      );
+    },
+  },
+  {
+    method: "POST",
     path: "/api/turn",
     handle: async (c) => {
       const { req, res, user } = c;

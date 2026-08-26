@@ -25,6 +25,7 @@ import type { SessionStateBus, SessionStateEvent } from "../runs/session-state-b
 import type { RunActivityEntry, RunActivityStore } from "../runs/run-activity-store.ts";
 import type { RunSignal, RunSignalStore } from "../runs/run-signal-store.ts";
 import type { TaskStore, TaskStatus } from "../tasks/task-store.ts";
+import type { DesktopBrowserTaskStore } from "../desktop-browser/browser-task-store.ts";
 import type { ModelGateway } from "../model/model-gateway.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
@@ -233,6 +234,12 @@ export interface SessionSearchHit {
 
 export interface App {
   turn(req: TurnRequest): Promise<TurnResult>;
+  desktopBrowserTaskAction(
+    taskId: string,
+    principalId: string,
+    authorityId: string,
+    action: "cancel",
+  ): Promise<TurnResult>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
   subscribeSessionStates(cb: (event: SessionStateEvent) => void): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;
@@ -495,6 +502,7 @@ export interface AppDeps {
   runActivity?: RunActivityStore;
   signals?: RunSignalStore;
   tasks?: TaskStore;
+  desktopBrowserTasks: DesktopBrowserTaskStore;
   modelGateway: ModelGateway;
   modelCredentials?: ModelCredentialStore;
   mcpServers?: McpServerStore;

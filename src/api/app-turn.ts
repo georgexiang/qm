@@ -8,7 +8,7 @@ import type { OrchestratorInput } from "../core/orchestrator.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
 import { isTerminal, leaseLapsed } from "../runs/run-store.ts";
 import { turnModelOptions, validateWebTurnModelOptions, webTurnRuntimeModelRefusal } from "../core/turn-options.ts";
-import { isProjectGroupRef, projectIdFromGroupRef } from "../projects/project-store.ts";
+import { isProjectGroupRef, projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
 import {
   defaultModelForHarness,
   isHarnessId,
@@ -18,12 +18,18 @@ import {
 import { selectableCatalogForHarness, selectableModelCatalog } from "../model/model-catalog.ts";
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
+import { constantTimeEqual } from "../util/crypto.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
 import { unscreenedNotice } from "../security/security-posture.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
+
+function explicitDesktopBrowserGoal(text: string): string | null {
+  const match = text.match(/^\s*\/desktop-browser(?:\s+([\s\S]*?))?\s*$/);
+  return match ? (match[1] ?? "").trim() : null;
+}
 
 export function createTurnMethods(
   deps: AppDeps,
@@ -32,6 +38,7 @@ export function createTurnMethods(
 ): Pick<
   App,
   | "turn"
+  | "desktopBrowserTaskAction"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -55,6 +62,21 @@ export function createTurnMethods(
     replayOrphanedRunSignals,
   } = h;
   const { shouldRouteToSpine, markTriggerHandled, addressedWakeText } = ambient;
+  const waitingActivity = (taskId: string, actionAuthority: string, sessionId?: string) => {
+    const connectCommand = `qm-host-broker connect ${deps.publicWebUrl}`;
+    return {
+      status: "ok" as const,
+      ...(sessionId ? { sessionId } : {}),
+      reply: `No Host Broker is connected. Start it on the customer desktop:\n\n${connectCommand}`,
+      desktopBrowserActivity: {
+        taskId,
+        status: "waiting_for_broker" as const,
+        connectCommand,
+        actionAuthority,
+        actions: ["continue", "cancel"] as Array<"continue" | "cancel">,
+      },
+    };
+  };
   return {
     async turn(req: TurnRequest): Promise<TurnResult> {
       await deps.identity.refresh();
@@ -80,9 +102,7 @@ export function createTurnMethods(
         ) {
           return { status: "refused", reason: "you're not a member of that context" };
         }
-        const activeMemberIds = project.memberIds.filter((memberId) =>
-          deps.identity.isInternal(deps.identity.classify(memberId)),
-        );
+        const activeMemberIds = (await deps.projects?.members(conversationRef)) ?? [];
         if (!activeMemberIds.includes(actor.id))
           return { status: "refused", reason: "you're not a member of that context" };
         projectAudience = await Promise.all(
@@ -108,6 +128,8 @@ export function createTurnMethods(
         return (await deps.projects.withVersion(conversationRef, projectVersion, fn)) ?? null;
       }
 
+      const desktopBrowserGoal = req.surface === "web" ? explicitDesktopBrowserGoal(req.text) : null;
+
       if (req.surface === "web") {
         const threadRef = req.conversation.threadRef;
         const existing = await deps.sessions.getByThread(threadRef);
@@ -122,75 +144,77 @@ export function createTurnMethods(
         } else if (threadRef.startsWith("web:") && !threadRef.startsWith(`web:${actor.id}:`)) {
           return { status: "refused", reason: "you can only start a new conversation on your own thread" };
         }
-        const org = scopeId("org", orgIdOf());
-        const targetScope =
-          req.conversation.kind === "dm"
-            ? scopeId("personal", actor.id)
-            : scopeId(req.conversation.kind, req.conversation.channelRef ?? threadRef);
-        const fallbackHarness = isHarnessId(deps.harnessId) ? deps.harnessId : "pi";
-        const runtimeFallback = deps.runtimeFallback ?? {
-          harnessId: fallbackHarness,
-          modelId: defaultModelForHarness(fallbackHarness),
-        };
-        let orgRuntime;
-        let configuredRuntime;
-        let runtime;
-        try {
-          orgRuntime = await resolveRuntimeChoiceDurable(deps.config, org, org, runtimeFallback);
-          configuredRuntime =
-            targetScope === org
-              ? orgRuntime
-              : await resolveRuntimeChoiceDurable(deps.config, org, targetScope, runtimeFallback);
-          runtime =
-            req.harness || req.model
-              ? await resolveRuntimeChoiceDurable(deps.config, org, targetScope, runtimeFallback, {
-                  ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
-                  ...(req.model ? { modelId: req.model } : {}),
-                })
-              : configuredRuntime;
-        } catch (error) {
-          return { status: "refused", reason: errMessage(error) };
-        }
-        if (req.harness && !isHarnessId(req.harness)) {
-          return { status: "refused", reason: `runtime ${req.harness} is not approved` };
-        }
-        const configuredKeys = deps.providerKeys ??
-          deps.modelProviders ?? { anthropic: false, openai: false, openrouter: false };
-        let providers = deps.modelProviders;
-        if (deps.modelCredentials) {
-          providers = modelProviderAvailabilityFor(
-            runtime.harnessId,
-            configuredKeys,
-            await deps.modelCredentials.availability(),
-          );
-        } else if (deps.providerKeys) {
-          providers = modelProviderAvailabilityFor(runtime.harnessId, configuredKeys);
-        }
-        if (providers && !modelServiceable(runtime.modelId, providers)) {
-          return {
-            status: "refused",
-            reason: "that model isn't available on this deployment (its provider isn't configured)",
+        if (desktopBrowserGoal === null) {
+          const org = scopeId("org", orgIdOf());
+          const targetScope =
+            req.conversation.kind === "dm"
+              ? scopeId("personal", actor.id)
+              : scopeId(req.conversation.kind, req.conversation.channelRef ?? threadRef);
+          const fallbackHarness = isHarnessId(deps.harnessId) ? deps.harnessId : "pi";
+          const runtimeFallback = deps.runtimeFallback ?? {
+            harnessId: fallbackHarness,
+            modelId: defaultModelForHarness(fallbackHarness),
           };
+          let orgRuntime;
+          let configuredRuntime;
+          let runtime;
+          try {
+            orgRuntime = await resolveRuntimeChoiceDurable(deps.config, org, org, runtimeFallback);
+            configuredRuntime =
+              targetScope === org
+                ? orgRuntime
+                : await resolveRuntimeChoiceDurable(deps.config, org, targetScope, runtimeFallback);
+            runtime =
+              req.harness || req.model
+                ? await resolveRuntimeChoiceDurable(deps.config, org, targetScope, runtimeFallback, {
+                    ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
+                    ...(req.model ? { modelId: req.model } : {}),
+                  })
+                : configuredRuntime;
+          } catch (error) {
+            return { status: "refused", reason: errMessage(error) };
+          }
+          if (req.harness && !isHarnessId(req.harness)) {
+            return { status: "refused", reason: `runtime ${req.harness} is not approved` };
+          }
+          const configuredKeys = deps.providerKeys ??
+            deps.modelProviders ?? { anthropic: false, openai: false, openrouter: false };
+          let providers = deps.modelProviders;
+          if (deps.modelCredentials) {
+            providers = modelProviderAvailabilityFor(
+              runtime.harnessId,
+              configuredKeys,
+              await deps.modelCredentials.availability(),
+            );
+          } else if (deps.providerKeys) {
+            providers = modelProviderAvailabilityFor(runtime.harnessId, configuredKeys);
+          }
+          if (providers && !modelServiceable(runtime.modelId, providers)) {
+            return {
+              status: "refused",
+              reason: "that model isn't available on this deployment (its provider isn't configured)",
+            };
+          }
+          const configuredWebuiModels = await deps.config.getWebuiModelsDurable(org);
+          let enabledWebuiModels: string[] | null = null;
+          if (configuredWebuiModels?.length) {
+            enabledWebuiModels = [...new Set([...configuredWebuiModels, orgRuntime.modelId])];
+          } else if (providers?.openrouter) {
+            enabledWebuiModels = [
+              ...new Set([
+                ...selectableCatalogForHarness(
+                  await selectableModelCatalog(deps.modelCredentialFetch),
+                  runtime.harnessId,
+                ).map((model) => model.id),
+                ...(orgRuntime.harnessId === runtime.harnessId ? [orgRuntime.modelId] : []),
+              ]),
+            ];
+          }
+          const invalidModelOption =
+            validateWebTurnModelOptions(req, enabledWebuiModels, providers) ??
+            webTurnRuntimeModelRefusal(runtime.modelId, orgRuntime.modelId, configuredWebuiModels);
+          if (invalidModelOption) return { status: "refused", reason: invalidModelOption };
         }
-        const configuredWebuiModels = await deps.config.getWebuiModelsDurable(org);
-        let enabledWebuiModels: string[] | null = null;
-        if (configuredWebuiModels?.length) {
-          enabledWebuiModels = [...new Set([...configuredWebuiModels, orgRuntime.modelId])];
-        } else if (providers?.openrouter) {
-          enabledWebuiModels = [
-            ...new Set([
-              ...selectableCatalogForHarness(
-                await selectableModelCatalog(deps.modelCredentialFetch),
-                runtime.harnessId,
-              ).map((model) => model.id),
-              ...(orgRuntime.harnessId === runtime.harnessId ? [orgRuntime.modelId] : []),
-            ]),
-          ];
-        }
-        const invalidModelOption =
-          validateWebTurnModelOptions(req, enabledWebuiModels, providers) ??
-          webTurnRuntimeModelRefusal(runtime.modelId, orgRuntime.modelId, configuredWebuiModels);
-        if (invalidModelOption) return { status: "refused", reason: invalidModelOption };
       }
 
       const rawAudience = req.conversation.audience ?? [req.actor];
@@ -222,13 +246,95 @@ export function createTurnMethods(
 
       const origin = resolveTurnOrigin(req);
       const retainedAuthority =
-        origin.kind === "human"
+        origin.kind === "human" || req.surface === "web"
           ? {
               authorityId: randomUUID(),
               turnId: randomUUID(),
               authorityExpiresAt: Date.now() + CAPABILITY_TTL_MS,
             }
           : {};
+
+      if (desktopBrowserGoal !== null) {
+        if (!projectId || !projectName || !projectVersion) {
+          return { status: "refused", reason: "Desktop Browser requires a Project context" };
+        }
+        if (!desktopBrowserGoal) {
+          return { status: "refused", reason: "Desktop Browser requires a goal" };
+        }
+        if (!deps.publicWebUrl) {
+          return { status: "failed", reason: "Desktop Browser requires the deployment public URL" };
+        }
+        if (!retainedAuthority.authorityId || !retainedAuthority.authorityExpiresAt) {
+          return { status: "refused", reason: "Desktop Browser requires current Turn authority" };
+        }
+        const created = await withCurrentProjectRoster(async () => {
+          const taskScope = scopeId("group", conversationRef!);
+          const session = await deps.sessions.getOrCreateByThread(
+            conversation.threadRef,
+            conversation.kind,
+            taskScope,
+            conversation.channelName,
+            req.surface,
+          );
+          await Promise.all(
+            conversation.audience.map((principal) =>
+              deps.sessions.addParticipant(session.id, principal.id, principal.displayName, { includeHistory: true }),
+            ),
+          );
+          const leaseAttempt = await deps.sessions.acquireLease(session.id, "turn");
+          if (!leaseAttempt.lease) return { busy: true as const };
+          try {
+            await deps.sessions.append(leaseAttempt.lease, {
+              type: "user",
+              payload: {
+                text: req.text,
+                ...(actor.displayName ? { name: actor.displayName } : {}),
+              },
+              scopeLabel: taskScope,
+            });
+            const task = await deps.desktopBrowserTasks.createWaiting({
+              goal: desktopBrowserGoal,
+              actorId: actor.id,
+              ...(actor.displayName ? { actorDisplayName: actor.displayName } : {}),
+              projectId,
+              projectName,
+              projectMembershipVersion: projectVersion,
+              authorityId: retainedAuthority.authorityId,
+              authorityExpiresAt: retainedAuthority.authorityExpiresAt,
+              sessionId: session.id,
+              threadRef: conversation.threadRef,
+            });
+            const response = waitingActivity(task.id, task.authorityId, session.id);
+            await deps.sessions
+              .append(leaseAttempt.lease, {
+                type: "assistant",
+                payload: {
+                  text: response.reply,
+                  desktopBrowserActivity: response.desktopBrowserActivity,
+                },
+                scopeLabel: taskScope,
+              })
+              .catch(() => undefined);
+            return { busy: false as const, task, response };
+          } finally {
+            await deps.sessions.releaseLease(leaseAttempt.lease);
+          }
+        });
+        if (!created) {
+          return { status: "refused", reason: "project membership changed; retry from the current project" };
+        }
+        if (created.busy) return { status: "refused", reason: "that conversation is busy" };
+        const { task, response } = created;
+        deps.auditLog.record({
+          at: task.createdAt,
+          principalId: actor.id,
+          action: "desktop_browser.task.created",
+          resource: task.id,
+          scopeLabel: scopeId("group", conversationRef!),
+          status: task.status,
+        });
+        return response;
+      }
 
       const input = {
         surface: req.surface,
@@ -450,6 +556,73 @@ export function createTurnMethods(
       if (deduped && run.result && isTerminal(run.status)) return withAdminLink(run.result);
       if (req.async) return { status: "queued", runId: run.id };
       return drive(run.id);
+    },
+
+    async desktopBrowserTaskAction(taskId, principalId, authorityId, _action) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      const actor = deps.identity.classify(principalId);
+      if (!task || task.actorId !== actor.id || !constantTimeEqual(task.authorityId, authorityId)) {
+        return { status: "refused", reason: "Desktop Browser Task not found" };
+      }
+      if (task.status !== "waiting_for_broker") {
+        return { status: "refused", reason: "Desktop Browser Task is no longer waiting" };
+      }
+      const leaseAttempt = await deps.sessions.acquireLease(task.sessionId, "turn");
+      if (!leaseAttempt.lease) return { status: "refused", reason: "that conversation is busy" };
+      try {
+        const response = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+          await deps.identity.refresh();
+          const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+          if (
+            project.orgId !== orgIdOf() ||
+            String(project.updatedAt) !== task.projectMembershipVersion ||
+            !currentMembers.has(actor.id) ||
+            !deps.identity.isInternal(deps.identity.classify(actor.id)) ||
+            !deps.identity.isInternal(deps.identity.classify(project.ownerId))
+          ) {
+            return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+          }
+          if (task.authorityExpiresAt <= Date.now()) {
+            return { status: "refused", reason: "Desktop Browser Turn authority expired; start a new Turn" } as const;
+          }
+          const canceled = await deps.desktopBrowserTasks.cancelWaiting(task.id);
+          if (!canceled) return { status: "refused", reason: "Desktop Browser Task is no longer waiting" } as const;
+          const result: TurnResult = {
+            status: "ok",
+            sessionId: canceled.sessionId,
+            reply: "Desktop Browser Task canceled.",
+            desktopBrowserActivity: {
+              taskId: canceled.id,
+              status: "canceled",
+              connectCommand: `qm-host-broker connect ${deps.publicWebUrl}`,
+              actionAuthority: canceled.authorityId,
+              actions: [],
+            },
+          };
+          await deps.sessions
+            .append(leaseAttempt.lease!, {
+              type: "assistant",
+              payload: {
+                text: result.reply,
+                desktopBrowserActivity: result.desktopBrowserActivity,
+              },
+              scopeLabel: projectScopeId(canceled.projectId),
+            })
+            .catch(() => undefined);
+          deps.auditLog.record({
+            at: canceled.updatedAt,
+            principalId: actor.id,
+            action: "desktop_browser.task.canceled",
+            resource: canceled.id,
+            scopeLabel: projectScopeId(canceled.projectId),
+            status: canceled.status,
+          });
+          return result;
+        });
+        return response ?? { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+      } finally {
+        await deps.sessions.releaseLease(leaseAttempt.lease);
+      }
     },
 
     subscribeSessionStates(cb) {
