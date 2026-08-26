@@ -63,7 +63,7 @@ export interface ChromeForTestingProvenance {
   executableVersion?: string;
 }
 
-export interface FailureChromeProvenance extends ChromeForTestingProvenance {
+interface FailureChromeProvenance extends ChromeForTestingProvenance {
   complete: boolean;
 }
 
@@ -153,7 +153,7 @@ export interface DesktopBrowserConformanceOptions {
   commandTimeoutMs: number;
 }
 
-export interface DesktopBrowserConformanceChromeHandle {
+interface DesktopBrowserConformanceChromeHandle {
   pid: number | null;
   readStderr: () => string;
   child?: unknown;

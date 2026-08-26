@@ -19,7 +19,7 @@ import {
   waitForDaemonReadiness,
   writeBrowserSkillConformanceManifest,
 } from "../scripts/desktop-browser-conformance.ts";
-import { createNodeDesktopBrowserConformanceDeps as createNodeRunnerDeps } from "../scripts/run-browser-skill-conformance.mjs";
+import { createNodeDesktopBrowserConformanceDeps as createNodeRunnerDeps } from "../scripts/run-browser-skill-conformance.ts";
 
 const sourceCommit = "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c";
 
