@@ -63,12 +63,21 @@ export const desktopBrowserRelayInvocationFixture = {
   },
 } as const satisfies DesktopBrowserMessage;
 
+export const desktopBrowserSessionStartAcceptedFixture = {
+  protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  kind: "host.accepted",
+  payload: {
+    dispatchId: desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    operationId: desktopBrowserSessionStartAuthorityFixture.operationId,
+    requestHash: desktopBrowserRelayInvocationFixture.payload.requestHash,
+  },
+} as const satisfies DesktopBrowserMessage;
+
 export const desktopBrowserSessionStartCompletedResultFixture = {
   protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   kind: "host.result",
   payload: {
     operationId: desktopBrowserSessionStartAuthorityFixture.operationId,
-    accepted: true,
     outcome: "completed",
     resultHash: "sha256:result-1",
     result: {
@@ -130,6 +139,7 @@ export const phaseFContractFixtures = [
     },
   },
   desktopBrowserRelayInvocationFixture,
+  desktopBrowserSessionStartAcceptedFixture,
   desktopBrowserSessionStartCompletedResultFixture,
   {
     protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
