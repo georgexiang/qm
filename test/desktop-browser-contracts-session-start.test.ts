@@ -172,7 +172,6 @@ test("Ticket 05 relay.invoke carries a strict authority plus dispatch identity a
       dispatchId: invocation.payload.dispatchId,
       requestHash: computeDesktopBrowserRequestHash(futureAuthority, "1.7"),
       authority: futureAuthority,
-      deliveryHint: "ignored-after-validation",
     },
   };
   assert.throws(
@@ -188,6 +187,20 @@ test("Ticket 05 relay.invoke carries a strict authority plus dispatch identity a
       authority: futureAuthority,
     },
   });
+  assert.throws(
+    () =>
+      decodeDesktopBrowserMessage(
+        JSON.stringify({
+          ...additiveInvocation,
+          payload: {
+            ...additiveInvocation.payload,
+            deliveryHint: "rejected-inside-operation-payload",
+          },
+        }),
+        "1.7",
+      ),
+    /relay\.invoke message does not match its schema/,
+  );
   for (const nestedAuthority of [
     {
       ...futureAuthority,
@@ -250,25 +263,98 @@ test("Ticket 05 relay.invoke carries a strict authority plus dispatch identity a
       ),
     /requestHash .* does not match canonical request hash/,
   );
+  assert.throws(
+    () =>
+      decodeDesktopBrowserMessage(
+        JSON.stringify({
+          ...invocation,
+          payload: {
+            ...invocation.payload,
+            authority: { ...authority, taskId: "task-2" },
+          },
+        }),
+        "1.2",
+      ),
+    /requestHash .* does not match canonical request hash/,
+  );
 });
 
-test("Ticket 05 host.result distinguishes pre-fence failure from accepted terminal outcomes", () => {
-  const preFenceFailure = {
+test("Ticket 05 host.accepted carries the unique fsynced acceptance point", () => {
+  const accepted = {
     protocolVersion: "1.2",
-    kind: "host.result",
+    kind: "host.accepted",
     payload: {
+      dispatchId: "0198f3d2-1950-7000-8000-000000000002",
       operationId: authority.operationId,
-      accepted: false,
-      outcome: "failed",
-      error: { code: "browser_cli_shape_changed", message: "CLI shape changed before acceptance" },
+      requestHash: computeDesktopBrowserRequestHash(authority),
     },
   };
+
+  const replayedDispatch = {
+    ...accepted,
+    payload: {
+      ...accepted.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000099",
+    },
+  };
+
+  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(accepted), "1.2"), accepted);
+  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(replayedDispatch), "1.2"), replayedDispatch);
+  assert.equal(accepted.payload.operationId, replayedDispatch.payload.operationId);
+  assert.equal(accepted.payload.requestHash, replayedDispatch.payload.requestHash);
+  assert.notEqual(accepted.payload.dispatchId, replayedDispatch.payload.dispatchId);
+  assert.throws(
+    () => decodeDesktopBrowserMessage(JSON.stringify(accepted), "1.0"),
+    /host\.accepted protocol version 1\.2 does not equal negotiated version 1\.0/,
+  );
+  assert.throws(
+    () => decodeDesktopBrowserMessage(JSON.stringify({ ...accepted, protocolVersion: "1.0" }), "1.0"),
+    /host\.accepted requires Ticket 05 protocol version 1\.2 or newer compatible minor/,
+  );
+  assert.throws(
+    () => decodeDesktopBrowserMessage(JSON.stringify({ ...accepted, traceContext: "not-valid-in-1.2" }), "1.2"),
+    /host\.accepted message does not match its schema/,
+  );
+  assert.throws(
+    () =>
+      decodeDesktopBrowserMessage(
+        JSON.stringify({
+          ...accepted,
+          payload: { ...accepted.payload, acceptanceHint: "not-valid-in-1.2" },
+        }),
+        "1.2",
+      ),
+    /host\.accepted message does not match its schema/,
+  );
+  const additiveAccepted = {
+    ...accepted,
+    protocolVersion: "1.7",
+    traceContext: "ignored-after-validation",
+  };
+  assert.throws(
+    () => decodeDesktopBrowserMessage(JSON.stringify(additiveAccepted), "1.2"),
+    /host\.accepted protocol version 1\.7 does not equal negotiated version 1\.2/,
+  );
+  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(additiveAccepted), "1.7"), {
+    ...accepted,
+    protocolVersion: "1.7",
+  });
+  for (const field of ["dispatchId", "operationId", "requestHash"] as const) {
+    const payload = { ...accepted.payload } as Record<string, unknown>;
+    delete payload[field];
+    assert.throws(
+      () => decodeDesktopBrowserMessage(JSON.stringify({ ...accepted, payload }), "1.2"),
+      /host\.accepted message does not match its schema/,
+    );
+  }
+});
+
+test("Ticket 05 host.result is terminal-only after host.accepted", () => {
   const completed = {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
       operationId: authority.operationId,
-      accepted: true,
       outcome: "completed",
       resultHash: "sha256:result-1",
       result: {
@@ -278,9 +364,29 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
       },
     },
   };
+  const failed = {
+    protocolVersion: "1.2",
+    kind: "host.result",
+    payload: {
+      operationId: authority.operationId,
+      outcome: "failed",
+      resultHash: "sha256:failed-1",
+      error: { code: "browser_cli_failed", message: "Browser CLI failed after acceptance" },
+    },
+  };
+  const unknown = {
+    protocolVersion: "1.2",
+    kind: "host.result",
+    payload: {
+      operationId: authority.operationId,
+      outcome: "unknown",
+      resultHash: "sha256:unknown-1",
+    },
+  };
 
-  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(preFenceFailure), "1.2"), preFenceFailure);
   assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(completed), "1.2"), completed);
+  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(failed), "1.2"), failed);
+  assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(unknown), "1.2"), unknown);
   assert.throws(
     () => decodeDesktopBrowserMessage(JSON.stringify(completed), "1.0"),
     /host\.result protocol version 1\.2 does not equal negotiated version 1\.0/,
@@ -301,10 +407,6 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
     ...completed,
     protocolVersion: "1.7",
     traceContext: "ignored-after-validation",
-    payload: {
-      ...completed.payload,
-      completionHint: "ignored-after-validation",
-    },
   };
   assert.throws(
     () => decodeDesktopBrowserMessage(JSON.stringify(additiveCompleted), "1.2"),
@@ -314,28 +416,30 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
     ...completed,
     protocolVersion: "1.7",
   });
+  assert.throws(
+    () =>
+      decodeDesktopBrowserMessage(
+        JSON.stringify({
+          ...additiveCompleted,
+          payload: {
+            ...additiveCompleted.payload,
+            completionHint: "rejected-inside-operation-payload",
+          },
+        }),
+        "1.7",
+      ),
+    /host\.result message does not match its schema/,
+  );
   const additiveFailure = {
+    ...failed,
     protocolVersion: "1.7",
-    kind: "host.result",
     traceContext: "ignored-after-validation",
-    payload: {
-      operationId: authority.operationId,
-      accepted: true,
-      outcome: "failed",
-      resultHash: "sha256:failed-1",
-      error: {
-        code: "browser_cli_failed",
-        message: "Browser CLI failed after acceptance",
-      },
-      failureHint: "ignored-after-validation",
-    },
   };
   assert.deepEqual(decodeDesktopBrowserMessage(JSON.stringify(additiveFailure), "1.7"), {
     protocolVersion: "1.7",
     kind: "host.result",
     payload: {
       operationId: authority.operationId,
-      accepted: true,
       outcome: "failed",
       resultHash: "sha256:failed-1",
       error: { code: "browser_cli_failed", message: "Browser CLI failed after acceptance" },
@@ -370,34 +474,6 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
     /host\.result message does not match its schema/,
   );
   assert.throws(
-    () =>
-      decodeDesktopBrowserMessage(
-        JSON.stringify({
-          ...preFenceFailure,
-          payload: { ...preFenceFailure.payload, result: completed.payload.result },
-        }),
-        "1.2",
-      ),
-    /host\.result message does not match its schema/,
-  );
-  for (const outcome of ["failed", "unknown"] as const) {
-    assert.doesNotThrow(() =>
-      decodeDesktopBrowserMessage(
-        JSON.stringify({
-          protocolVersion: "1.2",
-          kind: "host.result",
-          payload: {
-            operationId: authority.operationId,
-            accepted: true,
-            outcome,
-            resultHash: `sha256:${outcome}-1`,
-          },
-        }),
-        "1.2",
-      ),
-    );
-  }
-  assert.throws(
     () => decodeDesktopBrowserMessage(JSON.stringify({ ...completed, protocolVersion: "1.0" }), "1.0"),
     /host\.result requires Ticket 05 protocol version 1\.2 or newer compatible minor/,
   );
@@ -413,7 +489,7 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
         }),
         "1.2",
       ),
-    /completed session start cannot include error/,
+    /host\.result message does not match its schema/,
   );
   assert.throws(
     () =>
@@ -424,7 +500,7 @@ test("Ticket 05 host.result distinguishes pre-fence failure from accepted termin
         }),
         "1.2",
       ),
-    /host\.result message does not match its schema/,
+    /result is only valid for completed session start/,
   );
   assert.throws(
     () =>
@@ -444,18 +520,16 @@ test("Ticket 05 host.result rejects every invalid discriminator and field combin
   const error = { code: "browser_cli_failed", message: "Browser CLI failed" };
   const result = { session_id: "session-1", browser_instance_id: "browser-primary", agent_window_id: 42 };
   const invalidPayloads: Record<string, unknown>[] = [
-    { operationId, accepted: false, outcome: "completed", error },
-    { operationId, accepted: false, outcome: "unknown", error },
-    { operationId, accepted: false, outcome: "failed" },
-    { operationId, accepted: false, outcome: "failed", error, resultHash: "sha256:invalid" },
-    { operationId, accepted: false, outcome: "failed", error, result },
-    { operationId, accepted: true, outcome: "completed", resultHash: "sha256:result", result, error },
-    { operationId, accepted: true, outcome: "completed", result },
-    { operationId, accepted: true, outcome: "completed", resultHash: "sha256:result" },
-    { operationId, accepted: true, outcome: "failed", resultHash: "sha256:failed", result },
-    { operationId, accepted: true, outcome: "unknown", resultHash: "sha256:unknown", result },
-    { operationId, accepted: true, outcome: "failed" },
-    { operationId, accepted: true, outcome: "unknown" },
+    { operationId, accepted: false, outcome: "failed", error },
+    { operationId, dispatchId: "dispatch-1", outcome: "failed", error },
+    { operationId, outcome: "completed", result },
+    { operationId, outcome: "completed", resultHash: "sha256:result", result, error },
+    { operationId, outcome: "completed", resultHash: "sha256:result" },
+    { operationId, outcome: "completed", resultHash: "sha256:result", result, accepted: true },
+    { operationId, outcome: "failed", resultHash: "sha256:failed", result },
+    { operationId, outcome: "unknown", resultHash: "sha256:unknown", result },
+    { operationId, outcome: "failed" },
+    { operationId, outcome: "unknown" },
   ];
 
   for (const payload of invalidPayloads) {
