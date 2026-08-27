@@ -104,6 +104,16 @@ export interface RelayInvocationMessage {
   };
 }
 
+export interface HostAcceptedMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "host.accepted";
+  payload: {
+    dispatchId: string;
+    operationId: string;
+    requestHash: string;
+  };
+}
+
 export interface DesktopBrowserSessionStartResult {
   session_id: string;
   browser_instance_id: string;
@@ -122,20 +132,12 @@ export type HostResultMessage = {
   payload:
     | {
         operationId: string;
-        accepted: false;
-        outcome: "failed";
-        error: DesktopBrowserHostFailure;
-      }
-    | {
-        operationId: string;
-        accepted: true;
         outcome: "completed";
         resultHash: string;
         result: DesktopBrowserSessionStartResult;
       }
     | {
         operationId: string;
-        accepted: true;
         outcome: "failed" | "unknown";
         resultHash: string;
         error?: DesktopBrowserHostFailure;
@@ -235,6 +237,7 @@ export type DesktopBrowserMessage =
   | RelayChallengeMessage
   | HostChallengeResponseMessage
   | RelayInvocationMessage
+  | HostAcceptedMessage
   | HostResultMessage
   | CompanionStatusMessage;
 
@@ -671,11 +674,18 @@ export const desktopBrowserMessageSchemas = {
       authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
     }),
   ),
+  "host.accepted": strictMessageSchema(
+    "host.accepted",
+    strictObjectSchema(["dispatchId", "operationId", "requestHash"], {
+      dispatchId: nonEmptyStringSchema,
+      operationId: nonEmptyStringSchema,
+      requestHash: nonEmptyStringSchema,
+    }),
+  ),
   "host.result": strictMessageSchema(
     "host.result",
-    strictObjectSchema(["operationId", "accepted", "outcome"], {
+    strictObjectSchema(["operationId", "outcome", "resultHash"], {
       operationId: nonEmptyStringSchema,
-      accepted: { type: "boolean" },
       outcome: { enum: ["completed", "failed", "unknown"] },
       resultHash: nonEmptyStringSchema,
       result: desktopBrowserSessionStartResultSchema,
@@ -698,31 +708,31 @@ export const desktopBrowserMessageSchemas = {
 
 const relayInvocationAdditiveMessageSchema = messageSchema(
   "relay.invoke",
-  objectSchema(
-    ["dispatchId", "requestHash", "authority"],
-    {
-      dispatchId: nonEmptyStringSchema,
-      requestHash: nonEmptyStringSchema,
-      authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
-    },
-    true,
-  ),
+  strictObjectSchema(["dispatchId", "requestHash", "authority"], {
+    dispatchId: nonEmptyStringSchema,
+    requestHash: nonEmptyStringSchema,
+    authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
+  }),
+);
+
+const hostAcceptedAdditiveMessageSchema = messageSchema(
+  "host.accepted",
+  strictObjectSchema(["dispatchId", "operationId", "requestHash"], {
+    dispatchId: nonEmptyStringSchema,
+    operationId: nonEmptyStringSchema,
+    requestHash: nonEmptyStringSchema,
+  }),
 );
 
 const hostResultAdditiveMessageSchema = messageSchema(
   "host.result",
-  objectSchema(
-    ["operationId", "accepted", "outcome"],
-    {
-      operationId: nonEmptyStringSchema,
-      accepted: { type: "boolean" },
-      outcome: { enum: ["completed", "failed", "unknown"] },
-      resultHash: nonEmptyStringSchema,
-      result: desktopBrowserSessionStartResultSchema,
-      error: desktopBrowserHostFailureSchema,
-    },
-    true,
-  ),
+  strictObjectSchema(["operationId", "outcome", "resultHash"], {
+    operationId: nonEmptyStringSchema,
+    outcome: { enum: ["completed", "failed", "unknown"] },
+    resultHash: nonEmptyStringSchema,
+    result: desktopBrowserSessionStartResultSchema,
+    error: desktopBrowserHostFailureSchema,
+  }),
 );
 
 const messageParsers = Object.fromEntries(
@@ -733,6 +743,9 @@ const messageParsers = Object.fromEntries(
 ) as Record<DesktopBrowserMessageKind, ReturnType<typeof fromJSONSchema>>;
 const relayInvocationAdditiveMessageParser = fromJSONSchema(
   relayInvocationAdditiveMessageSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const hostAcceptedAdditiveMessageParser = fromJSONSchema(
+  hostAcceptedAdditiveMessageSchema as unknown as Parameters<typeof fromJSONSchema>[0],
 );
 const hostResultAdditiveMessageParser = fromJSONSchema(
   hostResultAdditiveMessageSchema as unknown as Parameters<typeof fromJSONSchema>[0],
@@ -822,7 +835,9 @@ export function isDesktopBrowserProtocolCompatible(remoteVersion: string, suppor
   return protocolMajor(remoteVersion) === protocolMajor(supportedVersion);
 }
 
-function assertTicket05OperationVersion(message: RelayInvocationMessage | HostResultMessage): void {
+function assertTicket05OperationVersion(
+  message: RelayInvocationMessage | HostAcceptedMessage | HostResultMessage,
+): void {
   assertCanonicalProtocolVersion(message.protocolVersion, "protocolVersion");
   if (
     !isDesktopBrowserProtocolCompatible(message.protocolVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) ||
@@ -845,6 +860,12 @@ function pickDesktopBrowserMessageParser(
     return relayInvocationAdditiveMessageParser;
   }
   if (
+    kind === "host.accepted" &&
+    isCompatibleAdditiveMinorVersion(supportedVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION)
+  ) {
+    return hostAcceptedAdditiveMessageParser;
+  }
+  if (
     kind === "host.result" &&
     isCompatibleAdditiveMinorVersion(supportedVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION)
   ) {
@@ -858,7 +879,7 @@ function assertNegotiatedOperationVersion(
   raw: Record<string, unknown>,
   supportedVersion: string,
 ): void {
-  if (kind !== "relay.invoke" && kind !== "host.result") return;
+  if (kind !== "relay.invoke" && kind !== "host.accepted" && kind !== "host.result") return;
   assertCanonicalProtocolVersion(supportedVersion, "supportedVersion");
   if (typeof raw.protocolVersion === "string" && raw.protocolVersion !== supportedVersion) {
     throw new Error(
@@ -920,6 +941,10 @@ export function decodeDesktopBrowserMessage(
       },
     };
   }
+  if (message.kind === "host.accepted") {
+    assertTicket05OperationVersion(message);
+    return canonicalizeDesktopBrowserHostAccepted(message);
+  }
   if (message.kind === "host.result") {
     assertTicket05OperationVersion(message);
     assertDesktopBrowserHostResult(message);
@@ -928,27 +953,26 @@ export function decodeDesktopBrowserMessage(
   return message;
 }
 
+function canonicalizeDesktopBrowserHostAccepted(message: HostAcceptedMessage): HostAcceptedMessage {
+  return {
+    protocolVersion: message.protocolVersion,
+    kind: message.kind,
+    payload: {
+      dispatchId: message.payload.dispatchId,
+      operationId: message.payload.operationId,
+      requestHash: message.payload.requestHash,
+    },
+  };
+}
+
 function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostResultMessage {
   const payload = message.payload;
-  if (!payload.accepted) {
-    return {
-      protocolVersion: message.protocolVersion,
-      kind: message.kind,
-      payload: {
-        operationId: payload.operationId,
-        accepted: false,
-        outcome: "failed",
-        error: { code: payload.error.code, message: payload.error.message },
-      },
-    };
-  }
   if (payload.outcome === "completed") {
     return {
       protocolVersion: message.protocolVersion,
       kind: message.kind,
       payload: {
         operationId: payload.operationId,
-        accepted: true,
         outcome: "completed",
         resultHash: payload.resultHash,
         result: {
@@ -964,7 +988,6 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
     kind: message.kind,
     payload: {
       operationId: payload.operationId,
-      accepted: true,
       outcome: payload.outcome,
       resultHash: payload.resultHash,
       ...(payload.error === undefined ? {} : { error: { code: payload.error.code, message: payload.error.message } }),
@@ -974,20 +997,6 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
 
 function assertDesktopBrowserHostResult(message: HostResultMessage): void {
   const payload = message.payload as unknown as Record<string, unknown>;
-  if (payload.accepted === false) {
-    if (
-      payload.outcome !== "failed" ||
-      payload.error === undefined ||
-      payload.resultHash !== undefined ||
-      payload.result !== undefined
-    ) {
-      throw new Error("host.result message does not match its schema: invalid pre-fence failure");
-    }
-    return;
-  }
-  if (payload.resultHash === undefined) {
-    throw new Error("host.result message does not match its schema: accepted result requires resultHash");
-  }
   if (payload.outcome === "completed") {
     if (payload.result === undefined) {
       throw new Error("host.result message does not match its schema: completed session start requires result");
