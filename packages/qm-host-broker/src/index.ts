@@ -1942,6 +1942,7 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
     if (!qmUrl) throw new Error("connect requires the QM public URL");
     ensureNoExtraArgs(rest);
     const relayUrl = deps.resolveRelayUrl ? deps.resolveRelayUrl(qmUrl) : resolveRelayUrlDefault(qmUrl);
+    normalizeBrowserSkillExecutable(deps.browserSkillExecutable, deps.sessionRunner);
     const processEpoch = nextProcessEpoch(stored?.processEpoch ?? null, scheduler);
     const initialState = createInitialState({
       qmUrl,

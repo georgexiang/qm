@@ -1933,6 +1933,7 @@ test("host relay path override validates and interoperates with a custom relay w
       brokerInstanceId: "broker-local-1",
       brokerVersion: "0.0.0-test",
       runtime: runtime(),
+      browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     }).finally(() => {
       if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = priorNodeEnv;
@@ -2344,6 +2345,7 @@ test("connect rejects present but mismatched authoritative deployment broker or 
       brokerInstanceId: tuple.brokerInstanceId,
       brokerVersion: "0.0.0-test",
       runtime: runtime(),
+      browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     };
 
     stdoutChunks.length = 0;
@@ -2533,6 +2535,7 @@ test("connect fails closed for insecure relay transport and unusable runtime met
     },
     resolveRelayUrl: () => "ws://relay.example.com/v1/device",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   });
 
   assert.equal(insecureTransportExit, 1);
@@ -2561,6 +2564,7 @@ test("connect fails closed for insecure relay transport and unusable runtime met
       extensionVersion: "unavailable",
       cliShapeHash: "unavailable",
     },
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   });
 
   assert.equal(offlineRuntimeExit, 1);
@@ -2680,6 +2684,7 @@ test("connect, status, and confirmation outputs all state that QM controls the s
     brokerInstanceId: tuple.brokerInstanceId,
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -2754,6 +2759,7 @@ test("connect preserves a newer authoritative epoch after a post-handshake trans
     brokerInstanceId: tuple.brokerInstanceId,
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const firstConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -2870,6 +2876,7 @@ test("connect supervisor reconnects after 1012 service restart, keeps only one s
     scheduler,
     reconnectBaseMs: 200,
     reconnectMaxMs: 1_000,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3004,6 +3011,7 @@ test("connect supervisor aborts during backoff without opening a duplicate socke
     scheduler,
     reconnectBaseMs: 200,
     reconnectMaxMs: 1_000,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3059,6 +3067,7 @@ test("connect supervisor fails closed on fatal close code without retry", async 
     scheduler,
     reconnectBaseMs: 200,
     reconnectMaxMs: 1_000,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3121,6 +3130,7 @@ test("connect supervisor fails closed on a nonretryable lower-epoch challenge af
     scheduler,
     reconnectBaseMs: 200,
     reconnectMaxMs: 1_000,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3202,6 +3212,7 @@ test("live connect stores authoritative binding and stale preview then confirm b
     brokerInstanceId: tuple.brokerInstanceId,
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const firstConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3327,6 +3338,7 @@ test("live connect accepts an identical reconnect idempotently without altering 
     brokerInstanceId: tuple.brokerInstanceId,
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const firstConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3456,6 +3468,7 @@ test("replayed lower-epoch relay challenges are rejected and cannot roll back st
     brokerInstanceId: tuple.brokerInstanceId,
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const firstConnect = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
@@ -3602,6 +3615,7 @@ test("late stale frames after a retryable close are ignored and do not mutate pe
     scheduler,
     reconnectBaseMs: 200,
     reconnectMaxMs: 1_000,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   };
 
   const connectPromise = runHostBrokerCli(["connect", "https://qm.example.com"], baseDeps);
