@@ -63,6 +63,15 @@ function parseInteger(name: string, value: string | undefined, fallback: number)
   return parsed;
 }
 
+function parsePositiveSafeInteger(name: string, value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return parsed;
+}
+
 export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.env): DesktopBrowserRelayRuntimeConfig {
   const sourceAuthSecret = requireEnv("QM_RELAY_SOURCE_AUTH_SECRET", env.QM_RELAY_SOURCE_AUTH_SECRET);
   if (sourceAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
@@ -82,12 +91,12 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
     supportedPolicyGrammarVersions: parseList(env.QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS, [
       ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
     ]),
-    maxSettledDispatchHistory: parseInteger(
+    maxSettledDispatchHistory: parsePositiveSafeInteger(
       "QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY",
       env.QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY,
       1_024,
     ),
-    settledDispatchHistoryTtlMs: parseInteger(
+    settledDispatchHistoryTtlMs: parsePositiveSafeInteger(
       "QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS",
       env.QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS,
       300_000,
