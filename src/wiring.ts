@@ -732,13 +732,15 @@ export function buildApp(
   if (config.production && !config.databaseUrl) {
     throw new Error("Desktop Browser registration requires DATABASE_URL in production");
   }
-  const desktopBrowserTasks = createDesktopBrowserTaskStore(artifactMap("desktop_browser_tasks"));
   const desktopBrowserDeviceRegistry = createDesktopBrowserDeviceRegistry(
     {
       state: artifactMap("desktop_browser_device_registry_state"),
     },
     { deploymentCanonicalId: config.publicWebUrl ?? "qm://deployments/local" },
   );
+  const desktopBrowserTasks = createDesktopBrowserTaskStore(artifactMap("desktop_browser_tasks"), {
+    sessionStartAuthority: (taskId) => desktopBrowserDeviceRegistry.sessionStartAuthority(taskId),
+  });
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),

@@ -54,6 +54,8 @@ export function createTurnMethods(
   | "desktopBrowserResolveRelayBinding"
   | "desktopBrowserPublishRelayConnection"
   | "desktopBrowserClearRelayConnection"
+  | "desktopBrowserPrepareSessionStart"
+  | "desktopBrowserConsumeSessionStartResult"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -772,6 +774,23 @@ export function createTurnMethods(
 
     async desktopBrowserClearRelayConnection(connectionId) {
       await deps.desktopBrowserDeviceRegistry.clearRelayConnection(connectionId);
+    },
+
+    async desktopBrowserPrepareSessionStart(taskId, authorityId) {
+      return withCurrentWaitingTask(taskId, authorityId, async () => {
+        return deps.desktopBrowserTasks.prepareSessionStart(taskId);
+      });
+    },
+
+    async desktopBrowserConsumeSessionStartResult(taskId, result) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      if (task.execution?.hostResult) {
+        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result);
+      }
+      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
+        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result);
+      });
     },
 
     subscribeSessionStates(cb) {

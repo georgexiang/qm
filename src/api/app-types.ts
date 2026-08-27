@@ -37,6 +37,7 @@ import type {
   DesktopBrowserPublicIdentity,
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRegistrationReservationTuple,
+  HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import type { ModelGateway } from "../model/model-gateway.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
@@ -315,6 +316,14 @@ export interface App {
   }): Promise<{ status: "ok"; binding: DesktopBrowserRelayRegistryBinding } | { status: "refused"; reason: string }>;
   desktopBrowserPublishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
   desktopBrowserClearRelayConnection(connectionId: string): Promise<void>;
+  desktopBrowserPrepareSessionStart(
+    taskId: string,
+    authorityId: string,
+  ): ReturnType<DesktopBrowserTaskStore["prepareSessionStart"]>;
+  desktopBrowserConsumeSessionStartResult(
+    taskId: string,
+    result: HostResultMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeSessionStartResult"]>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
   subscribeSessionStates(cb: (event: SessionStateEvent) => void): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;
