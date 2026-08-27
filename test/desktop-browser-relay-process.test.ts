@@ -103,6 +103,18 @@ function hostHello(devicePublicKey: string, brokerInstanceId: string): string {
   });
 }
 
+function relayProcessEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    QM_RELAY_HOST: "127.0.0.1",
+    QM_RELAY_PORT: "0",
+    QM_RELAY_INSTANCE_ID: "relay-a",
+    QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
+    QM_RELAY_CORE_API_URL: "http://127.0.0.1:8080",
+    QM_RELAY_SOURCE_AUTH_SECRET: "relay-source-auth-secret-for-tests-0001",
+    ...overrides,
+  };
+}
+
 function challengeResponse(
   challenge: RelayChallengeMessage,
   devicePublicKey: string,
@@ -401,20 +413,62 @@ test("relay process runtime loads dedicated config and starts independently", as
 });
 
 test("relay process config defaults to the shared Phase F protocol and policy grammar support", () => {
-  const sourceAuthSecret = "relay-source-auth-secret-for-tests-0001";
-  const config = loadDesktopBrowserRelayConfig({
-    QM_RELAY_HOST: "127.0.0.1",
-    QM_RELAY_PORT: "0",
-    QM_RELAY_INSTANCE_ID: "relay-a",
-    QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
-    QM_RELAY_CORE_API_URL: "http://127.0.0.1:8080",
-    QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
-  });
+  const config = loadDesktopBrowserRelayConfig(relayProcessEnv());
 
   assert.deepEqual(config.supportedProtocolVersions, [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS]);
   assert.deepEqual(config.supportedPolicyGrammarVersions, [
     ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   ]);
+  assert.equal(config.maxSettledDispatchHistory, 1_024);
+  assert.equal(config.settledDispatchHistoryTtlMs, 300_000);
+});
+
+test("relay process config accepts explicit settled dispatch history bounds", () => {
+  const config = loadDesktopBrowserRelayConfig(
+    relayProcessEnv({
+      QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "1",
+      QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "9007199254740991",
+    }),
+  );
+
+  assert.equal(config.maxSettledDispatchHistory, 1);
+  assert.equal(config.settledDispatchHistoryTtlMs, Number.MAX_SAFE_INTEGER);
+});
+
+test("relay process config rejects invalid settled dispatch history bounds directly", () => {
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "0" })),
+    /QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "-1" })),
+    /QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "1.5" })),
+    /QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "9007199254740992" })),
+    /QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "0" })),
+    /QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "-1" })),
+    /QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS must be a positive safe integer/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "1.5" })),
+    /QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS must be a positive safe integer/,
+  );
+  assert.throws(
+    () =>
+      loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "9007199254740992" })),
+    /QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS must be a positive safe integer/,
+  );
 });
 
 test("relay process runtime preserves an explicit websocket path override", async () => {

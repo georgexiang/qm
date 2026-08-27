@@ -2,17 +2,26 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { test } from "node:test";
 import {
+  computeDesktopBrowserRequestHash,
   encodeHostChallengeResponseSigningBytes,
+  type HostAcceptedMessage,
   type HostChallengeResponseMessage,
+  type HostResultMessage,
+  type RelayInvocationMessage,
   type RelayChallengeMessage,
 } from "../packages/desktop-browser-contracts/src/index.ts";
-import { desktopBrowserRelayInvocationFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
+import {
+  desktopBrowserRelayInvocationFixture,
+  desktopBrowserSessionStartAcceptedFixture,
+  desktopBrowserSessionStartCompletedResultFixture,
+} from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import {
   DesktopBrowserRelayService,
   type DesktopBrowserRelayBinding,
   type DesktopBrowserRelayClock,
   type DesktopBrowserRelayProjection,
   type DesktopBrowserRelayRegistryAdapter,
+  type RelayDispatchResult,
   type DesktopBrowserRelaySocket,
 } from "../packages/qm-broker-relay/src/index.ts";
 
@@ -166,13 +175,12 @@ function createDeviceIdentity() {
   const devicePublicKey = `ed25519:${Buffer.from(exported).toString("base64")}`;
   return {
     devicePublicKey,
-    signResponse(payload: Omit<HostChallengeResponseMessage["payload"], "signatureAlgorithm" | "signature">): string {
+    signResponse(
+      payload: Omit<HostChallengeResponseMessage["payload"], "signatureAlgorithm" | "signature">,
+      protocolVersion: `${number}.${number}` = "1.2",
+    ): string {
       return Buffer.from(
-        sign(
-          null,
-          Buffer.from(encodeHostChallengeResponseSigningBytes({ protocolVersion: "1.2", payload })),
-          privateKey,
-        ),
+        sign(null, Buffer.from(encodeHostChallengeResponseSigningBytes({ protocolVersion, payload })), privateKey),
       ).toString("base64url");
     },
   };
@@ -203,6 +211,124 @@ async function flushMessages(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function assertUnknownResult(
+  result: RelayDispatchResult,
+  expectedDispatchId: string,
+  expectedOperationId: string,
+  expectedRequestHash: string,
+  expectedMessage: RegExp,
+): void {
+  assert.equal(result.kind, "not_accepted_or_unknown");
+  assert.equal(result.dispatchId, expectedDispatchId);
+  assert.equal(result.operationId, expectedOperationId);
+  assert.equal(result.requestHash, expectedRequestHash);
+  assert.equal(result.error.code, "relay_delivery_unknown");
+  assert.match(result.error.message, expectedMessage);
+}
+
+function assertAcceptedUnknown(
+  result: RelayDispatchResult,
+  expectedAccepted: HostAcceptedMessage,
+  expectedMessage: RegExp,
+): void {
+  assert.equal(result.kind, "accepted_unknown");
+  assert.deepEqual(result.accepted, expectedAccepted);
+  assert.equal(result.error.code, "relay_delivery_unknown");
+  assert.match(result.error.message, expectedMessage);
+}
+
+function assertCompletedResult(
+  result: RelayDispatchResult,
+  expectedAccepted: HostAcceptedMessage,
+  expectedResult: HostResultMessage,
+): void {
+  assert.equal(result.kind, "host.result");
+  assert.deepEqual(result.accepted, expectedAccepted);
+  assert.deepEqual(result.result, expectedResult);
+}
+
+function acceptedMessageFor(
+  invocation: RelayInvocationMessage = desktopBrowserRelayInvocationFixture,
+): HostAcceptedMessage {
+  return {
+    ...desktopBrowserSessionStartAcceptedFixture,
+    payload: {
+      dispatchId: invocation.payload.dispatchId,
+      operationId: invocation.payload.authority.operationId,
+      requestHash: invocation.payload.requestHash,
+    },
+  };
+}
+
+function completedResultFor(
+  invocation: RelayInvocationMessage = desktopBrowserRelayInvocationFixture,
+): HostResultMessage {
+  return {
+    ...desktopBrowserSessionStartCompletedResultFixture,
+    payload: {
+      ...desktopBrowserSessionStartCompletedResultFixture.payload,
+      dispatchId: invocation.payload.dispatchId,
+      operationId: invocation.payload.authority.operationId,
+      result: {
+        ...desktopBrowserSessionStartCompletedResultFixture.payload.result,
+        browser_instance_id: invocation.payload.authority.browserInstanceId,
+      },
+    },
+  };
+}
+
+function invocationWithDispatchId(dispatchId: string): RelayInvocationMessage {
+  return {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId,
+    },
+  };
+}
+
+test("relay constructor enforces a positive safe integer max settled dispatch history", () => {
+  const createService = (maxSettledDispatchHistory: number) =>
+    new DesktopBrowserRelayService({
+      relayInstanceId: "relay-a",
+      deploymentCanonicalId: "qm://deployments/example",
+      supportedProtocolVersions: ["1.2"],
+      supportedPolicyGrammarVersions: ["1.0"],
+      registry: new FakeRegistryAdapter(),
+      maxSettledDispatchHistory,
+    });
+
+  assert.throws(
+    () => createService(Number.MAX_SAFE_INTEGER + 1),
+    /maxSettledDispatchHistory must be a positive safe integer/,
+  );
+  assert.throws(() => createService(-1), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.throws(() => createService(0), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.throws(() => createService(1.5), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.doesNotThrow(() => createService(Number.MAX_SAFE_INTEGER));
+});
+
+test("relay constructor enforces a positive safe integer settled dispatch history ttl", () => {
+  const createService = (settledDispatchHistoryTtlMs: number) =>
+    new DesktopBrowserRelayService({
+      relayInstanceId: "relay-a",
+      deploymentCanonicalId: "qm://deployments/example",
+      supportedProtocolVersions: ["1.2"],
+      supportedPolicyGrammarVersions: ["1.0"],
+      registry: new FakeRegistryAdapter(),
+      settledDispatchHistoryTtlMs,
+    });
+
+  assert.throws(
+    () => createService(Number.MAX_SAFE_INTEGER + 1),
+    /settledDispatchHistoryTtlMs must be a positive safe integer/,
+  );
+  assert.throws(() => createService(-1), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.throws(() => createService(0), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.throws(() => createService(1.5), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.doesNotThrow(() => createService(Number.MAX_SAFE_INTEGER));
+});
+
 function hostChallengeResponse(
   challenge: RelayChallengeMessage,
   input: {
@@ -214,6 +340,7 @@ function hostChallengeResponse(
     deploymentCanonicalId?: string;
     signResponse: (
       payload: Omit<HostChallengeResponseMessage["payload"], "signatureAlgorithm" | "signature">,
+      protocolVersion?: `${number}.${number}`,
     ) => string;
   },
 ): string {
@@ -232,9 +359,73 @@ function hostChallengeResponse(
     payload: {
       ...payload,
       signatureAlgorithm: "ed25519",
-      signature: input.signResponse(payload),
+      signature: input.signResponse(payload, challenge.protocolVersion),
     },
   });
+}
+
+async function createRegisteredTicket05Relay(
+  options: {
+    invocationTimeoutMs?: number;
+    protocolVersion?: `${number}.${number}`;
+    maxSettledDispatchHistory?: number;
+    settledDispatchHistoryTtlMs?: number;
+  } = {},
+) {
+  const protocolVersion = options.protocolVersion ?? "1.2";
+  const clock = new ManualClock();
+  const adapter = new FakeRegistryAdapter();
+  const identity = createDeviceIdentity();
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: [protocolVersion],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry: adapter,
+    clock,
+    createNonce: () => "nonce-1",
+    createConnectionId: (() => {
+      let current = 0;
+      return () => `connection-${++current}`;
+    })(),
+    invocationTimeoutMs: options.invocationTimeoutMs,
+    maxSettledDispatchHistory: options.maxSettledDispatchHistory,
+    settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs,
+  });
+  const socket = new FakeSocket();
+  service.acceptSocket(socket);
+  socket.message(
+    JSON.stringify({
+      protocolVersion,
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: [protocolVersion],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
+  await flushMessages();
+  socket.message(
+    hostChallengeResponse(challengeAt(socket), {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+  return { adapter, clock, identity, service, socket };
 }
 
 test("relay keeps a verified host pending until registration refresh promotes it and blocks invocation while pending", async () => {
@@ -286,6 +477,7 @@ test("relay keeps a verified host pending until registration refresh promotes it
         devicePublicKey: identity.devicePublicKey,
         brokerInstanceId: "broker-a",
         browserInstanceId: "browser-a",
+        invocation: desktopBrowserRelayInvocationFixture,
       }),
     /pending registration/,
   );
@@ -299,16 +491,642 @@ test("relay keeps a verified host pending until registration refresh promotes it
   });
   await service.refreshBinding({ devicePublicKey: identity.devicePublicKey, brokerInstanceId: "broker-a" });
   assert.equal(adapter.published.get("connection-1")?.registrationState, "registered");
+});
+
+test("relay delivers one session-start invocation to the current registered socket and resolves its result", async () => {
+  const clock = new ManualClock();
+  const adapter = new FakeRegistryAdapter();
+  const identity = createDeviceIdentity();
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry: adapter,
+    clock,
+    createNonce: () => "nonce-1",
+    createConnectionId: () => "connection-1",
+  });
+  const socket = new FakeSocket();
+
+  service.acceptSocket(socket);
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.2"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
+  await flushMessages();
+  socket.message(
+    hostChallengeResponse(challengeAt(socket), {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  assert.equal(socket.sent.length, 2);
+  assert.deepEqual(JSON.parse(socket.sent[1]!), desktopBrowserRelayInvocationFixture);
+
+  const accepted = acceptedMessageFor();
+  const completed = completedResultFor();
+  socket.message(JSON.stringify(accepted));
+  socket.message(JSON.stringify(completed));
+  assertCompletedResult(await result, accepted, completed);
+});
+
+test("relay returns not_accepted_or_unknown when a session-start dispatch times out before host.accepted", async () => {
+  const { clock, identity, service, socket } = await createRegisteredTicket05Relay({
+    invocationTimeoutMs: 50,
+  });
+
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  assert.equal(socket.sent.length, 2);
+
+  clock.tick(51);
+  const unknown = await result;
+  assertUnknownResult(
+    unknown,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+    desktopBrowserRelayInvocationFixture.payload.requestHash,
+    /timed out waiting for host\.accepted/i,
+  );
+  assert.equal(socket.sent.length, 2);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /timed out waiting for host\.accepted/i);
+});
+
+test("relay returns not_accepted_or_unknown when a session-start dispatch loses its socket before host.accepted", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+
+  socket.close(1006, "connection lost");
+  const unknown = await result;
+  assertUnknownResult(
+    unknown,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+    desktopBrowserRelayInvocationFixture.payload.requestHash,
+    /connection lost|closed before host\.accepted/i,
+  );
+});
+
+test("relay returns accepted_unknown when a session-start dispatch loses its socket after host.accepted", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+
+  const accepted = acceptedMessageFor();
+  socket.message(JSON.stringify(accepted));
+  await flushMessages();
+  socket.close(1006, "connection lost");
+
+  assertAcceptedUnknown(await result, accepted, /connection lost|closed after host\.accepted/i);
+});
+
+test("relay rejects a session-start dispatch unless the socket negotiated exactly protocol 1.2", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ protocolVersion: "1.3" });
 
   await assert.rejects(
     () =>
       service.dispatchInvocation({
         devicePublicKey: identity.devicePublicKey,
         brokerInstanceId: "broker-a",
-        browserInstanceId: "browser-a",
+        browserInstanceId: "browser-primary",
+        invocation: desktopBrowserRelayInvocationFixture,
       }),
-    /not implemented/,
+    /requires negotiated protocol version 1\.2/,
   );
+  assert.equal(socket.sent.length, 1);
+});
+
+test("relay independently rejects mismatched capability identity and request hash before delivery", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const authority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    capabilitySet: {
+      ...desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet,
+      bskVersion: "different-bsk-version",
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      service.dispatchInvocation({
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        browserInstanceId: "browser-primary",
+        invocation: {
+          ...desktopBrowserRelayInvocationFixture,
+          payload: {
+            ...desktopBrowserRelayInvocationFixture.payload,
+            authority,
+            requestHash: computeDesktopBrowserRequestHash(authority),
+          },
+        },
+      }),
+    /capability set does not match/,
+  );
+  await assert.rejects(
+    () =>
+      service.dispatchInvocation({
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        browserInstanceId: "browser-primary",
+        invocation: {
+          ...desktopBrowserRelayInvocationFixture,
+          payload: { ...desktopBrowserRelayInvocationFixture.payload, requestHash: "sha256:wrong" },
+        },
+      }),
+    /requestHash .* does not match canonical request hash/,
+  );
+  assert.equal(socket.sent.length, 1);
+});
+
+test("relay fences the socket and returns not_accepted_or_unknown when host.accepted does not match the in-flight dispatch", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(
+    JSON.stringify({
+      ...acceptedMessageFor(),
+      payload: {
+        ...acceptedMessageFor().payload,
+        requestHash: "sha256:mismatch",
+      },
+    }),
+  );
+
+  const unknown = await result;
+  assertUnknownResult(
+    unknown,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+    desktopBrowserRelayInvocationFixture.payload.requestHash,
+    /host\.accepted requestHash does not match/i,
+  );
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /host\.accepted requestHash does not match/i);
+});
+
+test("relay fences the socket and returns accepted_unknown when host.result names the wrong accepted operation", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  const accepted = acceptedMessageFor();
+  socket.message(JSON.stringify(accepted));
+  socket.message(
+    JSON.stringify({
+      ...completedResultFor(),
+      payload: {
+        ...completedResultFor().payload,
+        operationId: "0198f3d2-1950-7000-8000-000000000099",
+      },
+    }),
+  );
+
+  assertAcceptedUnknown(await result, accepted, /operation does not match the accepted invocation/i);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /operation does not match/i);
+});
+
+test("relay fences the socket and returns accepted_unknown when host.result names the wrong accepted dispatch", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  const accepted = acceptedMessageFor();
+  socket.message(JSON.stringify(accepted));
+  socket.message(
+    JSON.stringify({
+      ...completedResultFor(),
+      payload: {
+        ...completedResultFor().payload,
+        dispatchId: "0198f3d2-1950-7000-8000-000000000099",
+      },
+    }),
+  );
+
+  assertAcceptedUnknown(await result, accepted, /dispatch does not match the accepted invocation/i);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /dispatch does not match/i);
+});
+
+test("relay rejects a host.result that arrives before host.accepted", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+
+  socket.message(JSON.stringify(completedResultFor()));
+  const unknown = await result;
+  assertUnknownResult(
+    unknown,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+    desktopBrowserRelayInvocationFixture.payload.requestHash,
+    /host\.result arrived before host\.accepted/i,
+  );
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /before host\.accepted/i);
+});
+
+test("relay rejects a duplicate terminal result after resolving the correlated dispatch once", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  const accepted = acceptedMessageFor();
+  const completed = completedResultFor();
+  socket.message(JSON.stringify(accepted));
+  socket.message(JSON.stringify(completed));
+  assertCompletedResult(await result, accepted, completed);
+
+  socket.message(JSON.stringify(completed));
+  await flushMessages();
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /without an in-flight invocation/i);
+});
+
+test("relay ignores a delayed terminal from settled dispatch A on the current socket while accepted dispatch B for the same operation and request hash stays active", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  const first = dispatch(desktopBrowserRelayInvocationFixture);
+  await flushMessages();
+  const firstAccepted = acceptedMessageFor();
+  const firstCompleted = completedResultFor();
+  socket.message(JSON.stringify(firstAccepted));
+  socket.message(JSON.stringify(firstCompleted));
+  assertCompletedResult(await first, firstAccepted, firstCompleted);
+
+  const secondInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+    },
+  };
+  const second = dispatch(secondInvocation);
+  await flushMessages();
+  const secondAccepted = acceptedMessageFor(secondInvocation);
+  socket.message(JSON.stringify(secondAccepted));
+  await flushMessages();
+
+  socket.message(JSON.stringify(firstCompleted));
+  await flushMessages();
+  assert.equal(socket.closeCode, undefined);
+  assert.equal(socket.sent.length, 3);
+
+  const secondCompleted = completedResultFor(secondInvocation);
+  socket.message(JSON.stringify(secondCompleted));
+  assertCompletedResult(await second, secondAccepted, secondCompleted);
+  assert.equal(socket.closeCode, undefined);
+});
+
+test("relay allows sequential manual dispatch ids for the same operation and requestHash but rejects overlap, hash drift, and reused dispatch ids", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  const secondDispatchSameOperation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+    },
+  };
+
+  const first = dispatch(desktopBrowserRelayInvocationFixture);
+  await flushMessages();
+  await assert.rejects(() => dispatch(secondDispatchSameOperation), /already has an in-flight invocation/i);
+  socket.message(JSON.stringify(acceptedMessageFor()));
+  socket.message(JSON.stringify(completedResultFor()));
+  assertCompletedResult(await first, acceptedMessageFor(), completedResultFor());
+
+  const second = dispatch(secondDispatchSameOperation);
+  await flushMessages();
+  socket.message(JSON.stringify(acceptedMessageFor(secondDispatchSameOperation)));
+  socket.message(JSON.stringify(completedResultFor(secondDispatchSameOperation)));
+  assertCompletedResult(
+    await second,
+    acceptedMessageFor(secondDispatchSameOperation),
+    completedResultFor(secondDispatchSameOperation),
+  );
+
+  const conflictingAuthority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    taskId: "task-conflict",
+  };
+  const conflictingDispatch: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+      authority: conflictingAuthority,
+      requestHash: computeDesktopBrowserRequestHash(conflictingAuthority),
+    },
+  };
+  await assert.rejects(() => dispatch(conflictingDispatch), /operationId .* different requestHash/i);
+  const newOperationAuthority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    operationId: "0198f3d2-1950-7000-8000-000000000004",
+    operationSequence: 2,
+  };
+  const reusedDispatchId: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      dispatchId: desktopBrowserRelayInvocationFixture.payload.dispatchId,
+      authority: newOperationAuthority,
+      requestHash: computeDesktopBrowserRequestHash(newOperationAuthority),
+    },
+  };
+  await assert.rejects(() => dispatch(reusedDispatchId), /dispatchId .* already used/i);
+  assert.equal(socket.sent.length, 3);
+});
+
+test("relay returns not_accepted_or_unknown for a stale dispatch when a newer connection epoch supersedes its socket and fences stale results", async () => {
+  const { adapter, identity, service, socket: staleSocket } = await createRegisteredTicket05Relay();
+  const staleResult = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 8,
+  });
+  const currentSocket = new FakeSocket();
+  service.acceptSocket(currentSocket);
+  currentSocket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.2"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
+  await flushMessages();
+  currentSocket.message(
+    hostChallengeResponse(challengeAt(currentSocket), {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+
+  const unknown = await staleResult;
+  assertUnknownResult(
+    unknown,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+    desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+    desktopBrowserRelayInvocationFixture.payload.requestHash,
+    /replaced by a newer relay registration/i,
+  );
+  assert.equal(staleSocket.closeCode, 1008);
+  assert.match(staleSocket.closeReason ?? "", /replaced by a newer relay registration/i);
+
+  staleSocket.message(JSON.stringify(completedResultFor()));
+  await flushMessages();
+  assert.equal(currentSocket.closeCode, undefined);
+});
+
+test("relay ignores a delayed terminal from settled dispatch A and still resolves accepted dispatch B for the same operation and request hash", async () => {
+  const { adapter, identity, service, socket: staleSocket } = await createRegisteredTicket05Relay();
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+  const first = dispatch(desktopBrowserRelayInvocationFixture);
+  await flushMessages();
+  const firstAccepted = acceptedMessageFor();
+  staleSocket.message(JSON.stringify(firstAccepted));
+  await flushMessages();
+
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 8,
+  });
+  const currentSocket = new FakeSocket();
+  service.acceptSocket(currentSocket);
+  currentSocket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.2"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
+  await flushMessages();
+  currentSocket.message(
+    hostChallengeResponse(challengeAt(currentSocket), {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+
+  assertAcceptedUnknown(await first, firstAccepted, /replaced by a newer relay registration/i);
+  assert.equal(staleSocket.closeCode, 1008);
+  assert.match(staleSocket.closeReason ?? "", /replaced by a newer relay registration/i);
+
+  const secondInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+    },
+  };
+  const second = dispatch(secondInvocation);
+  await flushMessages();
+  const secondAccepted = acceptedMessageFor(secondInvocation);
+  currentSocket.message(JSON.stringify(secondAccepted));
+  await flushMessages();
+
+  staleSocket.message(JSON.stringify(completedResultFor()));
+  await flushMessages();
+  assert.equal(currentSocket.closeCode, undefined);
+
+  const secondCompleted = completedResultFor(secondInvocation);
+  currentSocket.message(JSON.stringify(secondCompleted));
+  assertCompletedResult(await second, secondAccepted, secondCompleted);
+});
+
+test("relay keeps recent settled dispatch tombstones bounded and still ignores delayed stale terminals after thousands of completed dispatches", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({
+    maxSettledDispatchHistory: 8,
+    settledDispatchHistoryTtlMs: 60_000,
+  });
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  for (let current = 1; current <= 2_000; current += 1) {
+    const invocation = invocationWithDispatchId(`0198f3d2-1950-7000-8000-${String(current).padStart(12, "0")}`);
+    const result = dispatch(invocation);
+    await flushMessages();
+    socket.message(JSON.stringify(acceptedMessageFor(invocation)));
+    socket.message(JSON.stringify(completedResultFor(invocation)));
+    assertCompletedResult(await result, acceptedMessageFor(invocation), completedResultFor(invocation));
+  }
+
+  const activeInvocation = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000009999");
+  const activeResult = dispatch(activeInvocation);
+  await flushMessages();
+  const activeAccepted = acceptedMessageFor(activeInvocation);
+  socket.message(JSON.stringify(activeAccepted));
+  await flushMessages();
+
+  const delayedRecent = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000001992");
+  socket.message(JSON.stringify(completedResultFor(delayedRecent)));
+  await flushMessages();
+  assert.equal(socket.closeCode, undefined);
+
+  const activeCompleted = completedResultFor(activeInvocation);
+  socket.message(JSON.stringify(activeCompleted));
+  assertCompletedResult(await activeResult, activeAccepted, activeCompleted);
+  assert.equal(socket.closeCode, undefined);
+});
+
+test("relay fences an ancient evicted terminal instead of resolving the current accepted dispatch", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({
+    maxSettledDispatchHistory: 8,
+    settledDispatchHistoryTtlMs: 60_000,
+  });
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  for (let current = 1; current <= 2_000; current += 1) {
+    const invocation = invocationWithDispatchId(`0198f3d2-1950-7000-8000-${String(current).padStart(12, "0")}`);
+    const result = dispatch(invocation);
+    await flushMessages();
+    socket.message(JSON.stringify(acceptedMessageFor(invocation)));
+    socket.message(JSON.stringify(completedResultFor(invocation)));
+    assertCompletedResult(await result, acceptedMessageFor(invocation), completedResultFor(invocation));
+  }
+
+  const activeInvocation = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000009999");
+  const activeResult = dispatch(activeInvocation);
+  await flushMessages();
+  const activeAccepted = acceptedMessageFor(activeInvocation);
+  socket.message(JSON.stringify(activeAccepted));
+  await flushMessages();
+
+  const ancientDelayed = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000000001");
+  socket.message(JSON.stringify(completedResultFor(ancientDelayed)));
+  await flushMessages();
+
+  assertAcceptedUnknown(await activeResult, activeAccepted, /dispatch does not match the accepted invocation/i);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /dispatch does not match the accepted invocation/i);
 });
 
 test("relay negotiates the highest exact shared protocol version during hello", async () => {
@@ -623,40 +1441,22 @@ test("relay heartbeats a registered connection, refreshes lastSeenAt on pong, an
   assert.match(socket.closeReason ?? "", /heartbeat timed out/i);
 });
 
-test("relay drains active connections with 1012 and rejects new sockets while draining", async () => {
-  const clock = new ManualClock();
-  const adapter = new FakeRegistryAdapter();
-  const identity = createDeviceIdentity();
-  adapter.setBinding({
-    registrationState: "registered",
+test("relay drains active connections with 1012, surfaces unknown for delivered work, and rejects new sockets", async () => {
+  const { identity, service, socket: live } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
     devicePublicKey: identity.devicePublicKey,
     brokerInstanceId: "broker-a",
-    browserInstanceId: "browser-a",
-    connectionEpoch: 7,
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
   });
-  const service = new DesktopBrowserRelayService({
-    relayInstanceId: "relay-a",
-    deploymentCanonicalId: "qm://deployments/example",
-    supportedProtocolVersions: ["1.2"],
-    supportedPolicyGrammarVersions: ["1.1"],
-    registry: adapter,
-    clock,
-    createConnectionId: () => "connection-1",
-  });
-  const live = new FakeSocket();
-
-  service.acceptSocket(live);
-  live.message(hostHello(identity.devicePublicKey, "broker-a"));
   await flushMessages();
-  live.message(
-    hostChallengeResponse(challengeAt(live), {
-      devicePublicKey: identity.devicePublicKey,
-      signResponse: identity.signResponse,
-    }),
-  );
+  const accepted = acceptedMessageFor();
+  live.message(JSON.stringify(accepted));
   await flushMessages();
 
   await service.drain();
+  const unknown = await result;
+  assertAcceptedUnknown(unknown, accepted, /service restart/i);
   assert.equal(live.closeCode, 1012);
   assert.match(live.closeReason ?? "", /service restart/i);
 

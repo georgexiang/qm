@@ -1,13 +1,19 @@
 import { randomUUID } from "node:crypto";
 import {
+  DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  computeDesktopBrowserRequestHash,
   computeDesktopBrowserPublicDeviceFingerprint,
   decodeDesktopBrowserMessage,
   encodeDesktopBrowserMessage,
   projectDesktopBrowserPublicIdentity,
   verifyHostChallengeResponseMessage,
+  type DesktopBrowserHostFailure,
   type DesktopBrowserRelayConnectionProjection,
   type DesktopBrowserRelayRegistryBinding,
+  type HostAcceptedMessage,
+  type HostResultMessage,
   type HostHelloMessage,
+  type RelayInvocationMessage,
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 import type { WebSocket, WebSocketServer } from "ws";
@@ -51,6 +57,25 @@ export interface DesktopBrowserRelayClock {
   clearInterval(handle: RelayTimerHandle): void;
 }
 
+export type RelayDispatchResult =
+  | {
+      kind: "host.result";
+      accepted: HostAcceptedMessage;
+      result: HostResultMessage;
+    }
+  | {
+      kind: "not_accepted_or_unknown";
+      dispatchId: string;
+      operationId: string;
+      requestHash: string;
+      error: DesktopBrowserHostFailure;
+    }
+  | {
+      kind: "accepted_unknown";
+      accepted: HostAcceptedMessage;
+      error: DesktopBrowserHostFailure;
+    };
+
 export interface DesktopBrowserRelayServiceOptions {
   relayInstanceId: string;
   deploymentCanonicalId: string;
@@ -63,6 +88,9 @@ export interface DesktopBrowserRelayServiceOptions {
   challengeTimeoutMs?: number;
   heartbeatIntervalMs?: number;
   heartbeatGraceMs?: number;
+  invocationTimeoutMs?: number;
+  maxSettledDispatchHistory?: number;
+  settledDispatchHistoryTtlMs?: number;
   createNonce?: () => string;
   createConnectionId?: () => string;
 }
@@ -81,8 +109,35 @@ interface RelayConnectionState {
   negotiatedProtocolVersion: `${number}.${number}` | null;
   negotiatedPolicyGrammarVersion: string | null;
   projectionPublished: boolean;
+  pendingDispatch: {
+    dispatchId: string;
+    operationId: string;
+    requestHash: string;
+    timeout: RelayTimerHandle;
+    accepted: HostAcceptedMessage | null;
+    resolve: (result: RelayDispatchResult) => void;
+  } | null;
   lastSeenAt: number;
   closeReason: string | null;
+}
+
+interface RelayDispatchHistoryEntry {
+  operationId: string;
+  requestHash: string;
+  state: "in_flight" | "accepted" | "terminal" | "unknown";
+  settledAt: number | null;
+}
+
+interface RelayDispatchTombstone {
+  operationId: string;
+  requestHash: string;
+  state: "accepted" | "terminal" | "unknown";
+  expiresAt: number;
+}
+
+interface RelayOperationRequestHashEntry {
+  requestHash: string;
+  refCount: number;
 }
 
 const DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024;
@@ -90,6 +145,9 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const DEFAULT_CHALLENGE_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 const DEFAULT_HEARTBEAT_GRACE_MS = 5_000;
+const DEFAULT_INVOCATION_TIMEOUT_MS = 20_000;
+const DEFAULT_MAX_SETTLED_DISPATCH_HISTORY = 1_024;
+const DEFAULT_SETTLED_DISPATCH_HISTORY_TTL_MS = 300_000;
 
 const systemClock: DesktopBrowserRelayClock = {
   now: () => Date.now(),
@@ -174,6 +232,9 @@ export class DesktopBrowserRelayService {
       | "challengeTimeoutMs"
       | "heartbeatIntervalMs"
       | "heartbeatGraceMs"
+      | "invocationTimeoutMs"
+      | "maxSettledDispatchHistory"
+      | "settledDispatchHistoryTtlMs"
     >
   > & {
     clock: DesktopBrowserRelayClock;
@@ -182,6 +243,11 @@ export class DesktopBrowserRelayService {
   };
   private readonly connections = new Map<string, RelayConnectionState>();
   private readonly currentByIdentity = new Map<string, string>();
+  private readonly operationRequestHashById = new Map<string, RelayOperationRequestHashEntry>();
+  private readonly dispatchHistoryById = new Map<string, RelayDispatchHistoryEntry>();
+  private readonly settledDispatchOrder: string[] = [];
+  private readonly dispatchTombstonesById = new Map<string, RelayDispatchTombstone>();
+  private readonly dispatchTombstoneOrder: string[] = [];
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -196,6 +262,9 @@ export class DesktopBrowserRelayService {
       challengeTimeoutMs: options.challengeTimeoutMs ?? DEFAULT_CHALLENGE_TIMEOUT_MS,
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       heartbeatGraceMs: options.heartbeatGraceMs ?? DEFAULT_HEARTBEAT_GRACE_MS,
+      invocationTimeoutMs: options.invocationTimeoutMs ?? DEFAULT_INVOCATION_TIMEOUT_MS,
+      maxSettledDispatchHistory: options.maxSettledDispatchHistory ?? DEFAULT_MAX_SETTLED_DISPATCH_HISTORY,
+      settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs ?? DEFAULT_SETTLED_DISPATCH_HISTORY_TTL_MS,
       clock: options.clock ?? systemClock,
       createNonce: options.createNonce ?? (() => randomUUID()),
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
@@ -205,6 +274,15 @@ export class DesktopBrowserRelayService {
     }
     if (this.options.supportedPolicyGrammarVersions.length === 0) {
       throw new Error("at least one supported policy grammar version is required");
+    }
+    if (!Number.isSafeInteger(this.options.maxSettledDispatchHistory) || this.options.maxSettledDispatchHistory < 1) {
+      throw new Error("maxSettledDispatchHistory must be a positive safe integer");
+    }
+    if (
+      !Number.isSafeInteger(this.options.settledDispatchHistoryTtlMs) ||
+      this.options.settledDispatchHistoryTtlMs < 1
+    ) {
+      throw new Error("settledDispatchHistoryTtlMs must be a positive safe integer");
     }
   }
 
@@ -228,6 +306,7 @@ export class DesktopBrowserRelayService {
       negotiatedProtocolVersion: null,
       negotiatedPolicyGrammarVersion: null,
       projectionPublished: false,
+      pendingDispatch: null,
       lastSeenAt: this.options.clock.now(),
       closeReason: null,
     };
@@ -303,19 +382,102 @@ export class DesktopBrowserRelayService {
     devicePublicKey: string;
     brokerInstanceId: string;
     browserInstanceId: string;
-  }): Promise<never> {
-    const key = identityKey(input);
-    const current = this.currentByIdentity.get(key);
-    if (!current) throw new Error("desktop browser host is not connected");
-    const connection = this.connections.get(current);
-    if (!connection || !connection.binding) throw new Error("desktop browser host is not connected");
-    if (connection.binding.browserInstanceId !== input.browserInstanceId) {
-      throw new Error("desktop browser host is not connected");
+    invocation: RelayInvocationMessage;
+  }): Promise<RelayDispatchResult> {
+    const connection = await this.resolveCurrentRegisteredConnection(input);
+    const binding = connection.binding;
+    if (!binding) throw new Error("desktop browser host is not connected");
+    if (connection.negotiatedProtocolVersion !== DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) {
+      throw new Error(
+        `desktop browser session-start requires negotiated protocol version ${DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION}`,
+      );
     }
-    if (connection.stage === "pending") {
-      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    if (!connection.hello || !connection.negotiatedPolicyGrammarVersion) {
+      throw new Error("desktop browser host capability identity is unavailable");
     }
-    throw new Error("relay invocation delivery is not implemented in Ticket04");
+    const decoded = decodeDesktopBrowserMessage(
+      encodeDesktopBrowserMessage(input.invocation),
+      connection.negotiatedProtocolVersion,
+      connection.negotiatedPolicyGrammarVersion,
+    );
+    if (decoded.kind !== "relay.invoke") {
+      throw new Error("desktop browser relay dispatch requires a relay.invoke message");
+    }
+    const canonicalRequestHash = computeDesktopBrowserRequestHash(
+      decoded.payload.authority,
+      connection.negotiatedProtocolVersion,
+      connection.negotiatedPolicyGrammarVersion,
+    );
+    if (decoded.payload.requestHash !== canonicalRequestHash) {
+      throw new Error(
+        `relay.invoke requestHash ${JSON.stringify(decoded.payload.requestHash)} does not match canonical request hash ${JSON.stringify(canonicalRequestHash)}`,
+      );
+    }
+    const authority = decoded.payload.authority;
+    if (authority.deploymentCanonicalId !== this.options.deploymentCanonicalId) {
+      throw new Error("desktop browser invocation deployment does not match this relay");
+    }
+    if (authority.deviceId.length === 0) {
+      throw new Error("desktop browser invocation device identity is unavailable");
+    }
+    if (authority.browserInstanceId !== input.browserInstanceId) {
+      throw new Error("desktop browser invocation browser does not match the requested host");
+    }
+    if (authority.browserInstanceId !== binding.browserInstanceId) {
+      throw new Error("desktop browser invocation browser does not match the registered host");
+    }
+    if (binding.devicePublicKey !== input.devicePublicKey) {
+      throw new Error("desktop browser invocation device key does not match the registered host");
+    }
+    if (binding.brokerInstanceId !== input.brokerInstanceId) {
+      throw new Error("desktop browser invocation broker does not match the registered host");
+    }
+    const advertised = connection.hello.payload;
+    const capability = authority.capabilitySet;
+    if (
+      capability.protocolVersion !== connection.negotiatedProtocolVersion ||
+      capability.policyGrammarVersion !== connection.negotiatedPolicyGrammarVersion ||
+      capability.bskVersion !== advertised.bskVersion ||
+      capability.extensionVersion !== advertised.extensionVersion ||
+      capability.cliShapeHash !== advertised.cliShapeHash
+    ) {
+      throw new Error("desktop browser invocation capability set does not match the registered host");
+    }
+    this.pruneDispatchTracking(this.options.clock.now());
+    this.assertOperationRequestHash(authority.operationId, canonicalRequestHash);
+    this.assertDispatchIdAvailable(decoded.payload.dispatchId);
+    if (connection.pendingDispatch) {
+      throw new Error("desktop browser host already has an in-flight invocation");
+    }
+    return new Promise<RelayDispatchResult>((resolve, reject) => {
+      this.startDispatchTracking(decoded.payload.dispatchId, authority.operationId, canonicalRequestHash);
+      const timeout = this.options.clock.setTimeout(() => {
+        if (connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId) return;
+        void this.closeConnection(
+          connection,
+          1008,
+          connection.pendingDispatch.accepted
+            ? "desktop browser invocation timed out waiting for host.result after host.accepted"
+            : "desktop browser invocation timed out waiting for host.accepted",
+        );
+      }, this.options.invocationTimeoutMs);
+      connection.pendingDispatch = {
+        dispatchId: decoded.payload.dispatchId,
+        operationId: authority.operationId,
+        requestHash: canonicalRequestHash,
+        timeout,
+        accepted: null,
+        resolve,
+      };
+      try {
+        connection.socket.send(encodeDesktopBrowserMessage(decoded));
+      } catch (error) {
+        this.options.clock.clearTimeout(timeout);
+        connection.pendingDispatch = null;
+        this.dropDispatchTracking(decoded.payload.dispatchId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   async drain(): Promise<void> {
@@ -365,11 +527,191 @@ export class DesktopBrowserRelayService {
     };
   }
 
+  private async resolveCurrentRegisteredConnection(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+    browserInstanceId: string;
+  }): Promise<RelayConnectionState> {
+    const key = identityKey(input);
+    const current = this.currentByIdentity.get(key);
+    if (!current) throw new Error("desktop browser host is not connected");
+    const connection = this.connections.get(current);
+    if (!connection || !connection.binding) throw new Error("desktop browser host is not connected");
+    if (connection.binding.browserInstanceId !== input.browserInstanceId) {
+      throw new Error("desktop browser host is not connected");
+    }
+    if (connection.stage === "pending") {
+      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    }
+    if (connection.stage !== "registered") {
+      throw new Error("desktop browser host is not connected");
+    }
+    const latest = await this.options.registry.resolveBinding({
+      devicePublicKey: input.devicePublicKey,
+      brokerInstanceId: input.brokerInstanceId,
+    });
+    if (!latest) {
+      await this.closeConnection(connection, 1008, "desktop browser binding expired before relay delivery");
+      throw new Error("desktop browser host is not connected");
+    }
+    if (latest.registrationState !== "registered") {
+      connection.binding = latest;
+      connection.stage = latest.registrationState;
+      await this.publishProjection(connection);
+      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    }
+    const bindingChanged =
+      latest.devicePublicKey !== connection.binding.devicePublicKey ||
+      latest.brokerInstanceId !== connection.binding.brokerInstanceId ||
+      latest.browserInstanceId !== connection.binding.browserInstanceId ||
+      latest.connectionEpoch !== connection.binding.connectionEpoch;
+    if (bindingChanged) {
+      await this.closeConnection(connection, 1008, "connection replaced by a newer relay registration");
+      throw new Error("desktop browser host is not connected");
+    }
+    connection.binding = latest;
+    return connection;
+  }
+
+  private relayDeliveryUnknown(detail: string): DesktopBrowserHostFailure {
+    return {
+      code: "relay_delivery_unknown",
+      message: detail,
+    };
+  }
+
+  private assertOperationRequestHash(operationId: string, requestHash: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (!existing) return;
+    if (existing.requestHash !== requestHash) {
+      throw new Error(
+        `operationId ${JSON.stringify(operationId)} already dispatched with different requestHash ${JSON.stringify(requestHash)}`,
+      );
+    }
+  }
+
+  private assertDispatchIdAvailable(dispatchId: string): void {
+    const current = this.dispatchHistoryById.get(dispatchId) ?? this.dispatchTombstonesById.get(dispatchId);
+    if (!current) return;
+    throw new Error(
+      `dispatchId ${JSON.stringify(dispatchId)} already used for operationId ${JSON.stringify(current.operationId)}`,
+    );
+  }
+
+  private startDispatchTracking(dispatchId: string, operationId: string, requestHash: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (existing) {
+      existing.refCount += 1;
+    } else {
+      this.operationRequestHashById.set(operationId, { requestHash, refCount: 1 });
+    }
+    this.dispatchHistoryById.set(dispatchId, {
+      operationId,
+      requestHash,
+      state: "in_flight",
+      settledAt: null,
+    });
+  }
+
+  private settleDispatch(dispatchId: string, state: "accepted" | "terminal" | "unknown"): void {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (!history) return;
+    history.state = state;
+    if (history.settledAt !== null) return;
+    history.settledAt = this.options.clock.now();
+    this.settledDispatchOrder.push(dispatchId);
+    this.pruneDispatchTracking(history.settledAt);
+  }
+
+  private dropDispatchTracking(dispatchId: string): void {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (!history) return;
+    this.dispatchHistoryById.delete(dispatchId);
+    this.releaseOperationRequestHash(history.operationId);
+  }
+
+  private releaseOperationRequestHash(operationId: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (!existing) return;
+    if (existing.refCount <= 1) {
+      this.operationRequestHashById.delete(operationId);
+      return;
+    }
+    existing.refCount -= 1;
+  }
+
+  private settledDispatch(dispatchId: string): RelayDispatchHistoryEntry | RelayDispatchTombstone | null {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (history && history.settledAt !== null) return history;
+    return this.dispatchTombstonesById.get(dispatchId) ?? null;
+  }
+
+  private pruneDispatchTracking(now: number): void {
+    this.pruneSettledDispatchHistory(now);
+    this.pruneDispatchTombstones(now);
+  }
+
+  private pruneSettledDispatchHistory(now: number): void {
+    while (this.settledDispatchOrder.length > 0) {
+      const dispatchId = this.settledDispatchOrder[0]!;
+      const history = this.dispatchHistoryById.get(dispatchId);
+      if (!history || history.settledAt === null) {
+        this.settledDispatchOrder.shift();
+        continue;
+      }
+      const expired = history.settledAt + this.options.settledDispatchHistoryTtlMs <= now;
+      const overLimit = this.settledDispatchOrder.length > this.options.maxSettledDispatchHistory;
+      if (!expired && !overLimit) return;
+      this.settledDispatchOrder.shift();
+      this.dispatchHistoryById.delete(dispatchId);
+      this.dispatchTombstonesById.set(dispatchId, {
+        operationId: history.operationId,
+        requestHash: history.requestHash,
+        state: history.state === "terminal" || history.state === "accepted" ? history.state : "unknown",
+        expiresAt: now + this.options.settledDispatchHistoryTtlMs,
+      });
+      this.dispatchTombstoneOrder.push(dispatchId);
+    }
+  }
+
+  private pruneDispatchTombstones(now: number): void {
+    while (this.dispatchTombstoneOrder.length > 0) {
+      const dispatchId = this.dispatchTombstoneOrder[0]!;
+      const tombstone = this.dispatchTombstonesById.get(dispatchId);
+      if (!tombstone) {
+        this.dispatchTombstoneOrder.shift();
+        continue;
+      }
+      const expired = tombstone.expiresAt <= now;
+      const overLimit = this.dispatchTombstonesById.size > this.options.maxSettledDispatchHistory;
+      if (!expired && !overLimit) return;
+      this.dispatchTombstoneOrder.shift();
+      this.dispatchTombstonesById.delete(dispatchId);
+      this.releaseOperationRequestHash(tombstone.operationId);
+    }
+  }
+
+  private isKnownStaleSequentialResult(
+    pending: NonNullable<RelayConnectionState["pendingDispatch"]>,
+    message: HostResultMessage,
+  ): boolean {
+    const history = this.settledDispatch(message.payload.dispatchId);
+    if (!history) return false;
+    if (history.state !== "accepted" && history.state !== "terminal") return false;
+    return (
+      history.operationId === message.payload.operationId &&
+      history.operationId === pending.operationId &&
+      history.requestHash === pending.requestHash
+    );
+  }
+
   private async handleMessage(connection: RelayConnectionState, raw: string): Promise<void> {
+    if (!this.connections.has(connection.connectionId) || connection.stage === "closing") return;
     if (byteLength(raw) > this.options.maxMessageBytes) {
       throw new Error("desktop browser relay message exceeded the maximum allowed size");
     }
     connection.lastSeenAt = this.options.clock.now();
+    this.pruneDispatchTracking(connection.lastSeenAt);
     if (connection.stage === "awaiting_hello") {
       const message = decodeDesktopBrowserMessage(raw, this.options.supportedProtocolVersions[0]);
       if (message.kind !== "host.hello")
@@ -396,6 +738,50 @@ export class DesktopBrowserRelayService {
       connection.negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
     );
     if (message.kind === "relay.invoke") throw new Error("unexpected relay.invoke frame from host");
+    if (message.kind === "host.accepted") {
+      const pending = connection.pendingDispatch;
+      if (!pending) throw new Error("unexpected host.accepted without an in-flight invocation");
+      if (pending.accepted) throw new Error("duplicate host.accepted for the in-flight invocation");
+      if (message.payload.dispatchId !== pending.dispatchId) {
+        throw new Error("host.accepted dispatch does not match the in-flight invocation");
+      }
+      if (message.payload.operationId !== pending.operationId) {
+        throw new Error("host.accepted operation does not match the in-flight invocation");
+      }
+      if (message.payload.requestHash !== pending.requestHash) {
+        throw new Error("host.accepted requestHash does not match the in-flight invocation");
+      }
+      const history = this.dispatchHistoryById.get(pending.dispatchId);
+      if (history) history.state = "accepted";
+      pending.accepted = message;
+      return;
+    }
+    if (message.kind === "host.result") {
+      const pending = connection.pendingDispatch;
+      if (!pending) throw new Error("unexpected host.result without an in-flight invocation");
+      if (message.payload.dispatchId !== pending.dispatchId) {
+        if (this.isKnownStaleSequentialResult(pending, message)) return;
+        if (!pending.accepted) {
+          throw new Error("host.result arrived before host.accepted");
+        }
+        throw new Error("host.result dispatch does not match the accepted invocation");
+      }
+      if (!pending.accepted) {
+        throw new Error("host.result arrived before host.accepted");
+      }
+      if (message.payload.operationId !== pending.accepted.payload.operationId) {
+        throw new Error("host.result operation does not match the accepted invocation");
+      }
+      connection.pendingDispatch = null;
+      this.options.clock.clearTimeout(pending.timeout);
+      this.settleDispatch(pending.dispatchId, "terminal");
+      pending.resolve({
+        kind: "host.result",
+        accepted: pending.accepted,
+        result: message,
+      });
+      return;
+    }
     throw new Error(
       `desktop browser relay operations are not implemented in Ticket04: ${JSON.stringify(message.kind)}`,
     );
@@ -584,6 +970,33 @@ export class DesktopBrowserRelayService {
     this.connections.delete(connection.connectionId);
     this.clearStageTimer(connection);
     this.clearHeartbeat(connection);
+    if (connection.pendingDispatch) {
+      const pending = connection.pendingDispatch;
+      connection.pendingDispatch = null;
+      this.options.clock.clearTimeout(pending.timeout);
+      this.settleDispatch(pending.dispatchId, pending.accepted ? "accepted" : "unknown");
+      const error = this.relayDeliveryUnknown(
+        connection.closeReason ??
+          (pending.accepted
+            ? "desktop browser host connection closed after host.accepted before host.result"
+            : "desktop browser host connection closed before host.accepted"),
+      );
+      pending.resolve(
+        pending.accepted
+          ? {
+              kind: "accepted_unknown",
+              accepted: pending.accepted,
+              error,
+            }
+          : {
+              kind: "not_accepted_or_unknown",
+              dispatchId: pending.dispatchId,
+              operationId: pending.operationId,
+              requestHash: pending.requestHash,
+              error,
+            },
+      );
+    }
     if (connection.binding) {
       const key = identityKey(connection.binding);
       if (this.currentByIdentity.get(key) === connection.connectionId) {
