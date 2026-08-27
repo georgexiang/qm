@@ -12,15 +12,18 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { isIP } from "node:net";
 import { dirname, join } from "node:path";
 import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_RELAY_AUDIENCE,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
   computeDesktopBrowserPublicDeviceFingerprint,
+  computeDesktopBrowserRequestHash,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   decodeDesktopBrowserMessage,
   encodeDesktopBrowserMessage,
@@ -30,13 +33,18 @@ import {
   parseDesktopBrowserRegistrationConfirmationEnvelope,
   parseDesktopBrowserRegistrationReservationTuple,
   projectDesktopBrowserPublicIdentity,
+  type DesktopBrowserSessionStartAuthorityEnvelope,
+  type DesktopBrowserSessionStartResult,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRegistrationReservationTuple,
+  type HostResultMessage,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 
 const MAX_RELAY_MESSAGE_BYTES = 64 * 1024;
+const MAX_BROWSER_SKILL_OUTPUT_BYTES = 64 * 1024;
+const MAX_BROWSER_SKILL_RUN_MS = 15_000;
 const RELAY_HANDSHAKE_TIMEOUT_MS = 10_000;
 const RECONNECT_BACKOFF_BASE_MS = 250;
 const RECONNECT_BACKOFF_MAX_MS = 5_000;
@@ -66,6 +74,8 @@ export interface HostBrokerStateSnapshot {
   qmUrl: string | null;
   relayUrl: string | null;
   deploymentCanonicalId: string | null;
+  negotiatedProtocolVersion: string | null;
+  negotiatedPolicyGrammarVersion: string | null;
   brokerStatus: "ready" | "paused" | "disconnected";
   browserSkillStatus: "ready" | "offline";
   currentTaskPresent: boolean;
@@ -112,6 +122,12 @@ export interface HostBrokerConnectionOptions {
   supportedPolicyGrammarVersions: string[];
   identity: DeviceIdentity;
   runtime: BrowserRuntimeMetadata;
+  dataDir?: string;
+  deviceId?: string;
+  browserSkillExecutable?: string;
+  sessionRunner?: HostBrokerSessionRunner;
+  maxBrowserSkillOutputBytes?: number;
+  browserSkillTimeoutMs?: number;
   connectionEpoch?: number | null;
   publicDeviceFingerprint?: string | null;
   confirmationFingerprint?: string | null;
@@ -133,6 +149,9 @@ export interface HostBrokerCliDeps {
   brokerVersion?: string;
   resolveRelayUrl?: (qmUrl: string) => string;
   runtime?: BrowserRuntimeMetadata;
+  deviceId?: string;
+  browserSkillExecutable?: string;
+  sessionRunner?: HostBrokerSessionRunner;
   signal?: AbortSignal;
   scheduler?: HostBrokerScheduler;
   reconnectBaseMs?: number;
@@ -144,6 +163,25 @@ export interface HostBrokerScheduler {
   random(): number;
   setTimeout(callback: () => void, ms: number): HostBrokerTimer;
   clearTimeout(timer: HostBrokerTimer): void;
+}
+
+export interface HostBrokerSessionRunOptions {
+  shell: false;
+  stdio: ["ignore", "pipe", "pipe"];
+}
+
+export interface HostBrokerSessionRunResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+export interface HostBrokerSessionRunner {
+  run(
+    executable: string,
+    argv: readonly string[],
+    options: HostBrokerSessionRunOptions,
+  ): Promise<HostBrokerSessionRunResult>;
 }
 
 type HostBrokerTimer = ReturnType<typeof setTimeout>;
@@ -168,8 +206,19 @@ interface RegistrationTupleBinding {
   now?: number;
 }
 
+interface HostOperationFence {
+  operationId: string;
+  requestHash: string;
+  taskId: string;
+  attemptId: string;
+  state: "accepted" | "completed" | "failed" | "unknown";
+  terminalPayload?: HostResultMessage["payload"];
+}
+
 const DEVICE_KEY_FILE = "device-key.json";
 const STATE_FILE = "state.json";
+const OPERATIONS_DIR = "operations";
+const SESSIONS_DIR = "sessions";
 const DEFAULT_RUNTIME: BrowserRuntimeMetadata = {
   browserInstanceId: "unbound",
   browserSkillStatus: "offline",
@@ -276,6 +325,164 @@ function stateFilePath(dataDir: string): string {
   return join(dataDir, STATE_FILE);
 }
 
+function localRecordPath(dataDir: string, directory: string, identity: string): string {
+  const digest = createHash("sha256").update(identity).digest("hex");
+  return join(dataDir, directory, `${digest}.json`);
+}
+
+function operationFencePath(dataDir: string, operationId: string): string {
+  return localRecordPath(dataDir, OPERATIONS_DIR, operationId);
+}
+
+function sessionOwnershipPath(dataDir: string, taskId: string): string {
+  return localRecordPath(dataDir, SESSIONS_DIR, taskId);
+}
+
+function loadOperationFence(dataDir: string, operationId: string): HostOperationFence | null {
+  return readJsonFile<HostOperationFence>(operationFencePath(dataDir, operationId));
+}
+
+function saveOperationFence(dataDir: string, fence: HostOperationFence): void {
+  atomicWriteText(operationFencePath(dataDir, fence.operationId), `${JSON.stringify(fence)}\n`, SAFE_FILE_MODE);
+}
+
+function createOperationFence(dataDir: string, fence: HostOperationFence): boolean {
+  const filePath = operationFencePath(dataDir, fence.operationId);
+  assertSafeDirectory(dirname(filePath));
+  let fd: number;
+  try {
+    fd = openSync(
+      filePath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      SAFE_FILE_MODE,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, `${JSON.stringify(fence)}\n`, "utf8");
+    fsyncSync(fd);
+    chmodSync(filePath, SAFE_FILE_MODE);
+  } finally {
+    closeSync(fd);
+  }
+  const dirFd = openSync(dirname(filePath), "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+  assertSafeFile(filePath, SAFE_FILE_MODE);
+  return true;
+}
+
+function waitForExitWithTimeout(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        return;
+      }
+    }, timeoutMs);
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("close", (exitCode) => finish(() => resolve(exitCode)));
+  });
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("host result contains a non-JSON value");
+}
+
+function computeHostResultHash(value: unknown): string {
+  return `sha256:${createHash("sha256").update(stableJson(value)).digest("hex")}`;
+}
+
+function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): DesktopBrowserSessionStartResult {
+  if (Buffer.byteLength(stdout, "utf8") > maxBytes) throw new Error("BrowserSkill output exceeded the maximum size");
+  const raw: unknown = JSON.parse(stdout);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("BrowserSkill session start output must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.session_id !== "string" || record.session_id.length === 0 || /\s/.test(record.session_id)) {
+    throw new Error("BrowserSkill session start output has an invalid session_id");
+  }
+  if (
+    typeof record.browser_instance_id !== "string" ||
+    record.browser_instance_id.length === 0 ||
+    /\s/.test(record.browser_instance_id)
+  ) {
+    throw new Error("BrowserSkill session start output has an invalid browser_instance_id");
+  }
+  if (!Number.isSafeInteger(record.agent_window_id) || (record.agent_window_id as number) < 0) {
+    throw new Error("BrowserSkill session start output has an invalid agent_window_id");
+  }
+  return Object.freeze({
+    session_id: record.session_id,
+    browser_instance_id: record.browser_instance_id,
+    agent_window_id: record.agent_window_id as number,
+  });
+}
+
+const DEFAULT_SESSION_RUNNER: HostBrokerSessionRunner = {
+  run(executable, argv, options) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(executable, [...argv], options);
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let outputBytes = 0;
+      let outputExceeded = false;
+      const collect = (chunks: Buffer[], chunk: Buffer): void => {
+        outputBytes += chunk.length;
+        if (outputBytes > MAX_BROWSER_SKILL_OUTPUT_BYTES) {
+          outputExceeded = true;
+          child.kill("SIGKILL");
+          return;
+        }
+        chunks.push(chunk);
+      };
+      child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+      child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+      waitForExitWithTimeout(child, MAX_BROWSER_SKILL_RUN_MS)
+        .then((exitCode) => {
+          if (outputExceeded) {
+            reject(new Error("BrowserSkill output exceeded the maximum size"));
+            return;
+          }
+          if (exitCode === null) {
+            reject(new Error("BrowserSkill session start timed out"));
+            return;
+          }
+          resolve({
+            exitCode,
+            stdout: Buffer.concat(stdout).toString("utf8"),
+            stderr: Buffer.concat(stderr).toString("utf8"),
+          });
+        })
+        .catch(reject);
+    });
+  },
+};
+
 function identityFromPrivateKeyPem(privateKeyPem: string): DeviceIdentity {
   const privateKey = createPrivateKey(privateKeyPem);
   const publicKey = createPublicKey(privateKey);
@@ -317,6 +524,8 @@ function createInitialState(input: {
   qmUrl: string | null;
   relayUrl: string | null;
   deploymentCanonicalId: string | null;
+  negotiatedProtocolVersion?: string | null;
+  negotiatedPolicyGrammarVersion?: string | null;
   brokerInstanceId: string;
   browserInstanceId: string | null;
   browserSkillStatus: "ready" | "offline";
@@ -330,6 +539,8 @@ function createInitialState(input: {
     qmUrl: input.qmUrl,
     relayUrl: input.relayUrl,
     deploymentCanonicalId: input.deploymentCanonicalId,
+    negotiatedProtocolVersion: input.negotiatedProtocolVersion ?? null,
+    negotiatedPolicyGrammarVersion: input.negotiatedPolicyGrammarVersion ?? null,
     brokerStatus: "disconnected",
     browserSkillStatus: input.browserSkillStatus,
     currentTaskPresent: false,
@@ -398,6 +609,8 @@ function renderHumanState(state: HostBrokerStateSnapshot): string {
     `QM URL: ${state.qmUrl ?? "unconfigured"}`,
     `Relay URL: ${state.relayUrl ?? "unconfigured"}`,
     `Deployment: ${state.deploymentCanonicalId ?? "unbound"}`,
+    `Negotiated protocol: ${state.negotiatedProtocolVersion ?? "pending handshake"}`,
+    `Negotiated policy grammar: ${state.negotiatedPolicyGrammarVersion ?? "pending handshake"}`,
     `Broker status: ${state.brokerStatus}`,
     `BrowserSkill status: ${state.browserSkillStatus}`,
     `Broker instance: ${state.brokerInstanceId}`,
@@ -530,6 +743,113 @@ function applyAuthoritativeChallengeBinding(
   if (payload.brokerInstanceId) state.brokerInstanceId = payload.brokerInstanceId;
   if (payload.browserInstanceId) state.browserInstanceId = payload.browserInstanceId;
   if (payload.connectionEpoch) state.connectionEpoch = payload.connectionEpoch;
+}
+
+function currentCapabilitySet(
+  runtime: BrowserRuntimeMetadata,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+) {
+  return {
+    protocolVersion: negotiatedProtocolVersion,
+    policyGrammarVersion: negotiatedPolicyGrammarVersion,
+    bskVersion: runtime.bskVersion,
+    extensionVersion: runtime.extensionVersion,
+    cliShapeHash: runtime.cliShapeHash,
+  };
+}
+
+function assertSessionStartAuthorityBindings(
+  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+  deviceId: string | null,
+  runtime: BrowserRuntimeMetadata,
+  state: HostBrokerStateSnapshot,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+  now: number,
+): void {
+  if (authority.audience !== DESKTOP_BROWSER_RELAY_AUDIENCE) throw new Error("authority audience is not the relay");
+  if (!state.deploymentCanonicalId || authority.deploymentCanonicalId !== state.deploymentCanonicalId) {
+    throw new Error("authority deployment does not match the authoritative relay binding");
+  }
+  if (!deviceId || authority.deviceId !== deviceId) {
+    throw new Error("authority device does not match the local host binding");
+  }
+  if (
+    authority.browserInstanceId !== runtime.browserInstanceId ||
+    authority.browserInstanceId !== state.browserInstanceId
+  ) {
+    throw new Error("authority browser does not match the live host runtime");
+  }
+  const expectedCapabilitySet = currentCapabilitySet(
+    runtime,
+    negotiatedProtocolVersion,
+    negotiatedPolicyGrammarVersion,
+  );
+  if (stableJson(authority.capabilitySet) !== stableJson(expectedCapabilitySet)) {
+    throw new Error("authority capability set does not exactly match the live host runtime");
+  }
+  if (Date.parse(authority.issuedAt) > now) throw new Error("authority lease is not valid yet");
+  if (Date.parse(authority.leaseExpiresAt) <= now) throw new Error("authority lease expired before acceptance");
+}
+
+function assertSessionStartRequestHash(
+  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+  requestHash: string,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+): void {
+  const canonicalRequestHash = computeDesktopBrowserRequestHash(
+    authority,
+    negotiatedProtocolVersion,
+    negotiatedPolicyGrammarVersion,
+  );
+  if (canonicalRequestHash !== requestHash) {
+    throw new Error("relay.invoke request hash does not match the locally recomputed authority hash");
+  }
+}
+
+function readInvocationOperationId(raw: string): string | null {
+  try {
+    const message = JSON.parse(raw) as { payload?: { authority?: { operationId?: unknown } } };
+    const operationId = message.payload?.authority?.operationId;
+    return typeof operationId === "string" && operationId.length > 0 ? operationId : null;
+  } catch {
+    return null;
+  }
+}
+
+function preFenceFailure(protocolVersion: `${number}.${number}`, operationId: string, error: Error): HostResultMessage {
+  return {
+    protocolVersion,
+    kind: "host.result",
+    payload: {
+      operationId,
+      accepted: false,
+      outcome: "failed",
+      error: { code: "host_precondition_failed", message: error.message },
+    },
+  };
+}
+
+function acceptedUnknown(
+  protocolVersion: `${number}.${number}`,
+  operationId: string,
+  requestHash: string,
+  error?: Error,
+): HostResultMessage {
+  const errorPayload = error ? { code: "host_operation_unknown", message: error.message } : undefined;
+  return {
+    protocolVersion,
+    kind: "host.result",
+    payload: {
+      operationId,
+      accepted: true,
+      outcome: "unknown",
+      resultHash: computeHostResultHash({ operationId, requestHash, outcome: "unknown", error: errorPayload }),
+      ...(errorPayload ? { error: errorPayload } : {}),
+    },
+  };
 }
 
 function defaultTransport(): HostBrokerTransport {
@@ -724,9 +1044,21 @@ export function verifyHostChallengeResponseMessage(message: HostChallengeRespons
 export class HostBrokerConnection {
   private readonly options: HostBrokerConnectionOptions;
   private readonly snapshotState: HostBrokerStateSnapshot;
+  private readonly dataDir: string | null;
+  private readonly deviceId: string | null;
+  private readonly browserSkillExecutable: string;
+  private readonly sessionRunner: HostBrokerSessionRunner;
+  private readonly maxBrowserSkillOutputBytes: number;
+  private readonly browserSkillTimeoutMs: number;
 
   constructor(options: HostBrokerConnectionOptions) {
     this.options = options;
+    this.dataDir = options.dataDir ?? null;
+    this.deviceId = options.deviceId ?? null;
+    this.browserSkillExecutable = options.browserSkillExecutable ?? "bsk";
+    this.sessionRunner = options.sessionRunner ?? DEFAULT_SESSION_RUNNER;
+    this.maxBrowserSkillOutputBytes = options.maxBrowserSkillOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
+    this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
     this.snapshotState = createInitialState({
       qmUrl: options.qmUrl,
       relayUrl: options.relayUrl,
@@ -750,6 +1082,183 @@ export class HostBrokerConnection {
     this.options.onStateChange?.(this.snapshot());
   }
 
+  private async handleRelayInvocation(input: {
+    raw: string;
+    socket: HostBrokerSocket;
+    protocolVersion: `${number}.${number}`;
+    policyGrammarVersion: string;
+    now: () => number;
+    isActive: () => boolean;
+  }): Promise<void> {
+    const operationId = readInvocationOperationId(input.raw);
+    let message: Extract<ReturnType<typeof decodeDesktopBrowserMessage>, { kind: "relay.invoke" }>;
+    try {
+      const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
+      if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
+      if (!this.dataDir) throw new Error("host operation state directory is not configured");
+      assertSessionStartAuthorityBindings(
+        decoded.payload.authority,
+        this.deviceId,
+        this.options.runtime,
+        this.snapshotState,
+        input.protocolVersion,
+        input.policyGrammarVersion,
+        input.now(),
+      );
+      assertSessionStartRequestHash(
+        decoded.payload.authority,
+        decoded.payload.requestHash,
+        input.protocolVersion,
+        input.policyGrammarVersion,
+      );
+      message = decoded;
+    } catch (error) {
+      if (!operationId) throw error;
+      input.socket.send(
+        encodeDesktopBrowserMessage(
+          preFenceFailure(
+            input.protocolVersion,
+            operationId,
+            error instanceof Error ? error : new Error(String(error)),
+          ),
+        ),
+      );
+      return;
+    }
+
+    const dataDir = this.dataDir!;
+    const authority = message.payload.authority;
+    let existingFence = loadOperationFence(dataDir, authority.operationId);
+    if (existingFence) {
+      if (existingFence.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(
+          encodeDesktopBrowserMessage({
+            protocolVersion: input.protocolVersion,
+            kind: "host.result",
+            payload: existingFence.terminalPayload,
+          }),
+        );
+        return;
+      }
+      if (existingFence.requestHash !== message.payload.requestHash) {
+        input.socket.send(
+          encodeDesktopBrowserMessage(
+            preFenceFailure(
+              input.protocolVersion,
+              authority.operationId,
+              new Error("operationId is already bound to a different request hash"),
+            ),
+          ),
+        );
+        return;
+      }
+      const unknown = acceptedUnknown(input.protocolVersion, authority.operationId, existingFence.requestHash);
+      input.socket.send(encodeDesktopBrowserMessage(unknown));
+      return;
+    }
+
+    const fence: HostOperationFence = {
+      operationId: authority.operationId,
+      requestHash: message.payload.requestHash,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      state: "accepted",
+    };
+    if (!createOperationFence(dataDir, fence)) {
+      existingFence = loadOperationFence(dataDir, authority.operationId);
+      if (existingFence?.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(
+          encodeDesktopBrowserMessage({
+            protocolVersion: input.protocolVersion,
+            kind: "host.result",
+            payload: existingFence.terminalPayload,
+          }),
+        );
+        return;
+      }
+      if (existingFence && existingFence.requestHash !== message.payload.requestHash) {
+        input.socket.send(
+          encodeDesktopBrowserMessage(
+            preFenceFailure(
+              input.protocolVersion,
+              authority.operationId,
+              new Error("operationId is already bound to a different request hash"),
+            ),
+          ),
+        );
+        return;
+      }
+      input.socket.send(
+        encodeDesktopBrowserMessage(
+          acceptedUnknown(
+            input.protocolVersion,
+            authority.operationId,
+            existingFence?.requestHash ?? message.payload.requestHash,
+            new Error("operation was fenced concurrently and cannot be spawned again"),
+          ),
+        ),
+      );
+      return;
+    }
+    this.snapshotState.currentTaskPresent = true;
+    this.emitState();
+    try {
+      const runResult = await Promise.race([
+        this.sessionRunner.run(this.browserSkillExecutable, authority.argv, {
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+        new Promise<HostBrokerSessionRunResult>((_, reject) => {
+          setTimeout(() => reject(new Error("BrowserSkill session start timed out")), this.browserSkillTimeoutMs);
+        }),
+      ]);
+      if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
+      const result = parseBrowserSkillSessionStartResult(runResult.stdout, this.maxBrowserSkillOutputBytes);
+      if (result.browser_instance_id !== authority.browserInstanceId) {
+        throw new Error("BrowserSkill returned a browser outside the authority binding");
+      }
+      const completed: HostResultMessage = {
+        protocolVersion: input.protocolVersion,
+        kind: "host.result",
+        payload: {
+          operationId: authority.operationId,
+          accepted: true,
+          outcome: "completed",
+          resultHash: computeHostResultHash(result),
+          result,
+        },
+      };
+      atomicWriteText(
+        sessionOwnershipPath(dataDir, authority.taskId),
+        `${JSON.stringify({
+          taskId: authority.taskId,
+          attemptId: authority.attemptId,
+          operationId: authority.operationId,
+          requestHash: message.payload.requestHash,
+          sessionId: result.session_id,
+          browserInstanceId: result.browser_instance_id,
+          agentWindowId: result.agent_window_id,
+        })}\n`,
+        SAFE_FILE_MODE,
+      );
+      saveOperationFence(dataDir, { ...fence, state: "completed", terminalPayload: completed.payload });
+      if (!input.isActive()) throw new Error("relay disconnected after operation acceptance");
+      input.socket.send(encodeDesktopBrowserMessage(completed));
+    } catch (error) {
+      const unknown = acceptedUnknown(
+        input.protocolVersion,
+        authority.operationId,
+        message.payload.requestHash,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      saveOperationFence(dataDir, { ...fence, state: "unknown", terminalPayload: unknown.payload });
+      if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(unknown));
+    } finally {
+      this.snapshotState.currentTaskPresent = false;
+      this.emitState();
+    }
+  }
+
   start(): Promise<HostBrokerConnectionRunResult> {
     assertSecureRelayUrl(this.options.relayUrl);
     assertConnectableRuntime(this.options.runtime);
@@ -768,6 +1277,8 @@ export class HostBrokerConnection {
     return new Promise<HostBrokerConnectionRunResult>((resolve, reject) => {
       let settled = false;
       let challenged = false;
+      let negotiatedProtocolVersion: `${number}.${number}` | null = null;
+      let negotiatedPolicyGrammarVersion: string | null = null;
       let handshakeComplete = false;
       let active = true;
       let locallyRequestedStop = false;
@@ -804,15 +1315,75 @@ export class HostBrokerConnection {
           if (Buffer.byteLength(raw, "utf8") > (this.options.maxMessageBytes ?? MAX_RELAY_MESSAGE_BYTES)) {
             throw new Error("relay message exceeded the maximum allowed size");
           }
-          const message = decodeDesktopBrowserMessage(raw, this.options.supportedProtocolVersions[0]);
+          const rawEnvelope = JSON.parse(raw) as {
+            kind?: unknown;
+            payload?: { policyGrammarVersion?: unknown };
+          };
+          if (challenged) {
+            if (rawEnvelope.kind === "relay.invoke") {
+              if (!negotiatedProtocolVersion) {
+                throw new Error("relay invoke arrived without an exact negotiated protocol version");
+              }
+              if (!negotiatedPolicyGrammarVersion) {
+                const operationId = readInvocationOperationId(raw);
+                if (!operationId) throw new Error("relay invoke arrived without an exact negotiated policy grammar");
+                socket.send(
+                  encodeDesktopBrowserMessage(
+                    preFenceFailure(
+                      negotiatedProtocolVersion,
+                      operationId,
+                      new Error("relay connection does not identify one exact negotiated policy grammar"),
+                    ),
+                  ),
+                );
+                return;
+              }
+              void this.handleRelayInvocation({
+                raw,
+                socket,
+                protocolVersion: negotiatedProtocolVersion,
+                policyGrammarVersion: negotiatedPolicyGrammarVersion,
+                now: () => scheduler.now(),
+                isActive: () => active,
+              }).catch((error: unknown) => {
+                finish(undefined, error instanceof Error ? error : new Error(String(error)));
+              });
+              return;
+            }
+          }
+          const message = decodeDesktopBrowserMessage(
+            raw,
+            negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
+          );
           if (message.kind === "relay.challenge") {
             if (challenged) throw new Error("relay sent multiple challenge messages for one host registration");
+            if (!this.options.supportedProtocolVersions.includes(message.protocolVersion)) {
+              throw new Error("relay challenge protocol version was not advertised by this host");
+            }
             assertTrustedRelayChallenge(message.payload, this.snapshotState);
             const response = createHostChallengeResponse(this.options.identity, message);
             if (!verifyHostChallengeResponseMessage(response)) {
               throw new Error("host challenge response failed local signature verification");
             }
             applyAuthoritativeChallengeBinding(this.snapshotState, message.payload);
+            negotiatedProtocolVersion = message.protocolVersion;
+            this.snapshotState.negotiatedProtocolVersion = message.protocolVersion;
+            const authoritativePolicyGrammarVersion = rawEnvelope.payload?.policyGrammarVersion;
+            if (authoritativePolicyGrammarVersion !== undefined) {
+              if (
+                typeof authoritativePolicyGrammarVersion !== "string" ||
+                !this.options.supportedPolicyGrammarVersions.includes(authoritativePolicyGrammarVersion)
+              ) {
+                throw new Error("relay challenge policy grammar version was not advertised by this host");
+              }
+              negotiatedPolicyGrammarVersion = authoritativePolicyGrammarVersion;
+            } else {
+              negotiatedPolicyGrammarVersion =
+                this.options.supportedPolicyGrammarVersions.length === 1
+                  ? this.options.supportedPolicyGrammarVersions[0]!
+                  : null;
+            }
+            this.snapshotState.negotiatedPolicyGrammarVersion = negotiatedPolicyGrammarVersion;
             socket.send(encodeDesktopBrowserMessage(response));
             challenged = true;
             clearHandshakeTimeout();
@@ -820,10 +1391,8 @@ export class HostBrokerConnection {
             this.emitState();
             return;
           }
-          if (message.kind === "relay.invoke") {
-            if (!challenged) throw new Error("relay invoke arrived before the host challenge completed");
-            throw new Error("host broker operation handling is not implemented");
-          }
+          if (message.kind === "relay.invoke")
+            throw new Error("relay invoke arrived before the host challenge completed");
           throw new Error(`unsupported relay message kind ${JSON.stringify(message.kind)}`);
         } catch (error) {
           finish(undefined, error instanceof Error ? error : new Error(String(error)));
@@ -1067,6 +1636,10 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
         identity,
         runtime,
+        dataDir: deps.dataDir,
+        deviceId: deps.deviceId,
+        browserSkillExecutable: deps.browserSkillExecutable,
+        sessionRunner: deps.sessionRunner,
         connectionEpoch: state.connectionEpoch,
         publicDeviceFingerprint: state.publicDeviceFingerprint,
         confirmationFingerprint: state.confirmationFingerprint,

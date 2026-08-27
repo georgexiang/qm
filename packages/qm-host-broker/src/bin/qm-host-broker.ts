@@ -14,6 +14,8 @@ try {
     stdout: process.stdout,
     stderr: process.stderr,
     signal: controller.signal,
+    deviceId: process.env.QM_HOST_BROKER_DEVICE_ID,
+    browserSkillExecutable: process.env.QM_HOST_BROKER_BSK_EXECUTABLE,
     resolveRelayUrl: (qmUrl) => resolveRelayUrlFromEnv(qmUrl, process.env),
   });
 } finally {

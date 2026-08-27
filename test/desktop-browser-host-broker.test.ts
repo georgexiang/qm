@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { chmodSync, mkdtempSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,12 +18,16 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
+  DESKTOP_BROWSER_RELAY_AUDIENCE,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
+  computeDesktopBrowserRequestHash,
   decodeDesktopBrowserMessage,
   projectDesktopBrowserPublicIdentity,
+  type DesktopBrowserSessionStartAuthorityEnvelope,
   type HostChallengeResponseMessage,
+  type HostResultMessage,
 } from "../packages/desktop-browser-contracts/src/index.ts";
 import {
   DesktopBrowserRelayService,
@@ -37,6 +50,7 @@ import {
   verifyRegistrationConfirmationEnvelopeSignature,
   type BrowserRuntimeMetadata,
   type HostBrokerScheduler,
+  type HostBrokerSessionRunner,
   type HostBrokerSocket,
   type HostBrokerTransport,
 } from "../packages/qm-host-broker/src/index.ts";
@@ -250,6 +264,95 @@ function runtime(): BrowserRuntimeMetadata {
     extensionVersion: "0.1.6",
     cliShapeHash: "shape-123",
   };
+}
+
+function sessionStartAuthority(
+  operationId: string,
+  now: number = Date.now(),
+): DesktopBrowserSessionStartAuthorityEnvelope {
+  const issuedAt = new Date(now - 1_000).toISOString();
+  return {
+    authorityVersion: "1.0",
+    audience: DESKTOP_BROWSER_RELAY_AUDIENCE,
+    deploymentCanonicalId: "qm://deployments/example",
+    actorId: "actor-1",
+    actorSnapshotHash: "sha256:actor-snapshot-1",
+    projectId: "project-1",
+    projectSnapshotHash: "sha256:project-snapshot-1",
+    membershipEpoch: 42,
+    taskId: "task-1",
+    attemptId: "attempt-1",
+    deviceId: "device-1",
+    browserInstanceId: "browser-primary",
+    leaseId: "lease-1",
+    leaseVersion: 3,
+    leaseExpiresAt: new Date(Date.parse(issuedAt) + 60_000).toISOString(),
+    operationId,
+    operationSequence: 1,
+    capabilitySet: {
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.0",
+      bskVersion: runtime().bskVersion,
+      extensionVersion: runtime().extensionVersion,
+      cliShapeHash: runtime().cliShapeHash,
+    },
+    argv: ["--json", "session", "start", "--browser", "browser-primary"],
+    brokerOptions: { forceSharedRuntime: false },
+    effectClass: "local_effect",
+    nonce: "nonce-operation-1",
+    issuedAt,
+  };
+}
+
+async function connectOperationHost(input: {
+  dataDir: string;
+  sessionRunner: HostBrokerSessionRunner;
+  browserSkillTimeoutMs?: number;
+  now?: number;
+  supportedPolicyGrammarVersions?: string[];
+  challengePolicyGrammarVersion?: string;
+}): Promise<{ socket: FakeSocket; running: Promise<unknown> }> {
+  const identity = await loadOrCreateDeviceIdentity(input.dataDir);
+  const socket = new FakeSocket();
+  const scheduler = new FakeScheduler();
+  scheduler.nowMs = input.now ?? Date.now();
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: "wss://relay.example.com/v1/device",
+    deploymentCanonicalId: "qm://deployments/example",
+    deviceId: "device-1",
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: input.supportedPolicyGrammarVersions ?? ["1.0"],
+    identity,
+    runtime: runtime(),
+    dataDir: input.dataDir,
+    browserSkillExecutable: "bsk",
+    sessionRunner: input.sessionRunner,
+    browserSkillTimeoutMs: input.browserSkillTimeoutMs,
+    scheduler,
+    transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
+  });
+  const running = connection.start();
+  socket.open();
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.challenge",
+      payload: {
+        relayInstanceId: "relay-a",
+        challengeNonce: "nonce-1",
+        deploymentCanonicalId: "qm://deployments/example",
+        brokerInstanceId: "broker-local-1",
+        browserInstanceId: "browser-primary",
+        connectionEpoch: 7,
+        ...(input.challengePolicyGrammarVersion ? { policyGrammarVersion: input.challengePolicyGrammarVersion } : {}),
+      },
+    }),
+  );
+  await waitFor(() => (socket.sent.length === 2 ? true : undefined), "host challenge response");
+  return { socket, running };
 }
 
 function tupleForIdentity(devicePublicKey: string) {
@@ -507,6 +610,560 @@ test("host and relay prefer protocol 1.2 during handshake interop and publish th
 
   sockets.host.close(1000, "done");
   await running;
+});
+
+test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSkill spawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-session-start-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-session-start-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2", "1.0"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry,
+    createNonce: () => "nonce-session-start-1",
+    createConnectionId: () => "connection-session-start-1",
+  });
+  let hostResult: HostResultMessage | undefined;
+  const sockets = createLinkedSocketPair({
+    hostToRelay(data) {
+      const raw = JSON.parse(data) as { kind?: string };
+      if (raw.kind === "host.result") {
+        hostResult = decodeDesktopBrowserMessage(data, "1.2", "1.0") as HostResultMessage;
+      }
+      return data;
+    },
+  });
+  const spawnCalls: Array<{ executable: string; argv: readonly string[]; options: unknown }> = [];
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run(executable, argv, options) {
+      const fenceFiles = readdirSync(join(dir, "operations"));
+      assert.equal(fenceFiles.length, 1);
+      const fence = JSON.parse(readFileSync(join(dir, "operations", fenceFiles[0]!), "utf8")) as {
+        operationId: string;
+        requestHash: string;
+      };
+      assert.equal(fence.operationId, "0198f3d2-1950-7000-8000-000000000011");
+      assert.equal(fence.requestHash, authorityRequestHash);
+      spawnCalls.push({ executable, argv, options });
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          session_id: "session-1",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+          ignored_remote_field: "filtered",
+        }),
+        stderr: "",
+      };
+    },
+  };
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    deploymentCanonicalId: "qm://deployments/example",
+    deviceId: "device-1",
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    identity,
+    runtime: runtime(),
+    dataDir: dir,
+    browserSkillExecutable: "bsk",
+    sessionRunner,
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const issuedAt = new Date(Date.now() - 1_000).toISOString();
+  const authority: DesktopBrowserSessionStartAuthorityEnvelope = {
+    authorityVersion: "1.0",
+    audience: DESKTOP_BROWSER_RELAY_AUDIENCE,
+    deploymentCanonicalId: "qm://deployments/example",
+    actorId: "actor-1",
+    actorSnapshotHash: "sha256:actor-snapshot-1",
+    projectId: "project-1",
+    projectSnapshotHash: "sha256:project-snapshot-1",
+    membershipEpoch: 42,
+    taskId: "task-1",
+    attemptId: "attempt-1",
+    deviceId: "device-1",
+    browserInstanceId: "browser-primary",
+    leaseId: "lease-1",
+    leaseVersion: 3,
+    leaseExpiresAt: new Date(Date.parse(issuedAt) + 60_000).toISOString(),
+    operationId: "0198f3d2-1950-7000-8000-000000000011",
+    operationSequence: 1,
+    capabilitySet: {
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.0",
+      bskVersion: runtime().bskVersion,
+      extensionVersion: runtime().extensionVersion,
+      cliShapeHash: runtime().cliShapeHash,
+    },
+    argv: ["--json", "session", "start", "--browser", "browser-primary"],
+    brokerOptions: { forceSharedRuntime: false },
+    effectClass: "local_effect",
+    nonce: "nonce-operation-1",
+    issuedAt,
+  };
+  const authorityRequestHash = computeDesktopBrowserRequestHash(authority, "1.2", "1.0");
+  const running = connection.start().catch(() => undefined);
+  sockets.host.open();
+  await waitFor(() => registry.published.get("connection-session-start-1"), "session-start relay publication");
+
+  sockets.relay.send(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "0198f3d2-1950-7000-8000-000000000012",
+        requestHash: authorityRequestHash,
+        authority,
+      },
+    }),
+  );
+
+  const completed = await waitFor(() => hostResult, "completed host result");
+  assert.equal(completed.protocolVersion, "1.2");
+  assert.deepEqual(completed.payload, {
+    operationId: authority.operationId,
+    accepted: true,
+    outcome: "completed",
+    resultHash: completed.payload.accepted ? completed.payload.resultHash : "",
+    result: {
+      session_id: "session-1",
+      browser_instance_id: "browser-primary",
+      agent_window_id: 42,
+    },
+  });
+  assert.deepEqual(spawnCalls, [
+    {
+      executable: "bsk",
+      argv: ["--json", "session", "start", "--browser", "browser-primary"],
+      options: { shell: false, stdio: ["ignore", "pipe", "pipe"] },
+    },
+  ]);
+  const operationFile = join(dir, "operations", readdirSync(join(dir, "operations"))[0]!);
+  const sessionFile = join(dir, "sessions", readdirSync(join(dir, "sessions"))[0]!);
+  assert.equal(statSync(join(dir, "operations")).mode & 0o777, 0o700);
+  assert.equal(statSync(join(dir, "sessions")).mode & 0o777, 0o700);
+  assert.equal(statSync(operationFile).mode & 0o777, 0o600);
+  assert.equal(statSync(sessionFile).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(readFileSync(sessionFile, "utf8")), {
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    operationId: authority.operationId,
+    requestHash: authorityRequestHash,
+    sessionId: "session-1",
+    browserInstanceId: "browser-primary",
+    agentWindowId: 42,
+  });
+
+  await running;
+});
+
+test("relay.invoke rejects every authority mismatch before fencing or spawning", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-pre-fence-rejection-"));
+  let spawnCalls = 0;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    sessionRunner: {
+      async run() {
+        spawnCalls += 1;
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      },
+    },
+  });
+  const base = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000021");
+  const futureIssuedAt = new Date(Date.now() + 30_000).toISOString();
+  const cases: Array<{ name: string; authority: unknown; requestHash?: string }> = [
+    { name: "request hash", authority: base, requestHash: `sha256:${"0".repeat(64)}` },
+    { name: "audience", authority: { ...base, audience: "other-audience" } },
+    { name: "deployment", authority: { ...base, deploymentCanonicalId: "qm://deployments/other" } },
+    { name: "device", authority: { ...base, deviceId: "device-2" } },
+    { name: "browser", authority: { ...base, browserInstanceId: "browser-secondary" } },
+    {
+      name: "runtime capability",
+      authority: { ...base, capabilitySet: { ...base.capabilitySet, bskVersion: "different-bsk" } },
+    },
+    {
+      name: "negotiated protocol",
+      authority: { ...base, capabilitySet: { ...base.capabilitySet, protocolVersion: "1.0" } },
+    },
+    {
+      name: "expired lease",
+      authority: {
+        ...base,
+        issuedAt: "2020-01-01T00:00:00.000Z",
+        leaseExpiresAt: "2020-01-01T00:01:00.000Z",
+      },
+    },
+    {
+      name: "future lease",
+      authority: {
+        ...base,
+        issuedAt: futureIssuedAt,
+        leaseExpiresAt: new Date(Date.parse(futureIssuedAt) + 60_000).toISOString(),
+      },
+    },
+    { name: "argv", authority: { ...base, argv: ["--json", "session", "start"] } },
+    {
+      name: "argv includes executable",
+      authority: { ...base, argv: ["bsk", "--json", "session", "start", "--browser", "browser-primary"] },
+    },
+    {
+      name: "argv duplicates leading json",
+      authority: {
+        ...base,
+        argv: ["--json", "--json", "session", "start", "--browser", "browser-primary"],
+      },
+    },
+    {
+      name: "argv misplaces global json",
+      authority: { ...base, argv: ["session", "start", "--json", "--browser", "browser-primary"] },
+    },
+    { name: "shared runtime", authority: { ...base, brokerOptions: { forceSharedRuntime: true } } },
+  ];
+
+  for (const entry of cases) {
+    const sentBefore = socket.sent.length;
+    let requestHash = entry.requestHash;
+    if (!requestHash) {
+      try {
+        requestHash = computeDesktopBrowserRequestHash(entry.authority, "1.2", "1.0");
+      } catch {
+        requestHash = computeDesktopBrowserRequestHash(base, "1.2", "1.0");
+      }
+    }
+    socket.message(
+      JSON.stringify({
+        protocolVersion: "1.2",
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: `dispatch-${entry.name.replaceAll(" ", "-")}`,
+          requestHash,
+          authority: entry.authority,
+        },
+      }),
+    );
+    const encodedResult = await waitFor(
+      () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
+      `${entry.name} rejection`,
+    );
+    const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
+    assert.equal(result.kind, "host.result", entry.name);
+    assert.equal(result.payload.accepted, false, entry.name);
+    assert.equal(result.payload.outcome, "failed", entry.name);
+  }
+
+  assert.equal(spawnCalls, 0);
+  assert.equal(existsSync(join(dir, "operations")), false);
+  socket.close(1000, "done");
+  await running;
+});
+
+test("relay.invoke retains the authoritative policy grammar instead of supported list order", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-policy-grammar-"));
+  let spawnCalls = 0;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    supportedPolicyGrammarVersions: ["1.0", "1.1"],
+    challengePolicyGrammarVersion: "1.1",
+    sessionRunner: {
+      async run() {
+        spawnCalls += 1;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            session_id: "session-grammar-1",
+            browser_instance_id: "browser-primary",
+            agent_window_id: 41,
+          }),
+          stderr: "",
+        };
+      },
+    },
+  });
+  const base = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000025");
+  const authority = {
+    ...base,
+    capabilitySet: { ...base.capabilitySet, policyGrammarVersion: "1.1" as const },
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-policy-grammar",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.1"),
+        authority,
+      },
+    }),
+  );
+
+  const result = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[2], "policy grammar completed result"),
+    "1.2",
+    "1.1",
+  ) as HostResultMessage;
+  assert.equal(result.payload.outcome, "completed");
+  assert.equal(spawnCalls, 1);
+  socket.close(1000, "done");
+  await running;
+});
+
+test("a durable operation fence prevents duplicate and mismatched session-start spawns after restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-durable-fence-"));
+  let spawnCalls = 0;
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run() {
+      spawnCalls += 1;
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          session_id: "session-1",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        }),
+        stderr: "",
+      };
+    },
+  };
+  const authority = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000031");
+  const requestHash = computeDesktopBrowserRequestHash(authority, "1.2", "1.0");
+  const invocation = {
+    protocolVersion: "1.2",
+    kind: "relay.invoke",
+    payload: { dispatchId: "dispatch-first", requestHash, authority },
+  };
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner });
+  first.socket.message(JSON.stringify(invocation));
+  const firstResult = decodeDesktopBrowserMessage(
+    await waitFor(() => first.socket.sent[2], "first completed result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(firstResult.payload.outcome, "completed");
+  first.socket.close(1000, "restart");
+  await first.running;
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner });
+  second.socket.message(JSON.stringify(invocation));
+  const duplicateResult = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[2], "duplicate completed result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.deepEqual(duplicateResult.payload, firstResult.payload);
+  assert.equal(spawnCalls, 1);
+
+  const mismatchedAuthority = { ...authority, attemptId: "attempt-2" };
+  second.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: {
+        dispatchId: "dispatch-mismatch",
+        requestHash: computeDesktopBrowserRequestHash(mismatchedAuthority, "1.2", "1.0"),
+        authority: mismatchedAuthority,
+      },
+    }),
+  );
+  const mismatchResult = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[3], "mismatched fenced result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(mismatchResult.payload.accepted, false);
+  assert.equal(mismatchResult.payload.outcome, "failed");
+  assert.equal(spawnCalls, 1);
+
+  second.socket.message(JSON.stringify(invocation));
+  const preservedResult = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[4], "preserved completed result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.deepEqual(preservedResult.payload, firstResult.payload);
+  assert.equal(spawnCalls, 1);
+
+  second.socket.close(1000, "done");
+  await second.running;
+});
+
+test("post-fence BrowserSkill output failures persist unknown without task ownership or retry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-output-failure-"));
+  const outputs = [
+    JSON.stringify({
+      session_id: "session-wrong-browser",
+      browser_instance_id: "browser-secondary",
+      agent_window_id: 42,
+    }),
+    JSON.stringify({
+      session_id: "session-oversized",
+      browser_instance_id: "browser-primary",
+      agent_window_id: 43,
+      padding: "x".repeat(70 * 1024),
+    }),
+  ];
+  let spawnCalls = 0;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    sessionRunner: {
+      async run() {
+        const stdout = outputs[spawnCalls];
+        spawnCalls += 1;
+        return { exitCode: 0, stdout: stdout ?? "", stderr: "" };
+      },
+    },
+  });
+
+  for (let index = 0; index < outputs.length; index += 1) {
+    const authority = {
+      ...sessionStartAuthority(`0198f3d2-1950-7000-8000-00000000004${index}`),
+      taskId: `task-output-${index}`,
+      attemptId: `attempt-output-${index}`,
+    };
+    const sentBefore = socket.sent.length;
+    socket.message(
+      JSON.stringify({
+        protocolVersion: "1.2",
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: `dispatch-output-${index}`,
+          requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+          authority,
+        },
+      }),
+    );
+    const encodedResult = await waitFor(
+      () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
+      `output failure ${index}`,
+    );
+    const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
+    assert.equal(result.payload.accepted, true);
+    assert.equal(result.payload.outcome, "unknown");
+  }
+
+  assert.equal(spawnCalls, 2);
+  assert.equal(existsSync(join(dir, "sessions")), false);
+  socket.close(1000, "done");
+  await running;
+});
+
+test("post-fence BrowserSkill timeout persists unknown without task ownership or retry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-timeout-"));
+  let spawnCalls = 0;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    browserSkillTimeoutMs: 5,
+    sessionRunner: {
+      async run() {
+        spawnCalls += 1;
+        return await new Promise<never>(() => {});
+      },
+    },
+  });
+  const authority = {
+    ...sessionStartAuthority("0198f3d2-1950-7000-8000-000000000060"),
+    taskId: "task-timeout-1",
+    attemptId: "attempt-timeout-1",
+  };
+  const sentBefore = socket.sent.length;
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-timeout-1",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  const encodedResult = await waitFor(
+    () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
+    "timeout failure",
+  );
+  const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
+  assert.equal(result.payload.accepted, true);
+  assert.equal(result.payload.outcome, "unknown");
+  assert.equal(spawnCalls, 1);
+  assert.equal(existsSync(join(dir, "sessions")), false);
+  socket.close(1000, "done");
+  await running;
+});
+
+test("disconnect after fencing persists unknown and a restarted host never retries the spawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-disconnect-unknown-"));
+  let resolveRun: ((result: { exitCode: number; stdout: string; stderr: string }) => void) | undefined;
+  let spawnCalls = 0;
+  const sessionRunner: HostBrokerSessionRunner = {
+    run() {
+      spawnCalls += 1;
+      return new Promise((resolve) => {
+        resolveRun = resolve;
+      });
+    },
+  };
+  const authority = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000051");
+  const requestHash = computeDesktopBrowserRequestHash(authority, "1.2", "1.0");
+  const invocation = {
+    protocolVersion: "1.2",
+    kind: "relay.invoke",
+    payload: { dispatchId: "dispatch-disconnect", requestHash, authority },
+  };
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner });
+  first.socket.message(JSON.stringify(invocation));
+  await waitFor(
+    () => (existsSync(join(dir, "operations")) && spawnCalls === 1 ? true : undefined),
+    "accepted operation fence",
+  );
+  first.socket.close(1006, "connection lost");
+  await assert.rejects(first.running, /retryable|transport|closed/i);
+  resolveRun?.({
+    exitCode: 0,
+    stdout: JSON.stringify({
+      session_id: "session-ambiguous",
+      browser_instance_id: "browser-primary",
+      agent_window_id: 42,
+    }),
+    stderr: "",
+  });
+  await waitFor(() => {
+    const fenceFile = readdirSync(join(dir, "operations"))[0];
+    if (!fenceFile) return undefined;
+    const fence = JSON.parse(readFileSync(join(dir, "operations", fenceFile), "utf8")) as { state?: string };
+    return fence.state === "unknown" ? true : undefined;
+  }, "unknown operation fence");
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner });
+  second.socket.message(JSON.stringify(invocation));
+  const replay = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[2], "unknown replay result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(replay.payload.accepted, true);
+  assert.equal(replay.payload.outcome, "unknown");
+  assert.equal(spawnCalls, 1);
+  second.socket.close(1000, "done");
+  await second.running;
 });
 
 test("host and relay fall back to protocol 1.0 during handshake interop when relay only supports 1.0", async () => {
@@ -1056,6 +1713,8 @@ test("connect handshake sends shared hello and signed challenge response through
     qmUrl: "https://qm.example.com",
     relayUrl: "wss://relay.example.com/v1/device",
     deploymentCanonicalId: "qm://deployments/example",
+    negotiatedProtocolVersion: "1.0",
+    negotiatedPolicyGrammarVersion: "1.0",
     brokerStatus: "ready",
     browserSkillStatus: "ready",
     currentTaskPresent: false,
