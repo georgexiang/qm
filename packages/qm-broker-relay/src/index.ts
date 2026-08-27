@@ -1,5 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  computeDesktopBrowserRequestHash,
   computeDesktopBrowserPublicDeviceFingerprint,
   decodeDesktopBrowserMessage,
   encodeDesktopBrowserMessage,
@@ -7,7 +9,9 @@ import {
   verifyHostChallengeResponseMessage,
   type DesktopBrowserRelayConnectionProjection,
   type DesktopBrowserRelayRegistryBinding,
+  type HostResultMessage,
   type HostHelloMessage,
+  type RelayInvocationMessage,
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 import type { WebSocket, WebSocketServer } from "ws";
@@ -63,6 +67,7 @@ export interface DesktopBrowserRelayServiceOptions {
   challengeTimeoutMs?: number;
   heartbeatIntervalMs?: number;
   heartbeatGraceMs?: number;
+  invocationTimeoutMs?: number;
   createNonce?: () => string;
   createConnectionId?: () => string;
 }
@@ -81,6 +86,13 @@ interface RelayConnectionState {
   negotiatedProtocolVersion: `${number}.${number}` | null;
   negotiatedPolicyGrammarVersion: string | null;
   projectionPublished: boolean;
+  pendingDispatch: {
+    dispatchId: string;
+    operationId: string;
+    requestHash: string;
+    timeout: RelayTimerHandle;
+    resolve: (result: HostResultMessage) => void;
+  } | null;
   lastSeenAt: number;
   closeReason: string | null;
 }
@@ -90,6 +102,7 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const DEFAULT_CHALLENGE_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 const DEFAULT_HEARTBEAT_GRACE_MS = 5_000;
+const DEFAULT_INVOCATION_TIMEOUT_MS = 20_000;
 
 const systemClock: DesktopBrowserRelayClock = {
   now: () => Date.now(),
@@ -174,6 +187,7 @@ export class DesktopBrowserRelayService {
       | "challengeTimeoutMs"
       | "heartbeatIntervalMs"
       | "heartbeatGraceMs"
+      | "invocationTimeoutMs"
     >
   > & {
     clock: DesktopBrowserRelayClock;
@@ -182,6 +196,8 @@ export class DesktopBrowserRelayService {
   };
   private readonly connections = new Map<string, RelayConnectionState>();
   private readonly currentByIdentity = new Map<string, string>();
+  private readonly operationRequestHashById = new Map<string, string>();
+  private readonly dispatchOperationById = new Map<string, string>();
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -196,6 +212,7 @@ export class DesktopBrowserRelayService {
       challengeTimeoutMs: options.challengeTimeoutMs ?? DEFAULT_CHALLENGE_TIMEOUT_MS,
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       heartbeatGraceMs: options.heartbeatGraceMs ?? DEFAULT_HEARTBEAT_GRACE_MS,
+      invocationTimeoutMs: options.invocationTimeoutMs ?? DEFAULT_INVOCATION_TIMEOUT_MS,
       clock: options.clock ?? systemClock,
       createNonce: options.createNonce ?? (() => randomUUID()),
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
@@ -228,6 +245,7 @@ export class DesktopBrowserRelayService {
       negotiatedProtocolVersion: null,
       negotiatedPolicyGrammarVersion: null,
       projectionPublished: false,
+      pendingDispatch: null,
       lastSeenAt: this.options.clock.now(),
       closeReason: null,
     };
@@ -303,19 +321,107 @@ export class DesktopBrowserRelayService {
     devicePublicKey: string;
     brokerInstanceId: string;
     browserInstanceId: string;
-  }): Promise<never> {
-    const key = identityKey(input);
-    const current = this.currentByIdentity.get(key);
-    if (!current) throw new Error("desktop browser host is not connected");
-    const connection = this.connections.get(current);
-    if (!connection || !connection.binding) throw new Error("desktop browser host is not connected");
-    if (connection.binding.browserInstanceId !== input.browserInstanceId) {
-      throw new Error("desktop browser host is not connected");
+    invocation: RelayInvocationMessage;
+  }): Promise<HostResultMessage> {
+    const connection = await this.resolveCurrentRegisteredConnection(input);
+    if (connection.negotiatedProtocolVersion !== DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) {
+      throw new Error(
+        `desktop browser session-start requires negotiated protocol version ${DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION}`,
+      );
     }
-    if (connection.stage === "pending") {
-      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    if (!connection.hello || !connection.negotiatedPolicyGrammarVersion) {
+      throw new Error("desktop browser host capability identity is unavailable");
     }
-    throw new Error("relay invocation delivery is not implemented in Ticket04");
+    const decoded = decodeDesktopBrowserMessage(
+      encodeDesktopBrowserMessage(input.invocation),
+      connection.negotiatedProtocolVersion,
+      connection.negotiatedPolicyGrammarVersion,
+    );
+    if (decoded.kind !== "relay.invoke") {
+      throw new Error("desktop browser relay dispatch requires a relay.invoke message");
+    }
+    const canonicalRequestHash = computeDesktopBrowserRequestHash(
+      decoded.payload.authority,
+      connection.negotiatedProtocolVersion,
+      connection.negotiatedPolicyGrammarVersion,
+    );
+    if (decoded.payload.requestHash !== canonicalRequestHash) {
+      throw new Error(
+        `relay.invoke requestHash ${JSON.stringify(decoded.payload.requestHash)} does not match canonical request hash ${JSON.stringify(canonicalRequestHash)}`,
+      );
+    }
+    const authority = decoded.payload.authority;
+    if (authority.deploymentCanonicalId !== this.options.deploymentCanonicalId) {
+      throw new Error("desktop browser invocation deployment does not match this relay");
+    }
+    if (authority.deviceId.length === 0) {
+      throw new Error("desktop browser invocation device identity is unavailable");
+    }
+    if (authority.browserInstanceId !== input.browserInstanceId) {
+      throw new Error("desktop browser invocation browser does not match the requested host");
+    }
+    if (authority.browserInstanceId !== connection.binding.browserInstanceId) {
+      throw new Error("desktop browser invocation browser does not match the registered host");
+    }
+    if (connection.binding.devicePublicKey !== input.devicePublicKey) {
+      throw new Error("desktop browser invocation device key does not match the registered host");
+    }
+    if (connection.binding.brokerInstanceId !== input.brokerInstanceId) {
+      throw new Error("desktop browser invocation broker does not match the registered host");
+    }
+    const advertised = connection.hello.payload;
+    const capability = authority.capabilitySet;
+    if (
+      capability.protocolVersion !== connection.negotiatedProtocolVersion ||
+      capability.policyGrammarVersion !== connection.negotiatedPolicyGrammarVersion ||
+      capability.bskVersion !== advertised.bskVersion ||
+      capability.extensionVersion !== advertised.extensionVersion ||
+      capability.cliShapeHash !== advertised.cliShapeHash
+    ) {
+      throw new Error("desktop browser invocation capability set does not match the registered host");
+    }
+    const previousOperationRequestHash = this.operationRequestHashById.get(authority.operationId);
+    if (previousOperationRequestHash !== undefined) {
+      if (previousOperationRequestHash !== canonicalRequestHash) {
+        throw new Error(
+          `operationId ${JSON.stringify(authority.operationId)} already dispatched with different requestHash ${JSON.stringify(canonicalRequestHash)}`,
+        );
+      }
+      throw new Error(`operation was already dispatched for operationId ${JSON.stringify(authority.operationId)}`);
+    }
+    const previousDispatchOperationId = this.dispatchOperationById.get(decoded.payload.dispatchId);
+    if (previousDispatchOperationId !== undefined) {
+      throw new Error(
+        `dispatchId ${JSON.stringify(decoded.payload.dispatchId)} already used for operationId ${JSON.stringify(previousDispatchOperationId)}`,
+      );
+    }
+    if (connection.pendingDispatch) {
+      throw new Error("desktop browser host already has an in-flight invocation");
+    }
+    return new Promise<HostResultMessage>((resolve, reject) => {
+      this.operationRequestHashById.set(authority.operationId, canonicalRequestHash);
+      this.dispatchOperationById.set(decoded.payload.dispatchId, authority.operationId);
+      const timeout = this.options.clock.setTimeout(() => {
+        if (connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId) return;
+        void this.closeConnection(connection, 1008, "desktop browser invocation timed out waiting for host.result");
+      }, this.options.invocationTimeoutMs);
+      connection.pendingDispatch = {
+        dispatchId: decoded.payload.dispatchId,
+        operationId: authority.operationId,
+        requestHash: canonicalRequestHash,
+        timeout,
+        resolve,
+      };
+      try {
+        connection.socket.send(encodeDesktopBrowserMessage(decoded));
+      } catch (error) {
+        this.options.clock.clearTimeout(timeout);
+        connection.pendingDispatch = null;
+        this.operationRequestHashById.delete(authority.operationId);
+        this.dispatchOperationById.delete(decoded.payload.dispatchId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   async drain(): Promise<void> {
@@ -365,6 +471,72 @@ export class DesktopBrowserRelayService {
     };
   }
 
+  private async resolveCurrentRegisteredConnection(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+    browserInstanceId: string;
+  }): Promise<RelayConnectionState> {
+    const key = identityKey(input);
+    const current = this.currentByIdentity.get(key);
+    if (!current) throw new Error("desktop browser host is not connected");
+    const connection = this.connections.get(current);
+    if (!connection || !connection.binding) throw new Error("desktop browser host is not connected");
+    if (connection.binding.browserInstanceId !== input.browserInstanceId) {
+      throw new Error("desktop browser host is not connected");
+    }
+    if (connection.stage === "pending") {
+      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    }
+    if (connection.stage !== "registered") {
+      throw new Error("desktop browser host is not connected");
+    }
+    const latest = await this.options.registry.resolveBinding({
+      devicePublicKey: input.devicePublicKey,
+      brokerInstanceId: input.brokerInstanceId,
+    });
+    if (!latest) {
+      await this.closeConnection(connection, 1008, "desktop browser binding expired before relay delivery");
+      throw new Error("desktop browser host is not connected");
+    }
+    if (latest.registrationState !== "registered") {
+      connection.binding = latest;
+      connection.stage = latest.registrationState;
+      await this.publishProjection(connection);
+      throw new Error("desktop browser host is pending registration and cannot receive task invocations");
+    }
+    const bindingChanged =
+      latest.devicePublicKey !== connection.binding.devicePublicKey ||
+      latest.brokerInstanceId !== connection.binding.brokerInstanceId ||
+      latest.browserInstanceId !== connection.binding.browserInstanceId ||
+      latest.connectionEpoch !== connection.binding.connectionEpoch;
+    if (bindingChanged) {
+      await this.closeConnection(connection, 1008, "connection replaced by a newer relay registration");
+      throw new Error("desktop browser host is not connected");
+    }
+    connection.binding = latest;
+    return connection;
+  }
+
+  private unknownHostResult(operationId: string, detail: string): HostResultMessage {
+    const resultHash = `sha256:${createHash("sha256")
+      .update(JSON.stringify({ operationId, outcome: "unknown", detail }))
+      .digest("hex")}`;
+    return {
+      protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+      kind: "host.result",
+      payload: {
+        operationId,
+        accepted: true,
+        outcome: "unknown",
+        resultHash,
+        error: {
+          code: "relay_delivery_unknown",
+          message: detail,
+        },
+      },
+    };
+  }
+
   private async handleMessage(connection: RelayConnectionState, raw: string): Promise<void> {
     if (byteLength(raw) > this.options.maxMessageBytes) {
       throw new Error("desktop browser relay message exceeded the maximum allowed size");
@@ -396,6 +568,17 @@ export class DesktopBrowserRelayService {
       connection.negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
     );
     if (message.kind === "relay.invoke") throw new Error("unexpected relay.invoke frame from host");
+    if (message.kind === "host.result") {
+      const pending = connection.pendingDispatch;
+      if (!pending) throw new Error("unexpected host.result without an in-flight invocation");
+      if (message.payload.operationId !== pending.operationId) {
+        throw new Error("host.result operation does not match the in-flight invocation");
+      }
+      connection.pendingDispatch = null;
+      this.options.clock.clearTimeout(pending.timeout);
+      pending.resolve(message);
+      return;
+    }
     throw new Error(
       `desktop browser relay operations are not implemented in Ticket04: ${JSON.stringify(message.kind)}`,
     );
@@ -584,6 +767,17 @@ export class DesktopBrowserRelayService {
     this.connections.delete(connection.connectionId);
     this.clearStageTimer(connection);
     this.clearHeartbeat(connection);
+    if (connection.pendingDispatch) {
+      const pending = connection.pendingDispatch;
+      connection.pendingDispatch = null;
+      this.options.clock.clearTimeout(pending.timeout);
+      pending.resolve(
+        this.unknownHostResult(
+          pending.operationId,
+          connection.closeReason ?? "desktop browser host connection closed before host.result",
+        ),
+      );
+    }
     if (connection.binding) {
       const key = identityKey(connection.binding);
       if (this.currentByIdentity.get(key) === connection.connectionId) {
