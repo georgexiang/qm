@@ -1096,7 +1096,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             : undefined;
         controlClaims = {
           actorId: actor.id,
-          ...(retainedAuthority ?? {}),
+          ...retainedAuthority,
           scopeId,
           ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
           aud: CONTROL_PLANE_AUD,
