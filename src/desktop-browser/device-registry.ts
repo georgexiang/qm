@@ -21,6 +21,26 @@ export interface DesktopBrowserSharedProfileProjection {
   device: DesktopBrowserOnlineDeviceProjection;
 }
 
+export interface DesktopBrowserSessionStartRegistrationSnapshot {
+  deploymentCanonicalId: string;
+  registrationId: string;
+  waitingTaskId: string;
+  actorId: string;
+  projectId: string;
+  membershipEpoch: number;
+  authorityId: string;
+  authorityExpiresAt: number;
+  publicDeviceFingerprint: string;
+  browserInstanceId: string;
+  status: "online" | "offline";
+  browserRuntimeStatus: "ready" | "offline";
+}
+
+export interface DesktopBrowserSessionStartAuthoritySnapshot {
+  registration: DesktopBrowserSessionStartRegistrationSnapshot;
+  relayConnection: DesktopBrowserRelayConnectionProjection;
+}
+
 interface DesktopBrowserChallengeBinding {
   registrationId: string;
   devicePublicKey: string;
@@ -159,6 +179,12 @@ export interface DesktopBrowserDeviceRegistry {
   }): Promise<DesktopBrowserRelayRegistryBinding | null>;
   publishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
   clearRelayConnection(connectionId: string): Promise<void>;
+  sessionStartAuthority(waitingTaskId: string): Promise<DesktopBrowserSessionStartAuthoritySnapshot | null>;
+  sessionStartAuthorityState(
+    waitingTaskId: string,
+  ): Promise<
+    { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string }
+  >;
 }
 
 function iso(at: number): string {
@@ -826,6 +852,70 @@ export function createDesktopBrowserDeviceRegistry(
       await updateState((state) => {
         delete state.relayConnections[connectionId];
       });
+    },
+
+    async sessionStartAuthority(waitingTaskId) {
+      const state = await this.sessionStartAuthorityState(waitingTaskId);
+      return state.status === "ok" ? state.authority : null;
+    },
+
+    async sessionStartAuthorityState(waitingTaskId) {
+      const state = await readState();
+      const claim = claimForTask(state, waitingTaskId);
+      if (!claim) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+      const registration = state.registrations[claim.registrationId];
+      if (!registration) {
+        return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+      }
+      if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
+        return { status: "refused", reason: "Desktop Browser device is not online" };
+      }
+      if (currentProjectHead(state, registration.projectId)?.registrationId !== registration.registrationId) {
+        return {
+          status: "refused",
+          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+        };
+      }
+      const relayConnection = Object.values(state.relayConnections)
+        .filter(
+          (connection) =>
+            connection.registrationState === "registered" &&
+            connection.publicDeviceFingerprint === registration.publicDeviceFingerprint &&
+            connection.brokerInstanceId === registration.registrationTuple.brokerInstanceId &&
+            connection.browserInstanceId === registration.registrationTuple.browserInstanceId &&
+            connection.connectionEpoch === registration.registrationTuple.connectionEpoch,
+        )
+        .sort(
+          (left, right) =>
+            Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt) ||
+            left.connectionId.localeCompare(right.connectionId),
+        )[0];
+      if (!relayConnection) {
+        return {
+          status: "refused",
+          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+        };
+      }
+      return {
+        status: "ok",
+        authority: {
+          registration: {
+            deploymentCanonicalId: registration.registrationTuple.deploymentCanonicalId,
+            registrationId: registration.registrationId,
+            waitingTaskId: registration.waitingTaskId,
+            actorId: registration.actorId,
+            projectId: registration.projectId,
+            membershipEpoch: registration.membershipEpoch,
+            authorityId: registration.authorityId,
+            authorityExpiresAt: registration.authorityExpiresAt,
+            publicDeviceFingerprint: registration.publicDeviceFingerprint,
+            browserInstanceId: registration.registrationTuple.browserInstanceId,
+            status: "online",
+            browserRuntimeStatus: "ready",
+          },
+          relayConnection: { ...relayConnection },
+        },
+      };
     },
   };
 }

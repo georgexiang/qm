@@ -1,4 +1,5 @@
 import {
+  accessSync,
   chmodSync,
   closeSync,
   constants as fsConstants,
@@ -12,15 +13,18 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { isIP } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_RELAY_AUDIENCE,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
   computeDesktopBrowserPublicDeviceFingerprint,
+  computeDesktopBrowserRequestHash,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   decodeDesktopBrowserMessage,
   encodeDesktopBrowserMessage,
@@ -30,20 +34,31 @@ import {
   parseDesktopBrowserRegistrationConfirmationEnvelope,
   parseDesktopBrowserRegistrationReservationTuple,
   projectDesktopBrowserPublicIdentity,
+  type DesktopBrowserHostFailure,
+  type DesktopBrowserSessionStartAuthorityEnvelope,
+  type DesktopBrowserSessionStartResult,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRegistrationReservationTuple,
+  type HostAcceptedMessage,
+  type HostResultMessage,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 
 const MAX_RELAY_MESSAGE_BYTES = 64 * 1024;
+const MAX_BROWSER_SKILL_OUTPUT_BYTES = 64 * 1024;
+const MAX_BROWSER_SKILL_RUN_MS = 15_000;
 const RELAY_HANDSHAKE_TIMEOUT_MS = 10_000;
 const RECONNECT_BACKOFF_BASE_MS = 250;
 const RECONNECT_BACKOFF_MAX_MS = 5_000;
 const SAFE_DIR_MODE = 0o700;
 const SAFE_FILE_MODE = 0o600;
+const SAFE_INSTALL_FILE_MAX_MODE = 0o755;
+const DEFAULT_CHILD_KILL_GRACE_MS = 250;
 const HOST_BROKER_RELAY_URL_ENV = "QM_HOST_BROKER_RELAY_URL";
 const HOST_BROKER_RELAY_WSS_PATH_ENV = "QM_HOST_BROKER_RELAY_WSS_PATH";
+const HOST_BROKER_BSK_EXECUTABLE_ENV = "QM_HOST_BROKER_BSK_EXECUTABLE";
+const HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE = "browser-skill-executable.txt";
 
 export const HOST_BROKER_CONTROL_NOTICE =
   "QM controls the browser on this device. The browser profile is shared across this deployment.";
@@ -66,6 +81,8 @@ export interface HostBrokerStateSnapshot {
   qmUrl: string | null;
   relayUrl: string | null;
   deploymentCanonicalId: string | null;
+  negotiatedProtocolVersion: string | null;
+  negotiatedPolicyGrammarVersion: string | null;
   brokerStatus: "ready" | "paused" | "disconnected";
   browserSkillStatus: "ready" | "offline";
   currentTaskPresent: boolean;
@@ -112,6 +129,12 @@ export interface HostBrokerConnectionOptions {
   supportedPolicyGrammarVersions: string[];
   identity: DeviceIdentity;
   runtime: BrowserRuntimeMetadata;
+  dataDir?: string;
+  deviceId?: string;
+  browserSkillExecutable?: string;
+  sessionRunner?: HostBrokerSessionRunner;
+  maxBrowserSkillOutputBytes?: number;
+  browserSkillTimeoutMs?: number;
   connectionEpoch?: number | null;
   publicDeviceFingerprint?: string | null;
   confirmationFingerprint?: string | null;
@@ -122,6 +145,21 @@ export interface HostBrokerConnectionOptions {
   scheduler?: HostBrokerScheduler;
   processEpoch?: number | null;
   onStateChange?: (state: HostBrokerStateSnapshot) => void;
+  writeObserver?: HostBrokerWriteObserver;
+}
+
+export interface HostBrokerWriteObserver {
+  onFenceCreated?(fence: HostOperationFence): void;
+  onFenceSaved?(fence: HostOperationFence): void;
+  onSessionOwnershipSaved(record: {
+    taskId: string;
+    attemptId: string;
+    operationId: string;
+    requestHash: string;
+    sessionId: string;
+    browserInstanceId: string;
+    agentWindowId: number;
+  }): void;
 }
 
 export interface HostBrokerCliDeps {
@@ -133,6 +171,9 @@ export interface HostBrokerCliDeps {
   brokerVersion?: string;
   resolveRelayUrl?: (qmUrl: string) => string;
   runtime?: BrowserRuntimeMetadata;
+  deviceId?: string;
+  browserSkillExecutable?: string;
+  sessionRunner?: HostBrokerSessionRunner;
   signal?: AbortSignal;
   scheduler?: HostBrokerScheduler;
   reconnectBaseMs?: number;
@@ -144,6 +185,51 @@ export interface HostBrokerScheduler {
   random(): number;
   setTimeout(callback: () => void, ms: number): HostBrokerTimer;
   clearTimeout(timer: HostBrokerTimer): void;
+}
+
+export interface HostBrokerSessionRunOptions {
+  shell: false;
+  stdio: ["ignore", "pipe", "pipe"];
+}
+
+export interface HostBrokerSessionRunResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+export interface HostBrokerSessionRunControl {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface HostBrokerSessionRunHandle {
+  result: Promise<HostBrokerSessionRunResult>;
+  cancel(reason?: Error): Promise<void>;
+}
+
+export interface HostBrokerSessionRunner {
+  run(
+    executable: string,
+    argv: readonly string[],
+    options: HostBrokerSessionRunOptions,
+    control?: HostBrokerSessionRunControl,
+  ): Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle;
+}
+
+export interface ResolveInstalledBrowserSkillExecutableOptions {
+  env?: NodeJS.ProcessEnv;
+  installRoot: string;
+}
+
+export interface CreateDefaultHostBrokerSessionRunnerOptions {
+  spawn?: typeof spawn;
+  defaultTimeoutMs?: number;
+  maxOutputBytes?: number;
+  killGraceMs?: number;
+  closeGraceMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 }
 
 type HostBrokerTimer = ReturnType<typeof setTimeout>;
@@ -168,8 +254,35 @@ interface RegistrationTupleBinding {
   now?: number;
 }
 
+type PersistedHostTerminalPayload =
+  | {
+      dispatchId?: string;
+      operationId?: string;
+      outcome: "completed";
+      resultHash?: string;
+      result: DesktopBrowserSessionStartResult;
+    }
+  | {
+      dispatchId?: string;
+      operationId?: string;
+      outcome: "failed" | "unknown";
+      resultHash?: string;
+      error?: DesktopBrowserHostFailure;
+    };
+
+interface HostOperationFence {
+  operationId: string;
+  requestHash: string;
+  taskId: string;
+  attemptId: string;
+  state: "accepted" | "completed" | "failed" | "unknown";
+  terminalPayload?: PersistedHostTerminalPayload;
+}
+
 const DEVICE_KEY_FILE = "device-key.json";
 const STATE_FILE = "state.json";
+const OPERATIONS_DIR = "operations";
+const SESSIONS_DIR = "sessions";
 const DEFAULT_RUNTIME: BrowserRuntimeMetadata = {
   browserInstanceId: "unbound",
   browserSkillStatus: "offline",
@@ -192,6 +305,13 @@ class RetryableHostBrokerError extends Error {
     super(message);
     this.name = "RetryableHostBrokerError";
     this.ready = ready;
+  }
+}
+
+export class HostBrokerSpawnRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HostBrokerSpawnRejectedError";
   }
 }
 
@@ -276,6 +396,358 @@ function stateFilePath(dataDir: string): string {
   return join(dataDir, STATE_FILE);
 }
 
+function localRecordPath(dataDir: string, directory: string, identity: string): string {
+  const digest = createHash("sha256").update(identity).digest("hex");
+  return join(dataDir, directory, `${digest}.json`);
+}
+
+function operationFencePath(dataDir: string, operationId: string): string {
+  return localRecordPath(dataDir, OPERATIONS_DIR, operationId);
+}
+
+function sessionOwnershipPath(dataDir: string, taskId: string): string {
+  return localRecordPath(dataDir, SESSIONS_DIR, taskId);
+}
+
+function loadOperationFence(dataDir: string, operationId: string): HostOperationFence | null {
+  return readJsonFile<HostOperationFence>(operationFencePath(dataDir, operationId));
+}
+
+function saveOperationFence(dataDir: string, fence: HostOperationFence): void {
+  atomicWriteText(operationFencePath(dataDir, fence.operationId), `${JSON.stringify(fence)}\n`, SAFE_FILE_MODE);
+}
+
+function createOperationFence(dataDir: string, fence: HostOperationFence): boolean {
+  const filePath = operationFencePath(dataDir, fence.operationId);
+  assertSafeDirectory(dirname(filePath));
+  let fd: number;
+  try {
+    fd = openSync(
+      filePath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+      SAFE_FILE_MODE,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, `${JSON.stringify(fence)}\n`, "utf8");
+    fsyncSync(fd);
+    chmodSync(filePath, SAFE_FILE_MODE);
+  } finally {
+    closeSync(fd);
+  }
+  const dirFd = openSync(dirname(filePath), "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+  assertSafeFile(filePath, SAFE_FILE_MODE);
+  return true;
+}
+
+function assertSafeInstallOwnedFile(path: string): void {
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink()) throw new Error(`refusing symbolic link path ${JSON.stringify(path)}`);
+  if (!stats.isFile()) throw new Error(`expected regular file at ${JSON.stringify(path)}`);
+  if ((stats.mode & 0o022) !== 0) {
+    throw new Error(`file ${JSON.stringify(path)} must not be writable by group or others`);
+  }
+  if ((stats.mode & 0o777) > SAFE_INSTALL_FILE_MAX_MODE) {
+    throw new Error(`file ${JSON.stringify(path)} uses an unsafe mode`);
+  }
+  const currentUid = process.getuid?.();
+  if (currentUid !== undefined && stats.uid !== currentUid && stats.uid !== 0) {
+    throw new Error(`file ${JSON.stringify(path)} must be owned by the current user or root`);
+  }
+}
+
+function assertSafeExecutableFile(path: string): void {
+  if (!isAbsolute(path)) throw new Error("BrowserSkill executable path must be absolute");
+  assertSafeInstallOwnedFile(path);
+  try {
+    accessSync(path, fsConstants.X_OK);
+  } catch {
+    throw new Error(`BrowserSkill executable is not executable at ${path}`);
+  }
+}
+
+function normalizeInstalledExecutablePath(text: string): string {
+  const executable = text.trim();
+  if (!executable) throw new Error("BrowserSkill executable config is empty");
+  if (!isAbsolute(executable)) throw new Error("BrowserSkill executable path must be absolute");
+  return executable;
+}
+
+function normalizeBrowserSkillExecutable(
+  executable: string | undefined,
+  sessionRunner: HostBrokerSessionRunner | undefined,
+): string {
+  if (executable === undefined) {
+    if (!sessionRunner) {
+      throw new Error("BrowserSkill executable is required when using the default host broker session runner");
+    }
+    return "";
+  }
+  assertSafeExecutableFile(executable);
+  return executable;
+}
+
+export function resolveInstalledBrowserSkillExecutable(options: ResolveInstalledBrowserSkillExecutableOptions): string {
+  const env = options.env ?? process.env;
+  if (env[HOST_BROKER_BSK_EXECUTABLE_ENV]?.trim()) {
+    throw new Error(
+      `${HOST_BROKER_BSK_EXECUTABLE_ENV} is removed; configure ${HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE}`,
+    );
+  }
+  const configPath = join(options.installRoot, HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE);
+  if (!existsSync(configPath)) {
+    throw new Error(`BrowserSkill executable config is missing at ${JSON.stringify(configPath)}`);
+  }
+  assertSafeInstallOwnedFile(configPath);
+  const executable = normalizeInstalledExecutablePath(readFileSync(configPath, "utf8"));
+  assertSafeExecutableFile(executable);
+  return executable;
+}
+
+function isSessionRunHandle(
+  value: Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle,
+): value is HostBrokerSessionRunHandle {
+  return typeof value === "object" && value !== null && "result" in value && "cancel" in value;
+}
+
+function normalizeSessionRunHandle(
+  value: Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle,
+): HostBrokerSessionRunHandle {
+  if (isSessionRunHandle(value)) return value;
+  return {
+    result: value,
+    async cancel() {},
+  };
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("host result contains a non-JSON value");
+}
+
+function computeHostResultHash(value: unknown): string {
+  return `sha256:${createHash("sha256").update(stableJson(value)).digest("hex")}`;
+}
+
+function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): DesktopBrowserSessionStartResult {
+  if (Buffer.byteLength(stdout, "utf8") > maxBytes) throw new Error("BrowserSkill output exceeded the maximum size");
+  const raw: unknown = JSON.parse(stdout);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("BrowserSkill session start output must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  if (typeof record.session_id !== "string" || record.session_id.length === 0 || /\s/.test(record.session_id)) {
+    throw new Error("BrowserSkill session start output has an invalid session_id");
+  }
+  if (
+    typeof record.browser_instance_id !== "string" ||
+    record.browser_instance_id.length === 0 ||
+    /\s/.test(record.browser_instance_id)
+  ) {
+    throw new Error("BrowserSkill session start output has an invalid browser_instance_id");
+  }
+  if (!Number.isSafeInteger(record.agent_window_id) || (record.agent_window_id as number) < 0) {
+    throw new Error("BrowserSkill session start output has an invalid agent_window_id");
+  }
+  return Object.freeze({
+    session_id: record.session_id,
+    browser_instance_id: record.browser_instance_id,
+    agent_window_id: record.agent_window_id as number,
+  });
+}
+
+function classifyAcceptedFailure(error: unknown): {
+  state: "failed" | "unknown";
+  terminalPayload: PersistedHostTerminalPayload;
+} {
+  if (error instanceof HostBrokerSpawnRejectedError) {
+    return {
+      state: "failed",
+      terminalPayload: {
+        outcome: "failed",
+        error: {
+          code: "browser_cli_spawn_rejected",
+          message: error.message,
+        },
+      },
+    };
+  }
+  const unknownError = error instanceof Error ? error : new Error(String(error));
+  return {
+    state: "unknown",
+    terminalPayload: {
+      outcome: "unknown",
+      error: {
+        code: "host_operation_unknown",
+        message: unknownError.message,
+      },
+    },
+  };
+}
+
+export function createDefaultHostBrokerSessionRunner(
+  options: CreateDefaultHostBrokerSessionRunnerOptions = {},
+): HostBrokerSessionRunner {
+  const spawnProcess = options.spawn ?? spawn;
+  const setTimer = options.setTimeout ?? setTimeout;
+  const clearTimer = options.clearTimeout ?? clearTimeout;
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
+  const maxOutputBytes = options.maxOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
+  const killGraceMs = options.killGraceMs ?? DEFAULT_CHILD_KILL_GRACE_MS;
+  const closeGraceMs = options.closeGraceMs ?? killGraceMs;
+  return {
+    run(executable, argv, runOptions, control) {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawnProcess(executable, [...argv], runOptions);
+      } catch (error) {
+        return {
+          result: Promise.reject(
+            new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)),
+          ),
+          async cancel() {},
+        };
+      }
+      if (!child.stdout || !child.stderr) {
+        return {
+          result: Promise.reject(new HostBrokerSpawnRejectedError("BrowserSkill pipes were not available")),
+          async cancel() {},
+        };
+      }
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let outputBytes = 0;
+      let settled = false;
+      let finish: (() => void) | null = null;
+      let rejectResult: ((error: Error) => void) | null = null;
+      let terminationReason: Error | null = null;
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let closeTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearTerminationTimers = (): void => {
+        if (timeoutTimer !== null) {
+          clearTimer(timeoutTimer);
+          timeoutTimer = null;
+        }
+        if (killTimer !== null) {
+          clearTimer(killTimer);
+          killTimer = null;
+        }
+        if (closeTimer !== null) {
+          clearTimer(closeTimer);
+          closeTimer = null;
+        }
+      };
+      const cleanupAbortListener = (): void => {
+        control?.signal?.removeEventListener("abort", onAbort);
+      };
+      const settleRejection = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTerminationTimers();
+        cleanupAbortListener();
+        rejectResult?.(error);
+        finish?.();
+      };
+      const settleResolution = (exitCode: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTerminationTimers();
+        cleanupAbortListener();
+        if (terminationReason) {
+          rejectResult?.(terminationReason);
+        } else {
+          finish?.();
+        }
+        if (!terminationReason && exitCode !== null) {
+          resolveResult({
+            exitCode,
+            stdout: Buffer.concat(stdout).toString("utf8"),
+            stderr: Buffer.concat(stderr).toString("utf8"),
+          });
+        } else if (!terminationReason && exitCode === null) {
+          rejectResult?.(new Error("BrowserSkill session start terminated"));
+        }
+      };
+      let resolveResult!: (value: HostBrokerSessionRunResult) => void;
+      const result = new Promise<HostBrokerSessionRunResult>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = (error) => reject(error);
+        finish = () => {};
+      });
+      const terminate = (reason: Error): Promise<void> => {
+        if (!terminationReason) {
+          terminationReason = reason;
+          if (!settled) {
+            void child.kill("SIGTERM");
+            killTimer = setTimer(() => {
+              void child.kill("SIGKILL");
+              closeTimer = setTimer(() => {
+                settleRejection(new Error("BrowserSkill session start failed to terminate after SIGKILL"));
+              }, closeGraceMs);
+            }, killGraceMs);
+          }
+        }
+        return result.then(
+          () => undefined,
+          (error) => {
+            if (error === terminationReason) return;
+            throw error;
+          },
+        );
+      };
+      const collect = (chunks: Buffer[], chunk: Buffer): void => {
+        outputBytes += chunk.length;
+        if (outputBytes > maxOutputBytes) {
+          void terminate(new Error("BrowserSkill output exceeded the maximum size"));
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onAbort = (): void => {
+        void terminate(new Error("BrowserSkill session start cancelled"));
+      };
+      child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+      child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+      child.once("error", (error) => {
+        settleRejection(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
+      });
+      child.once("close", (exitCode) => {
+        settleResolution(exitCode);
+      });
+      control?.signal?.addEventListener("abort", onAbort, { once: true });
+      timeoutTimer = setTimer(() => {
+        void terminate(new Error("BrowserSkill session start timed out"));
+      }, control?.timeoutMs ?? defaultTimeoutMs);
+      return {
+        result,
+        cancel(reason) {
+          return terminate(reason ?? new Error("BrowserSkill session start cancelled"));
+        },
+      };
+    },
+  };
+}
+
+const DEFAULT_SESSION_RUNNER = createDefaultHostBrokerSessionRunner();
+
 function identityFromPrivateKeyPem(privateKeyPem: string): DeviceIdentity {
   const privateKey = createPrivateKey(privateKeyPem);
   const publicKey = createPublicKey(privateKey);
@@ -317,6 +789,8 @@ function createInitialState(input: {
   qmUrl: string | null;
   relayUrl: string | null;
   deploymentCanonicalId: string | null;
+  negotiatedProtocolVersion?: string | null;
+  negotiatedPolicyGrammarVersion?: string | null;
   brokerInstanceId: string;
   browserInstanceId: string | null;
   browserSkillStatus: "ready" | "offline";
@@ -330,6 +804,8 @@ function createInitialState(input: {
     qmUrl: input.qmUrl,
     relayUrl: input.relayUrl,
     deploymentCanonicalId: input.deploymentCanonicalId,
+    negotiatedProtocolVersion: input.negotiatedProtocolVersion ?? null,
+    negotiatedPolicyGrammarVersion: input.negotiatedPolicyGrammarVersion ?? null,
     brokerStatus: "disconnected",
     browserSkillStatus: input.browserSkillStatus,
     currentTaskPresent: false,
@@ -398,6 +874,8 @@ function renderHumanState(state: HostBrokerStateSnapshot): string {
     `QM URL: ${state.qmUrl ?? "unconfigured"}`,
     `Relay URL: ${state.relayUrl ?? "unconfigured"}`,
     `Deployment: ${state.deploymentCanonicalId ?? "unbound"}`,
+    `Negotiated protocol: ${state.negotiatedProtocolVersion ?? "pending handshake"}`,
+    `Negotiated policy grammar: ${state.negotiatedPolicyGrammarVersion ?? "pending handshake"}`,
     `Broker status: ${state.brokerStatus}`,
     `BrowserSkill status: ${state.browserSkillStatus}`,
     `Broker instance: ${state.brokerInstanceId}`,
@@ -530,6 +1008,147 @@ function applyAuthoritativeChallengeBinding(
   if (payload.brokerInstanceId) state.brokerInstanceId = payload.brokerInstanceId;
   if (payload.browserInstanceId) state.browserInstanceId = payload.browserInstanceId;
   if (payload.connectionEpoch) state.connectionEpoch = payload.connectionEpoch;
+}
+
+function currentCapabilitySet(
+  runtime: BrowserRuntimeMetadata,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+) {
+  return {
+    protocolVersion: negotiatedProtocolVersion,
+    policyGrammarVersion: negotiatedPolicyGrammarVersion,
+    bskVersion: runtime.bskVersion,
+    extensionVersion: runtime.extensionVersion,
+    cliShapeHash: runtime.cliShapeHash,
+  };
+}
+
+function assertSessionStartAuthorityBindings(
+  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+  deviceId: string | null,
+  runtime: BrowserRuntimeMetadata,
+  state: HostBrokerStateSnapshot,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+  now: number,
+): void {
+  if (authority.audience !== DESKTOP_BROWSER_RELAY_AUDIENCE) throw new Error("authority audience is not the relay");
+  if (!state.deploymentCanonicalId || authority.deploymentCanonicalId !== state.deploymentCanonicalId) {
+    throw new Error("authority deployment does not match the authoritative relay binding");
+  }
+  if (!deviceId || authority.deviceId !== deviceId) {
+    throw new Error("authority device does not match the local host binding");
+  }
+  if (
+    authority.browserInstanceId !== runtime.browserInstanceId ||
+    authority.browserInstanceId !== state.browserInstanceId
+  ) {
+    throw new Error("authority browser does not match the live host runtime");
+  }
+  const expectedCapabilitySet = currentCapabilitySet(
+    runtime,
+    negotiatedProtocolVersion,
+    negotiatedPolicyGrammarVersion,
+  );
+  if (stableJson(authority.capabilitySet) !== stableJson(expectedCapabilitySet)) {
+    throw new Error("authority capability set does not exactly match the live host runtime");
+  }
+  if (Date.parse(authority.issuedAt) > now) throw new Error("authority lease is not valid yet");
+  if (Date.parse(authority.leaseExpiresAt) <= now) throw new Error("authority lease expired before acceptance");
+}
+
+function assertSessionStartRequestHash(
+  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+  requestHash: string,
+  negotiatedProtocolVersion: string,
+  negotiatedPolicyGrammarVersion: string,
+): void {
+  const canonicalRequestHash = computeDesktopBrowserRequestHash(
+    authority,
+    negotiatedProtocolVersion,
+    negotiatedPolicyGrammarVersion,
+  );
+  if (canonicalRequestHash !== requestHash) {
+    throw new Error("relay.invoke request hash does not match the locally recomputed authority hash");
+  }
+}
+
+function accepted(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  requestHash: string,
+): HostAcceptedMessage {
+  return {
+    protocolVersion,
+    kind: "host.accepted",
+    payload: {
+      dispatchId,
+      operationId,
+      requestHash,
+    },
+  };
+}
+
+function materializeHostResultPayload(
+  dispatchId: string,
+  operationId: string,
+  terminalPayload: PersistedHostTerminalPayload,
+): HostResultMessage["payload"] {
+  if (terminalPayload.outcome === "completed") {
+    return {
+      dispatchId,
+      operationId,
+      outcome: "completed",
+      resultHash: computeHostResultHash({
+        dispatchId,
+        operationId,
+        outcome: "completed",
+        result: terminalPayload.result,
+      }),
+      result: terminalPayload.result,
+    };
+  }
+  return {
+    dispatchId,
+    operationId,
+    outcome: terminalPayload.outcome,
+    resultHash: computeHostResultHash({
+      dispatchId,
+      operationId,
+      outcome: terminalPayload.outcome,
+      ...(terminalPayload.error === undefined ? {} : { error: terminalPayload.error }),
+    }),
+    ...(terminalPayload.error === undefined ? {} : { error: terminalPayload.error }),
+  };
+}
+
+function terminalResult(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  terminalPayload: PersistedHostTerminalPayload,
+): HostResultMessage {
+  return {
+    protocolVersion,
+    kind: "host.result",
+    payload: materializeHostResultPayload(dispatchId, operationId, terminalPayload),
+  };
+}
+
+function unknownResult(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  error?: Error,
+): HostResultMessage {
+  const errorPayload = error ? { code: "host_operation_unknown", message: error.message } : undefined;
+  return terminalResult(protocolVersion, dispatchId, operationId, {
+    dispatchId,
+    outcome: "unknown",
+    ...(errorPayload ? { error: errorPayload } : {}),
+  });
 }
 
 function defaultTransport(): HostBrokerTransport {
@@ -724,9 +1343,27 @@ export function verifyHostChallengeResponseMessage(message: HostChallengeRespons
 export class HostBrokerConnection {
   private readonly options: HostBrokerConnectionOptions;
   private readonly snapshotState: HostBrokerStateSnapshot;
+  private readonly dataDir: string | null;
+  private readonly deviceId: string | null;
+  private readonly browserSkillExecutable: string;
+  private readonly sessionRunner: HostBrokerSessionRunner;
+  private readonly maxBrowserSkillOutputBytes: number;
+  private readonly browserSkillTimeoutMs: number;
+  private readonly writeObserver: HostBrokerWriteObserver | null;
+  private readonly activeSessionRuns = new Set<HostBrokerSessionRunHandle>();
 
   constructor(options: HostBrokerConnectionOptions) {
     this.options = options;
+    this.dataDir = options.dataDir ?? null;
+    this.deviceId = options.deviceId ?? null;
+    this.browserSkillExecutable = normalizeBrowserSkillExecutable(
+      options.browserSkillExecutable,
+      options.sessionRunner,
+    );
+    this.sessionRunner = options.sessionRunner ?? DEFAULT_SESSION_RUNNER;
+    this.maxBrowserSkillOutputBytes = options.maxBrowserSkillOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
+    this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
+    this.writeObserver = options.writeObserver ?? null;
     this.snapshotState = createInitialState({
       qmUrl: options.qmUrl,
       relayUrl: options.relayUrl,
@@ -750,6 +1387,199 @@ export class HostBrokerConnection {
     this.options.onStateChange?.(this.snapshot());
   }
 
+  private async handleRelayInvocation(input: {
+    raw: string;
+    socket: HostBrokerSocket;
+    protocolVersion: `${number}.${number}`;
+    policyGrammarVersion: string;
+    now: () => number;
+    isActive: () => boolean;
+    signal: AbortSignal;
+  }): Promise<void> {
+    const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
+    if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
+    if (!this.dataDir) throw new Error("host operation state directory is not configured");
+    assertSessionStartAuthorityBindings(
+      decoded.payload.authority,
+      this.deviceId,
+      this.options.runtime,
+      this.snapshotState,
+      input.protocolVersion,
+      input.policyGrammarVersion,
+      input.now(),
+    );
+    assertSessionStartRequestHash(
+      decoded.payload.authority,
+      decoded.payload.requestHash,
+      input.protocolVersion,
+      input.policyGrammarVersion,
+    );
+    const message = decoded;
+
+    const dataDir = this.dataDir!;
+    const authority = message.payload.authority;
+    const acceptedMessage = accepted(
+      input.protocolVersion,
+      message.payload.dispatchId,
+      authority.operationId,
+      message.payload.requestHash,
+    );
+    let existingFence = loadOperationFence(dataDir, authority.operationId);
+    if (existingFence) {
+      if (existingFence.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+        input.socket.send(
+          encodeDesktopBrowserMessage(
+            terminalResult(
+              input.protocolVersion,
+              message.payload.dispatchId,
+              authority.operationId,
+              existingFence.terminalPayload,
+            ),
+          ),
+        );
+        return;
+      }
+      if (existingFence.requestHash !== message.payload.requestHash) {
+        throw new Error("operationId is already bound to a different request hash");
+      }
+      input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+      const unknown = unknownResult(input.protocolVersion, message.payload.dispatchId, authority.operationId);
+      input.socket.send(encodeDesktopBrowserMessage(unknown));
+      return;
+    }
+
+    const fence: HostOperationFence = {
+      operationId: authority.operationId,
+      requestHash: message.payload.requestHash,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      state: "accepted",
+    };
+    if (!createOperationFence(dataDir, fence)) {
+      existingFence = loadOperationFence(dataDir, authority.operationId);
+      if (existingFence?.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+        input.socket.send(
+          encodeDesktopBrowserMessage(
+            terminalResult(
+              input.protocolVersion,
+              message.payload.dispatchId,
+              authority.operationId,
+              existingFence.terminalPayload,
+            ),
+          ),
+        );
+        return;
+      }
+      if (existingFence && existingFence.requestHash !== message.payload.requestHash) {
+        throw new Error("operationId is already bound to a different request hash");
+      }
+      input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+      input.socket.send(
+        encodeDesktopBrowserMessage(
+          unknownResult(
+            input.protocolVersion,
+            message.payload.dispatchId,
+            authority.operationId,
+            new Error("operation was fenced concurrently and cannot be spawned again"),
+          ),
+        ),
+      );
+      return;
+    }
+    this.writeObserver?.onFenceCreated?.(fence);
+    this.snapshotState.currentTaskPresent = true;
+    this.emitState();
+    input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+    let completedPersisted = false;
+    const runHandle = normalizeSessionRunHandle(
+      this.sessionRunner.run(
+        this.browserSkillExecutable,
+        authority.argv,
+        {
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+        {
+          signal: input.signal,
+          timeoutMs: this.browserSkillTimeoutMs,
+        },
+      ),
+    );
+    this.activeSessionRuns.add(runHandle);
+    try {
+      const runResult = await runHandle.result;
+      if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
+      const result = parseBrowserSkillSessionStartResult(runResult.stdout, this.maxBrowserSkillOutputBytes);
+      if (result.browser_instance_id !== authority.browserInstanceId) {
+        throw new Error("BrowserSkill returned a browser outside the authority binding");
+      }
+      const completedTerminalPayload: PersistedHostTerminalPayload = {
+        dispatchId: message.payload.dispatchId,
+        outcome: "completed",
+        result,
+      };
+      const completed = terminalResult(
+        input.protocolVersion,
+        message.payload.dispatchId,
+        authority.operationId,
+        completedTerminalPayload,
+      );
+      const sessionOwnership = {
+        taskId: authority.taskId,
+        attemptId: authority.attemptId,
+        operationId: authority.operationId,
+        requestHash: message.payload.requestHash,
+        sessionId: result.session_id,
+        browserInstanceId: result.browser_instance_id,
+        agentWindowId: result.agent_window_id,
+      };
+      atomicWriteText(
+        sessionOwnershipPath(dataDir, authority.taskId),
+        `${JSON.stringify(sessionOwnership)}\n`,
+        SAFE_FILE_MODE,
+      );
+      this.writeObserver?.onSessionOwnershipSaved(sessionOwnership);
+      const completedFence = {
+        ...fence,
+        state: "completed" as const,
+        terminalPayload: completedTerminalPayload,
+      };
+      saveOperationFence(dataDir, completedFence);
+      completedPersisted = true;
+      this.writeObserver?.onFenceSaved?.(completedFence);
+      if (!input.isActive()) return;
+      input.socket.send(encodeDesktopBrowserMessage(completed));
+      return;
+    } catch (error) {
+      if (completedPersisted) throw error;
+      const failure = classifyAcceptedFailure(error);
+      const terminal = terminalResult(
+        input.protocolVersion,
+        message.payload.dispatchId,
+        authority.operationId,
+        failure.terminalPayload,
+      );
+      const failedFence = {
+        ...fence,
+        state: failure.state,
+        terminalPayload: {
+          dispatchId: message.payload.dispatchId,
+          ...failure.terminalPayload,
+        },
+      };
+      saveOperationFence(dataDir, failedFence);
+      this.writeObserver?.onFenceSaved?.(failedFence);
+      if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(terminal));
+      return;
+    } finally {
+      this.activeSessionRuns.delete(runHandle);
+      this.snapshotState.currentTaskPresent = false;
+      this.emitState();
+    }
+  }
+
   start(): Promise<HostBrokerConnectionRunResult> {
     assertSecureRelayUrl(this.options.relayUrl);
     assertConnectableRuntime(this.options.runtime);
@@ -768,9 +1598,12 @@ export class HostBrokerConnection {
     return new Promise<HostBrokerConnectionRunResult>((resolve, reject) => {
       let settled = false;
       let challenged = false;
+      let negotiatedProtocolVersion: `${number}.${number}` | null = null;
+      let negotiatedPolicyGrammarVersion: string | null = null;
       let handshakeComplete = false;
       let active = true;
       let locallyRequestedStop = false;
+      const invocationAbortController = new AbortController();
       const handshakeTimeout = scheduler.setTimeout(() => {
         finish(
           undefined,
@@ -804,15 +1637,65 @@ export class HostBrokerConnection {
           if (Buffer.byteLength(raw, "utf8") > (this.options.maxMessageBytes ?? MAX_RELAY_MESSAGE_BYTES)) {
             throw new Error("relay message exceeded the maximum allowed size");
           }
-          const message = decodeDesktopBrowserMessage(raw, this.options.supportedProtocolVersions[0]);
+          const rawEnvelope = JSON.parse(raw) as {
+            kind?: unknown;
+            payload?: { policyGrammarVersion?: unknown };
+          };
+          if (challenged) {
+            if (rawEnvelope.kind === "relay.invoke") {
+              if (!negotiatedProtocolVersion) {
+                throw new Error("relay invoke arrived without an exact negotiated protocol version");
+              }
+              if (!negotiatedPolicyGrammarVersion) {
+                throw new Error("relay connection does not identify one exact negotiated policy grammar");
+              }
+              void this.handleRelayInvocation({
+                raw,
+                socket,
+                protocolVersion: negotiatedProtocolVersion,
+                policyGrammarVersion: negotiatedPolicyGrammarVersion,
+                now: () => scheduler.now(),
+                isActive: () => active,
+                signal: invocationAbortController.signal,
+              }).catch((error: unknown) => {
+                finish(undefined, error instanceof Error ? error : new Error(String(error)));
+              });
+              return;
+            }
+          }
+          const message = decodeDesktopBrowserMessage(
+            raw,
+            negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
+          );
           if (message.kind === "relay.challenge") {
             if (challenged) throw new Error("relay sent multiple challenge messages for one host registration");
+            if (!this.options.supportedProtocolVersions.includes(message.protocolVersion)) {
+              throw new Error("relay challenge protocol version was not advertised by this host");
+            }
             assertTrustedRelayChallenge(message.payload, this.snapshotState);
             const response = createHostChallengeResponse(this.options.identity, message);
             if (!verifyHostChallengeResponseMessage(response)) {
               throw new Error("host challenge response failed local signature verification");
             }
             applyAuthoritativeChallengeBinding(this.snapshotState, message.payload);
+            negotiatedProtocolVersion = message.protocolVersion;
+            this.snapshotState.negotiatedProtocolVersion = message.protocolVersion;
+            const authoritativePolicyGrammarVersion = rawEnvelope.payload?.policyGrammarVersion;
+            if (authoritativePolicyGrammarVersion !== undefined) {
+              if (
+                typeof authoritativePolicyGrammarVersion !== "string" ||
+                !this.options.supportedPolicyGrammarVersions.includes(authoritativePolicyGrammarVersion)
+              ) {
+                throw new Error("relay challenge policy grammar version was not advertised by this host");
+              }
+              negotiatedPolicyGrammarVersion = authoritativePolicyGrammarVersion;
+            } else {
+              negotiatedPolicyGrammarVersion =
+                this.options.supportedPolicyGrammarVersions.length === 1
+                  ? this.options.supportedPolicyGrammarVersions[0]!
+                  : null;
+            }
+            this.snapshotState.negotiatedPolicyGrammarVersion = negotiatedPolicyGrammarVersion;
             socket.send(encodeDesktopBrowserMessage(response));
             challenged = true;
             clearHandshakeTimeout();
@@ -820,10 +1703,8 @@ export class HostBrokerConnection {
             this.emitState();
             return;
           }
-          if (message.kind === "relay.invoke") {
-            if (!challenged) throw new Error("relay invoke arrived before the host challenge completed");
-            throw new Error("host broker operation handling is not implemented");
-          }
+          if (message.kind === "relay.invoke")
+            throw new Error("relay invoke arrived before the host challenge completed");
           throw new Error(`unsupported relay message kind ${JSON.stringify(message.kind)}`);
         } catch (error) {
           finish(undefined, error instanceof Error ? error : new Error(String(error)));
@@ -875,11 +1756,32 @@ export class HostBrokerConnection {
         detachListeners();
         clearHandshakeTimeout();
         this.options.signal?.removeEventListener("abort", onAbort);
+        invocationAbortController.abort();
         if (!locallyRequestedStop) closeSocket(1000, error ? "local cleanup" : "settled");
         this.snapshotState.brokerStatus = "disconnected";
         this.emitState();
-        if (error) reject(error);
-        else resolve(result ?? { reason: "settled", ready: challenged });
+        const cancelReason = error
+          ? new Error(`BrowserSkill session start interrupted: ${error.message}`)
+          : new Error(
+              result?.reason === "stopped"
+                ? "BrowserSkill session start stopped"
+                : "BrowserSkill session start cancelled",
+            );
+        const inFlightCancels = [...this.activeSessionRuns].map((handle) => handle.cancel(cancelReason));
+        void Promise.allSettled(inFlightCancels).then((cancelResults) => {
+          const cleanupFailure = cancelResults.find((entry) => entry.status === "rejected");
+          if (cleanupFailure) {
+            const reason = cleanupFailure.reason;
+            reject(
+              new Error(
+                `Host broker terminal cleanup failed: ${reason instanceof Error ? reason.message : String(reason)}`,
+              ),
+            );
+            return;
+          }
+          if (error) reject(error);
+          else resolve(result ?? { reason: "settled", ready: challenged });
+        });
       };
       this.options.signal?.addEventListener("abort", onAbort, { once: true });
       socket.addEventListener("open", openListener);
@@ -1067,6 +1969,10 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
         identity,
         runtime,
+        dataDir: deps.dataDir,
+        deviceId: deps.deviceId,
+        browserSkillExecutable: deps.browserSkillExecutable,
+        sessionRunner: deps.sessionRunner,
         connectionEpoch: state.connectionEpoch,
         publicDeviceFingerprint: state.publicDeviceFingerprint,
         confirmationFingerprint: state.confirmationFingerprint,
