@@ -51,7 +51,7 @@ export interface ToolCredentialPath {
   kind: "file" | "directory";
 }
 
-export interface ToolProcessDescriptor {
+interface ToolProcessDescriptor {
   executableId: string;
   protocolMajor: number;
   launchSchema: Record<string, unknown>;
