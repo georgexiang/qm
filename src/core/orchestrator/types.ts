@@ -81,6 +81,9 @@ export interface OrchestratorInput extends Omit<
   actor: Principal;
   conversation: Conversation;
   origin: TurnOrigin;
+  authorityId?: string;
+  turnId?: string;
+  authorityExpiresAt?: number;
   runId?: string;
   attempt?: number;
   finalAttempt?: boolean;

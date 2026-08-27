@@ -6,6 +6,7 @@ import {
   type ToolCredentialBroker,
   type ToolCredentialPath,
   type ToolDescriptor,
+  type ToolProcessDescriptor,
 } from "./deployment-layer.ts";
 import { credentialServiceForPath } from "../credentials/resident-paths.ts";
 import type { ResidentAuthConnector } from "../credentials/resident-auth.ts";
@@ -21,6 +22,7 @@ export interface DeploymentLayerRuntime {
   splitEnvTemplates: Record<string, string>[];
   commandRules: CommandRule[];
   brokeredTools: BrokeredLayerTool[];
+  ephemeralProcesses: ToolProcessDescriptor[];
 }
 
 export interface BrokeredLayerTool {
@@ -41,6 +43,7 @@ export function emptyDeploymentLayer(): DeploymentLayerRuntime {
     splitEnvTemplates: [],
     commandRules: [],
     brokeredTools: [],
+    ephemeralProcesses: [],
   };
 }
 
@@ -75,6 +78,17 @@ function toolService(tool: ToolDescriptor, why: string): string {
 
 export function resolvedDeploymentLayer(dir: string, tools: ToolDescriptor[]): DeploymentLayerRuntime {
   assertDisjointCredentialLinks(tools);
+  const processOwners = new Map<string, string>();
+  for (const tool of tools) {
+    if (!tool.process) continue;
+    const owner = processOwners.get(tool.process.executableId);
+    if (owner) {
+      throw new Error(
+        `ephemeral process executable ID ${JSON.stringify(tool.process.executableId)} is declared by both ${JSON.stringify(owner)} and ${JSON.stringify(tool.id)}`,
+      );
+    }
+    processOwners.set(tool.process.executableId, tool.id);
+  }
   const withAuth = tools.filter((t) => t.auth);
   const brokered = withAuth.filter((t) => t.auth!.broker);
   if (brokered.length > 1) {
@@ -114,6 +128,7 @@ export function resolvedDeploymentLayer(dir: string, tools: ToolDescriptor[]): D
         broker: t.auth!.broker!,
       };
     }),
+    ephemeralProcesses: tools.flatMap((tool) => (tool.process ? [tool.process] : [])),
   };
 }
 
@@ -128,6 +143,7 @@ export function replaceDeploymentLayer(target: DeploymentLayerRuntime, source: D
     "splitEnvTemplates",
     "commandRules",
     "brokeredTools",
+    "ephemeralProcesses",
   ] as const) {
     target[key].splice(0, target[key].length, ...(source[key] as never[]));
   }

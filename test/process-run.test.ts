@@ -178,9 +178,20 @@ test("a retryable turn failure requeues the run, rethrows, and stops the heartbe
   const gate = new Promise<TurnResult>((_, reject) => {
     explode = reject;
   });
-  const orchestrator = fakeOrchestrator(() => gate);
+  const seen: OrchestratorInput[] = [];
+  const orchestrator = fakeOrchestrator((input) => {
+    seen.push(input);
+    return gate;
+  });
 
-  await runs.enqueue({ sessionId: "s1", request: turn, maxAttempts: 3 });
+  const retainedAuthorityTurn: OrchestratorInput = {
+    ...turn,
+    origin: { kind: "human" },
+    authorityId: "authority-1",
+    turnId: "turn-1",
+    authorityExpiresAt: Date.now() + 60_000,
+  };
+  await runs.enqueue({ sessionId: "s1", request: retainedAuthorityTurn, maxAttempts: 3 });
   const run = await runs.claim("w1", 9_000);
   const pending = processRun({ runs, orchestrator, leaseTtlMs: 9_000 }, run!);
 
@@ -202,7 +213,6 @@ test("a retryable turn failure requeues the run, rethrows, and stops the heartbe
   const retried = await runs.claim("w2", 9_000);
   assert.equal(retried?.id, run!.id, "another worker can pick the requeued run up");
 
-  const seen: OrchestratorInput[] = [];
   await processRun(
     {
       runs,
@@ -215,9 +225,17 @@ test("a retryable turn failure requeues the run, rethrows, and stops the heartbe
     retried!,
   );
   assert.equal(
-    seen[0]?.attempt,
+    seen[1]?.attempt,
     2,
     "the retry carries its attempt number so the orchestrator can resume the interrupted turn",
+  );
+  assert.deepEqual(
+    [seen[0]?.authorityId, seen[0]?.turnId, seen[0]?.authorityExpiresAt, seen[0]?.runId],
+    ["authority-1", "turn-1", retainedAuthorityTurn.authorityExpiresAt, run!.id],
+  );
+  assert.deepEqual(
+    [seen[1]?.authorityId, seen[1]?.turnId, seen[1]?.authorityExpiresAt, seen[1]?.runId],
+    ["authority-1", "turn-1", retainedAuthorityTurn.authorityExpiresAt, run!.id],
   );
 });
 

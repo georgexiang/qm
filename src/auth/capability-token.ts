@@ -20,6 +20,10 @@ type BlobTransferClaims = CapabilityClaims & { aud: typeof BLOB_TRANSFER_AUD; bl
 
 export interface CapabilityClaims {
   actorId: string;
+  authorityId?: string;
+  sessionId?: string;
+  turnId?: string;
+  runId?: string;
   aud?: string;
   scopeId: ScopeId;
   scopeVersion?: string;
@@ -42,6 +46,12 @@ export interface CapabilityClaims {
   threadRef?: string;
   exp: number;
 }
+
+export type RetainedAuthorityCapabilityClaims = CapabilityClaims & {
+  authorityId: string;
+  sessionId: string;
+  turnId: string;
+};
 
 export function mintCapabilityToken(claims: CapabilityClaims, secret: string): Promise<string> {
   return mintSignedPayload({ orgId: configOrgId(), ...claims }, secret);
@@ -73,6 +83,10 @@ export async function verifyCapabilityToken(
     return null;
   }
   if (claims.timezone !== undefined && !isValidCapabilityTimezone(claims.timezone)) return null;
+  if (claims.authorityId !== undefined && (typeof claims.authorityId !== "string" || !claims.authorityId)) return null;
+  if (claims.sessionId !== undefined && (typeof claims.sessionId !== "string" || !claims.sessionId)) return null;
+  if (claims.turnId !== undefined && (typeof claims.turnId !== "string" || !claims.turnId)) return null;
+  if (claims.runId !== undefined && (typeof claims.runId !== "string" || !claims.runId)) return null;
   if (claims.scopeVersion !== undefined && typeof claims.scopeVersion !== "string") return null;
   if (claims.destinations !== undefined && !Array.isArray(claims.destinations)) return null;
   if (claims.credentials !== undefined && !Array.isArray(claims.credentials)) return null;
@@ -89,6 +103,16 @@ export async function verifyCapabilityToken(
   if (claims.drop !== undefined && typeof claims.drop !== "string") return null;
   if (now >= claims.exp) return null;
   return claims;
+}
+
+export async function verifyRetainedAuthorityCapability(
+  token: string,
+  secret: string | string[],
+  now: number = Date.now(),
+): Promise<RetainedAuthorityCapabilityClaims | null> {
+  const claims = await verifyCapabilityToken(token, secret, now);
+  if (!claims?.authorityId || !claims.sessionId || !claims.turnId) return null;
+  return claims as RetainedAuthorityCapabilityClaims;
 }
 
 const BLOB_ID = /^[0-9a-f]{32}$/;

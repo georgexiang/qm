@@ -11,6 +11,19 @@ function row(call: unknown, result?: unknown): ToolRowModel {
   return { call: act(1, "tool_call", call), result: result === undefined ? null : act(2, "tool_result", result) };
 }
 
+test("Desktop Browser waiting state remains one updateable activity item", () => {
+  const activity = act(1, "desktop_browser_task", {
+    taskId: "task-1",
+    status: "waiting_for_broker",
+    connectCommand: "qm-host-broker connect https://qm.example.com",
+    actionAuthority: "turn-authority",
+    actions: ["cancel"],
+  });
+  const items = buildTimeline({ status: "complete", activity: [activity] });
+
+  assert.deepEqual(items, [{ kind: "desktop_browser", activity }]);
+});
+
 test("thinking, tool calls, and results stay in seq order — never bucketed by type", () => {
   const work: WorkBlock = {
     status: "complete",

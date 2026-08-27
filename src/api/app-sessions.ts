@@ -1,4 +1,4 @@
-import type { PendingApprovalRecord } from "../types.ts";
+import type { PendingApprovalRecord, SessionEntry } from "../types.ts";
 import { orgId as orgIdOf } from "../config.ts";
 import { parseScopeId, scopeId } from "../types.ts";
 import { fileArtifactId, artifactPath } from "../files/file-artifact-store.ts";
@@ -13,6 +13,10 @@ import { type ArtifactHome } from "./artifact-share.ts";
 import { randomUUID } from "node:crypto";
 import { MAX_ATTACHMENT_BYTES, mimeFromName, safeAttachmentName } from "../core/attachments.ts";
 import { projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
+import {
+  projectDesktopBrowserActivityReply,
+  projectDesktopBrowserTaskActivity,
+} from "../desktop-browser/task-activity.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { toFileItem, type ScopeDeployment, type SessionSearchHit } from "./app-types.ts";
@@ -79,21 +83,68 @@ export function createSessionMethods(
     principalManagesArtifactHome,
     artifactAuthor,
   } = h;
+  async function withDesktopBrowserProjection(sessionId: string, entries: SessionEntry[]): Promise<SessionEntry[]> {
+    const tasks = await deps.desktopBrowserTasks.listForSession(sessionId);
+    if (!tasks.length) return entries;
+    const projected = entries.slice();
+    for (const task of tasks) {
+      const desktopBrowserActivity = projectDesktopBrowserTaskActivity(
+        task,
+        deps.publicWebUrl,
+        await deps.desktopBrowserDeviceRegistry.taskRegistration(task.id),
+      );
+      const latestIndex = projected.findLastIndex(
+        (entry) =>
+          entry.type === "assistant" &&
+          (entry.payload as { desktopBrowserActivity?: { taskId?: string } } | null)?.desktopBrowserActivity?.taskId ===
+            task.id,
+      );
+      const text = projectDesktopBrowserActivityReply(desktopBrowserActivity);
+      if (latestIndex >= 0) {
+        const entry = projected[latestIndex]!;
+        projected[latestIndex] = {
+          ...entry,
+          payload: {
+            ...(entry.payload as Record<string, unknown>),
+            text,
+            desktopBrowserActivity,
+          },
+        };
+        continue;
+      }
+      const last = projected.at(-1);
+      projected.push({
+        sessionId,
+        seq: (last?.seq ?? -1) + 1,
+        parentSeq: last?.seq ?? null,
+        type: "assistant",
+        payload: {
+          text,
+          desktopBrowserActivity,
+        },
+        scopeLabel: projectScopeId(task.projectId),
+        createdAt: task.updatedAt,
+      });
+    }
+    return projected;
+  }
   return {
     async getSession(sessionId, window) {
       const session = await deps.sessions.get(sessionId);
       if (!session) return null;
-      const w = windowedTranscript(transcriptEntries(await deps.sessions.getEntries(sessionId)), window);
+      const entries = await withDesktopBrowserProjection(sessionId, await deps.sessions.getEntries(sessionId));
+      const w = windowedTranscript(transcriptEntries(entries), window);
       return { session, entries: w.entries, ...(w.earlier > 0 ? { earlierEntries: w.earlier } : {}) };
     },
 
     async getSessionForViewer(sessionId, principalId, window) {
       const session = (await sessionsForViewer(principalId)).find((s) => s.id === sessionId);
       if (!session) return null;
-      const w = windowedTranscript(
-        transcriptEntries(await deps.sessions.visibleEntries(sessionId, principalId)),
-        window,
+      const entries = await withDesktopBrowserProjection(
+        sessionId,
+        await deps.sessions.visibleEntries(sessionId, principalId),
       );
+      const w = windowedTranscript(transcriptEntries(entries), window);
       return { session, entries: w.entries, ...(w.earlier > 0 ? { earlierEntries: w.earlier } : {}) };
     },
 

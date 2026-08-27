@@ -491,4 +491,17 @@ export interface TurnResult {
   attachments?: OutgoingAttachment[];
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
+  desktopBrowserActivity?: {
+    taskId: string;
+    status: "waiting_for_broker" | "waiting_for_local_confirmation" | "registration_confirmed" | "canceled";
+    connectCommand: string;
+    actionAuthority: string;
+    actions: Array<"confirm" | "cancel">;
+    registration?: {
+      registrationId: string;
+      confirmationFingerprint: string;
+      expiresAt: string;
+      confirmReady: boolean;
+    };
+  };
 }

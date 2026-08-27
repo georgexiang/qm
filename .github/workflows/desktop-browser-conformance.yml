@@ -1,0 +1,146 @@
+name: Desktop Browser Conformance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/desktop-browser-conformance.yml
+      - scripts/desktop-browser-conformance.ts
+      - scripts/run-browser-skill-conformance.mjs
+      - test/desktop-browser-conformance.test.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-browser-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BROWSERSKILL_COMMIT: 4b6cdde168f9e46ebff78e8cccaa75c75814cb7c
+  BROWSERSKILL_CLI_RELEASE_VERSION: "0.1.10"
+  BROWSERSKILL_CLI_RELEASE_URL: "https://github.com/Tencent/BrowserSkill/releases/download/cli-v0.1.10/bsk-v0.1.10-aarch64-apple-darwin.tar.gz"
+  BROWSERSKILL_CLI_RELEASE_SHA256: 50403691584243a48398d9b0c9084c562fef047878f0826dcdc70a01c4baec9f
+  BROWSERSKILL_EXTENSION_RELEASE_VERSION: "0.1.6"
+  BROWSERSKILL_EXTENSION_RELEASE_URL: "https://github.com/Tencent/BrowserSkill/releases/download/ext-v0.1.6/browser-skill-extension-v0.1.6-chrome.zip"
+  BROWSERSKILL_EXTENSION_RELEASE_SHA256: 3bcf76efeed375250dd6cd2f93eda442f9ab9fdabf00a8c43e519cd7ff234b5b
+  CHROME_FOR_TESTING_VERSION: 152.0.7977.64
+  CHROME_FOR_TESTING_URL: "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.64/mac-arm64/chrome-mac-arm64.zip"
+  CHROME_FOR_TESTING_SHA256: 10033804338bd0a5aa098149a8dd64f3f2e0e8b201bf3d400d7c17d067ff696f
+  BSK_AUTO_UPDATE: "off"
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = arm64
+      - name: Install QM dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check out pinned BrowserSkill source
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/Tencent/BrowserSkill.git "$RUNNER_TEMP/BrowserSkill"
+          git -C "$RUNNER_TEMP/BrowserSkill" checkout --detach "$BROWSERSKILL_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/BrowserSkill" rev-parse HEAD)" = "$BROWSERSKILL_COMMIT"
+      - name: Build pinned CLI and Extension
+        run: |
+          corepack enable >/dev/null 2>&1
+          cd "$RUNNER_TEMP/BrowserSkill"
+          pnpm install --frozen-lockfile --reporter=append-only
+          cargo build --release --locked -p bsk --target aarch64-apple-darwin
+          pnpm ext:build:zip
+          pnpm ext:test
+      - name: Download pinned Chrome for Testing
+        run: |
+          mkdir -p "$RUNNER_TEMP/chrome-for-testing"
+          curl -fsSL "$CHROME_FOR_TESTING_URL" -o "$RUNNER_TEMP/chrome-for-testing/chrome.zip"
+          echo "${CHROME_FOR_TESTING_SHA256}  $RUNNER_TEMP/chrome-for-testing/chrome.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/chrome-for-testing/chrome.zip" -d "$RUNNER_TEMP/chrome-for-testing"
+          chrome="$RUNNER_TEMP/chrome-for-testing/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+          if [ ! -f "$chrome" ]; then
+            echo "Chrome for Testing executable was not found at $chrome" >&2
+            exit 1
+          fi
+          if [ ! -x "$chrome" ]; then
+            echo "Chrome for Testing executable is not executable at $chrome" >&2
+            exit 1
+          fi
+          chrome_version="$("$chrome" --version)"
+          echo "CHROME_FOR_TESTING=$chrome" >> "$GITHUB_ENV"
+          echo "CHROME_FOR_TESTING_EXECUTABLE_VERSION=$chrome_version" >> "$GITHUB_ENV"
+      - name: Run source-built conformance baseline
+        run: |
+          source="$RUNNER_TEMP/BrowserSkill"
+          node scripts/run-browser-skill-conformance.mjs \
+            --source-dir "$source" \
+            --bsk "$source/target/aarch64-apple-darwin/release/bsk" \
+            --extension-dir "$source/apps/extension/dist/chrome-mv3" \
+            --extension-zip "$source/apps/extension/dist/browser-skillextension-0.1.6-chrome.zip" \
+            --chrome "$CHROME_FOR_TESTING" \
+            --chrome-version "$CHROME_FOR_TESTING_VERSION" \
+            --chrome-url "$CHROME_FOR_TESTING_URL" \
+            --chrome-archive-sha256 "$CHROME_FOR_TESTING_SHA256" \
+            --out-dir "$RUNNER_TEMP/conformance-baseline" \
+            --mode baseline-source-build
+      - name: Download released smoke artifacts
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-cli" "$RUNNER_TEMP/release-extension"
+          curl -fsSL "$BROWSERSKILL_CLI_RELEASE_URL" -o "$RUNNER_TEMP/release-cli/bsk.tar.gz"
+          curl -fsSL "$BROWSERSKILL_EXTENSION_RELEASE_URL" -o "$RUNNER_TEMP/release-extension/extension.zip"
+          echo "${BROWSERSKILL_CLI_RELEASE_SHA256}  $RUNNER_TEMP/release-cli/bsk.tar.gz" | shasum -a 256 -c -
+          echo "${BROWSERSKILL_EXTENSION_RELEASE_SHA256}  $RUNNER_TEMP/release-extension/extension.zip" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/release-cli/bsk.tar.gz" -C "$RUNNER_TEMP/release-cli"
+          unzip -q "$RUNNER_TEMP/release-extension/extension.zip" -d "$RUNNER_TEMP/release-extension/unpacked"
+          cli="$RUNNER_TEMP/release-cli/bsk"
+          extension_dir="$RUNNER_TEMP/release-extension/unpacked"
+          if [ ! -f "$cli" ]; then
+            echo "released BrowserSkill CLI was not found at $cli" >&2
+            exit 1
+          fi
+          if [ ! -x "$cli" ]; then
+            echo "released BrowserSkill CLI is not executable at $cli" >&2
+            exit 1
+          fi
+          if [ ! -d "$extension_dir" ]; then
+            echo "released BrowserSkill extension directory was not found at $extension_dir" >&2
+            exit 1
+          fi
+          if [ ! -f "$extension_dir/manifest.json" ]; then
+            echo "released BrowserSkill extension directory is missing manifest.json at $extension_dir/manifest.json" >&2
+            exit 1
+          fi
+      - name: Run released combination smoke test
+        run: |
+          node scripts/run-browser-skill-conformance.mjs \
+            --source-dir "$RUNNER_TEMP/BrowserSkill" \
+            --bsk "$RUNNER_TEMP/release-cli/bsk" \
+            --extension-dir "$RUNNER_TEMP/release-extension/unpacked" \
+            --extension-zip "$RUNNER_TEMP/release-extension/extension.zip" \
+            --chrome "$CHROME_FOR_TESTING" \
+            --chrome-version "$CHROME_FOR_TESTING_VERSION" \
+            --chrome-url "$CHROME_FOR_TESTING_URL" \
+            --chrome-archive-sha256 "$CHROME_FOR_TESTING_SHA256" \
+            --out-dir "$RUNNER_TEMP/conformance-release-smoke" \
+            --mode release-smoke \
+            --release-cli-version "$BROWSERSKILL_CLI_RELEASE_VERSION" \
+            --release-cli-url "$BROWSERSKILL_CLI_RELEASE_URL" \
+            --release-cli-archive-sha256 "$BROWSERSKILL_CLI_RELEASE_SHA256" \
+            --release-extension-version "$BROWSERSKILL_EXTENSION_RELEASE_VERSION" \
+            --release-extension-url "$BROWSERSKILL_EXTENSION_RELEASE_URL" \
+            --release-extension-archive-sha256 "$BROWSERSKILL_EXTENSION_RELEASE_SHA256"
+      - name: Upload conformance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-browser-conformance-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/conformance-baseline
+            ${{ runner.temp }}/conformance-release-smoke
+          if-no-files-found: error

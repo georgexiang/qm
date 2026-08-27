@@ -9,7 +9,7 @@ import { scopeId, type TurnRequest } from "../src/types.ts";
 import { TEST_CAPABILITY_SECRET, testConfig } from "./support/test-config.ts";
 import type { Config } from "../src/config.ts";
 import type { ProvisionOptions, Sandbox } from "../src/sandbox/sandbox.ts";
-import { verifyCapabilityToken, EGRESS_PROXY_AUD } from "../src/auth/capability-token.ts";
+import { verifyCapabilityToken, EGRESS_PROXY_AUD, type CapabilityClaims } from "../src/auth/capability-token.ts";
 import { egressClaimAllowingControlPlane } from "../src/core/orchestrator.ts";
 import { TURN_FILES_DIR, turnFileId } from "../src/core/attachments.ts";
 import { contextSummaryPayload } from "../src/harness/context-compaction.ts";
@@ -749,6 +749,92 @@ test("turn timezone rides the prompt and control-plane capability token", async 
   assert.equal(invalidClaims!.timezone, undefined, "invalid surface timezones are omitted from the token");
 });
 
+test("a human Turn capability carries server-issued authority lineage", async () => {
+  const config = testConfig({
+    dataDir: mkdtempSync(join(tmpdir(), "ap-")),
+    signingSecret: "test-secret",
+    apiBaseUrl: "https://core.example.com",
+  });
+  const { app, sandbox } = buildApp(config);
+  let captured: ProvisionOptions | undefined;
+  const realProvision = sandbox.provision.bind(sandbox);
+  sandbox.provision = (layers, opts) => {
+    captured = opts;
+    return realProvision(layers, opts);
+  };
+
+  const request = {
+    ...dm("!run echo lineage", {
+      conversation: { kind: "dm", threadRef: "dm:U1:authority-lineage" },
+      liveActor: true,
+    }),
+    authorityId: "caller-forged-authority",
+    turnId: "caller-forged-turn",
+    sessionId: "caller-forged-session",
+    runId: "caller-forged-run",
+    actorId: "caller-forged-actor",
+    exp: Number.MAX_SAFE_INTEGER,
+  } as TurnRequest;
+  const result = await app.turn(request);
+  assert.equal(result.status, "ok");
+  const claims = (await verifyCapabilityToken(
+    captured!.env!.AGENT_API_TOKEN!,
+    TEST_CAPABILITY_SECRET,
+  )) as CapabilityClaims & { authorityId?: string; sessionId?: string; turnId?: string; runId?: string };
+  assert.match(claims.authorityId ?? "", /^[0-9a-f-]{36}$/);
+  assert.match(claims.turnId ?? "", /^[0-9a-f-]{36}$/);
+  assert.notEqual(claims.authorityId, "caller-forged-authority");
+  assert.notEqual(claims.turnId, "caller-forged-turn");
+  assert.equal(claims.sessionId, result.sessionId);
+  assert.notEqual(claims.sessionId, "caller-forged-session");
+  assert.match(claims.runId ?? "", /^[0-9a-f-]{36}$/);
+  assert.notEqual(claims.runId, "caller-forged-run");
+  assert.equal(claims.actorId, "U1");
+  assert.ok(claims.exp < Number.MAX_SAFE_INTEGER);
+});
+
+test("a retried human Turn preserves its durable authority lineage and original expiry", async () => {
+  const { app, runs, sandbox } = freshApp({ signingSecret: "test-secret", apiBaseUrl: "https://core.example.com" });
+  let durableRunId: string | undefined;
+  const realEnqueue = runs.enqueue.bind(runs);
+  runs.enqueue = async (input) => {
+    const result = await realEnqueue(input);
+    durableRunId = result.run.id;
+    return result;
+  };
+  const tokens: string[] = [];
+  const realProvision = sandbox.provision.bind(sandbox);
+  sandbox.provision = async (layers, opts) => {
+    tokens.push(opts!.env!.AGENT_API_TOKEN!);
+    if (tokens.length === 1) throw new Error("transient provision failure");
+    return realProvision(layers, opts);
+  };
+  const request = dm("!run echo durable-authority", {
+    conversation: { kind: "dm", threadRef: "dm:U1:authority-retry" },
+    liveActor: true,
+    idempotencyKey: "authority-retry",
+  });
+
+  await assert.rejects(app.turn(request), /transient provision failure/);
+  const failedRequest = (await runs.get(durableRunId!))!.request;
+  assert.equal((await app.turn(request)).status, "ok");
+  const completedRequest = (await runs.get(durableRunId!))!.request;
+  assert.equal(tokens.length, 1);
+  assert.match(failedRequest.authorityId ?? "", /^[0-9a-f-]{36}$/);
+  assert.match(failedRequest.turnId ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(typeof failedRequest.authorityExpiresAt, "number");
+  const claims = await verifyCapabilityToken(tokens[0]!, TEST_CAPABILITY_SECRET);
+  assert.deepEqual(
+    [failedRequest.authorityId, failedRequest.turnId, failedRequest.authorityExpiresAt],
+    [completedRequest.authorityId, completedRequest.turnId, completedRequest.authorityExpiresAt],
+  );
+  assert.deepEqual(
+    [claims?.authorityId, claims?.turnId, claims?.exp],
+    [failedRequest.authorityId, failedRequest.turnId, failedRequest.authorityExpiresAt],
+  );
+  assert.equal(claims?.runId, durableRunId);
+});
+
 test("unattended grants enter capability claims only on non-live turns", async () => {
   const config = testConfig({
     dataDir: mkdtempSync(join(tmpdir(), "ap-")),
@@ -766,6 +852,10 @@ test("unattended grants enter capability claims only on non-live turns", async (
   await app.turn(dm("!run echo cron", { triggered: true, unattendedGrants: ["admin.sessions.read"] }));
   let claims = await verifyCapabilityToken(captured!.env!.AGENT_API_TOKEN!, TEST_CAPABILITY_SECRET);
   assert.deepEqual(claims?.grants, ["admin.sessions.read"]);
+  assert.equal(claims?.authorityId, undefined);
+  assert.equal(claims?.sessionId, undefined);
+  assert.equal(claims?.turnId, undefined);
+  assert.equal(claims?.runId, undefined);
 
   await app.turn(
     dm("!run echo live", {

@@ -144,17 +144,20 @@ export function createExecProcessSessions(io: ExecProcessIo): ExecProcessSession
       assertId(processId);
       const sig = signal.replace(/^SIG/, "").toUpperCase();
       if (!ALLOWED_SIGNALS.has(sig)) throw new Error(`unsupported signal: ${signal}`);
-      const sentinelLine =
-        sig === "KILL"
-          ? `[ -f "$P/code" ] || echo 137 > "$P/code"`
-          : `if ! kill -0 -"$pid" 2>/dev/null && ! kill -0 "$pid" 2>/dev/null; then [ -f "$P/code" ] || echo 143 > "$P/code"; fi`;
+      const exitCode = sig === "KILL" ? 137 : 143;
       const script = [
         `P="${PROC_BASE}/${processId}"`,
         `pid=$(cat "$P/pid" 2>/dev/null) || exit 0`,
-        `kill -${sig} -"$pid" 2>/dev/null || kill -${sig} "$pid" 2>/dev/null || true`,
-        sentinelLine,
+        `_alive() { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }`,
+        `if _alive; then kill -${sig} -"$pid" 2>/dev/null || kill -${sig} "$pid" 2>/dev/null || { echo "signal delivery failed" >&2; exit 1; }; fi`,
+        `i=0; while _alive && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done`,
+        `if _alive; then echo "process is still alive after ${sig}" >&2; exit 1; fi`,
+        `[ -f "$P/code" ] || echo ${exitCode} > "$P/code"`,
       ].join("\n");
-      await io.run(handle, script, { timeoutMs: 15_000 });
+      const result = await io.run(handle, script, { timeoutMs: 15_000 });
+      if (result.code !== 0) {
+        throw new Error(`signalProcess failed for ${processId}: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
     },
 
     async listProcesses(handle): Promise<ProcessSession[]> {

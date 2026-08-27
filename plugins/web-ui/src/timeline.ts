@@ -35,6 +35,7 @@ export interface ToolRowModel {
 export type TimelineItem =
   | { kind: "thinking"; activity: ToolActivity }
   | { kind: "text"; activity: ToolActivity }
+  | { kind: "desktop_browser"; activity: ToolActivity }
   | { kind: "tool"; row: ToolRowModel }
   | { kind: "approval"; approval: PendingApproval };
 
@@ -106,7 +107,10 @@ function buildTimelineUncached(work: WorkBlock): TimelineItem[] {
   const rowByCallId = new Map<string, ToolRowModel>();
   let open: ToolRowModel | null = null;
   for (const a of work.activity) {
-    if (a.type === "thinking") {
+    if (a.type === "desktop_browser_task") {
+      items.push({ kind: "desktop_browser", activity: a });
+      open = null;
+    } else if (a.type === "thinking") {
       items.push({ kind: "thinking", activity: a });
       open = null;
     } else if (a.type === "text") {

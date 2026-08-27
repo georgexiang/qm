@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fromJSONSchema } from "zod";
 import { JUNK_FILE, deploymentLayerBundle } from "./deployment-layer.ts";
 import { errMessage } from "./log.ts";
 
@@ -50,6 +51,12 @@ export interface ToolCredentialPath {
   kind: "file" | "directory";
 }
 
+interface ToolProcessDescriptor {
+  executableId: string;
+  protocolMajor: number;
+  launchSchema: Record<string, unknown>;
+}
+
 export interface ToolDescriptor {
   id: string;
   label?: string;
@@ -59,6 +66,7 @@ export interface ToolDescriptor {
   auth?: ToolAuthDescriptor;
   approvals?: ToolApproval[];
   install?: { binary?: string };
+  process?: ToolProcessDescriptor;
 }
 
 export function parseToolDescriptor(raw: string, sourcePath: string): ToolDescriptor {
@@ -104,6 +112,7 @@ export function parseToolDescriptor(raw: string, sourcePath: string): ToolDescri
 
   if (d["auth"] !== undefined) out.auth = parseAuth(d["auth"], sourcePath);
   if (d["approvals"] !== undefined) out.approvals = parseApprovals(d["approvals"], sourcePath);
+  if (d["process"] !== undefined) out.process = parseProcess(d["process"], sourcePath);
 
   if (d["install"] !== undefined) {
     const inst = d["install"];
@@ -164,6 +173,11 @@ export function parseToolDescriptor(raw: string, sourcePath: string): ToolDescri
     }
   }
   const binary = out.install?.binary ?? out.id;
+  if (out.process && out.process.executableId !== binary) {
+    throw new Error(
+      `${sourcePath}: "process.executableId" must equal "install.binary" when present, otherwise the tool id ${JSON.stringify(binary)}`,
+    );
+  }
   if (out.auth?.broker && !POSIX_FUNCTION_NAME_RE.test(binary)) {
     throw new Error(
       `${sourcePath}: a brokered tool's binary ${JSON.stringify(binary)} must match ${POSIX_FUNCTION_NAME_RE.source} — vended credentials wrap it in a shell function, and not every sandbox shell accepts hyphenated function names`,
@@ -192,6 +206,94 @@ export function parseToolDescriptor(raw: string, sourcePath: string): ToolDescri
   }
 
   return out;
+}
+
+function parseProcess(raw: unknown, sourcePath: string): ToolProcessDescriptor {
+  if (!isPlainObject(raw)) throw new Error(`${sourcePath}: "process" must be an object`);
+  if (typeof raw.executableId !== "string" || !TOOL_ID_RE.test(raw.executableId)) {
+    throw new Error(`${sourcePath}: "process.executableId" must match ${TOOL_ID_RE.source}`);
+  }
+  if (!Number.isSafeInteger(raw.protocolMajor) || (raw.protocolMajor as number) < 1) {
+    throw new Error(`${sourcePath}: "process.protocolMajor" must be a positive safe integer`);
+  }
+  if (!isPlainObject(raw.launchSchema)) {
+    throw new Error(`${sourcePath}: "process.launchSchema" must be a JSON Schema object`);
+  }
+  validateJsonSchema(raw.launchSchema, sourcePath, "process.launchSchema");
+  if (raw.launchSchema.type !== "object") {
+    throw new Error(`${sourcePath}: "process.launchSchema.type" must be "object"`);
+  }
+  try {
+    fromJSONSchema(raw.launchSchema as Parameters<typeof fromJSONSchema>[0]);
+  } catch (error) {
+    throw new Error(`${sourcePath}: "process.launchSchema" is not supported`, { cause: error });
+  }
+  return {
+    executableId: raw.executableId,
+    protocolMajor: raw.protocolMajor as number,
+    launchSchema: raw.launchSchema,
+  };
+}
+
+function validateJsonSchema(raw: unknown, sourcePath: string, field: string): void {
+  if (typeof raw === "boolean") return;
+  if (!isPlainObject(raw)) throw new Error(`${sourcePath}: "${field}" must be a JSON Schema object or boolean`);
+  const schemaTypes = new Set(["array", "boolean", "integer", "null", "number", "object", "string"]);
+  if (
+    raw.type !== undefined &&
+    !(
+      (typeof raw.type === "string" && schemaTypes.has(raw.type)) ||
+      (Array.isArray(raw.type) &&
+        raw.type.length > 0 &&
+        raw.type.every((entry) => typeof entry === "string" && schemaTypes.has(entry)))
+    )
+  ) {
+    throw new Error(`${sourcePath}: "${field}.type" is not a valid JSON Schema type`);
+  }
+  if (
+    raw.required !== undefined &&
+    (!Array.isArray(raw.required) || !raw.required.every((entry) => typeof entry === "string"))
+  ) {
+    throw new Error(`${sourcePath}: "${field}.required" must be an array of strings`);
+  }
+  for (const key of [
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependentRequired",
+    "unevaluatedProperties",
+    "minProperties",
+    "maxProperties",
+    "uniqueItems",
+    "contains",
+    "minContains",
+    "maxContains",
+  ] as const) {
+    if (raw[key] !== undefined) throw new Error(`${sourcePath}: "${field}.${key}" is not supported`);
+  }
+  if (raw.$ref !== undefined && typeof raw.$ref !== "string") {
+    throw new Error(`${sourcePath}: "${field}.$ref" must be a string`);
+  }
+  for (const key of ["properties", "patternProperties", "$defs", "definitions"] as const) {
+    if (raw[key] === undefined) continue;
+    if (!isPlainObject(raw[key])) throw new Error(`${sourcePath}: "${field}.${key}" must be an object of JSON Schemas`);
+    for (const [name, child] of Object.entries(raw[key])) {
+      validateJsonSchema(child, sourcePath, `${field}.${key}.${name}`);
+    }
+  }
+  for (const key of ["items", "additionalProperties", "not", "propertyNames"] as const) {
+    if (raw[key] !== undefined) validateJsonSchema(raw[key], sourcePath, `${field}.${key}`);
+  }
+  for (const key of ["allOf", "anyOf", "oneOf", "prefixItems"] as const) {
+    if (raw[key] === undefined) continue;
+    if (!Array.isArray(raw[key]) || raw[key].length === 0) {
+      throw new Error(`${sourcePath}: "${field}.${key}" must be a non-empty array of JSON Schemas`);
+    }
+    for (const [index, child] of raw[key].entries()) {
+      validateJsonSchema(child, sourcePath, `${field}.${key}[${index}]`);
+    }
+  }
 }
 
 function parseAuth(raw: unknown, sourcePath: string): ToolAuthDescriptor {

@@ -1081,12 +1081,26 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const memoryClaim = memoryAccess
           ? { ...memoryAccess, ...(orgMemoryWrite ? { orgWrite: orgMemoryWrite } : {}) }
           : undefined;
+        const retainedAuthority =
+          input.origin.kind === "human" &&
+          typeof input.authorityId === "string" &&
+          typeof input.turnId === "string" &&
+          typeof input.authorityExpiresAt === "number"
+            ? {
+                authorityId: input.authorityId,
+                sessionId: session.id,
+                turnId: input.turnId,
+                ...(input.runId ? { runId: input.runId } : {}),
+                exp: input.authorityExpiresAt,
+              }
+            : undefined;
         controlClaims = {
           actorId: actor.id,
+          ...retainedAuthority,
           scopeId,
           ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
           aud: CONTROL_PLANE_AUD,
-          exp: Date.now() + CAPABILITY_TTL_MS,
+          exp: retainedAuthority?.exp ?? Date.now() + CAPABILITY_TTL_MS,
           ...(turnTimezone ? { timezone: turnTimezone } : {}),
           ...(destination ? { destination } : {}),
           ...(delivery.candidates.length > 0 ? { destinations: delivery.candidates } : {}),

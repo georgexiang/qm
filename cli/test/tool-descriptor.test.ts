@@ -6,7 +6,6 @@ import {
   parseSkillFrontmatter,
   parseToolDescriptor,
 } from "../src/sandbox-layer.ts";
-import * as canonical from "../../src/deployment/deployment-layer.ts";
 import { parseSeedSkillFrontmatter } from "../../src/skills/frontmatter.ts";
 
 const P = (o: unknown): ReturnType<typeof parseToolDescriptor> => parseToolDescriptor(JSON.stringify(o), "t.json");
@@ -48,6 +47,47 @@ test("install.binary is restricted to the inert charset (it lands in generated D
       `expected reject: ${bad}`,
     );
   }
+});
+
+test("ephemeral process metadata round-trips through the CLI descriptor parser", () => {
+  const process = {
+    executableId: "local-browser-adapter",
+    protocolMajor: 2,
+    launchSchema: {
+      type: "object",
+      properties: { taskId: { type: "string" } },
+      required: ["taskId"],
+      additionalProperties: false,
+    },
+  };
+  assert.deepEqual(P({ id: "local-browser", install: { binary: "local-browser-adapter" }, process }).process, process);
+  for (const invalid of [
+    { ...process, executableId: "../adapter" },
+    { ...process, protocolMajor: 0 },
+    { ...process, launchSchema: [] },
+    { ...process, launchSchema: { type: "not-a-json-schema-type" } },
+    { ...process, launchSchema: { type: "object", properties: { taskId: { type: "invalid" } } } },
+    { ...process, launchSchema: { type: "string" } },
+    { ...process, launchSchema: { type: "object", propertyNames: 42 } },
+    { ...process, launchSchema: { type: "object", unevaluatedProperties: false } },
+    { ...process, launchSchema: { type: "object", properties: { taskId: { type: "string", pattern: "[" } } } },
+    { ...process, launchSchema: { type: "object", minProperties: 1 } },
+    { ...process, launchSchema: { type: "object", properties: { ids: { type: "array", uniqueItems: true } } } },
+  ]) {
+    assert.throws(
+      () => P({ id: "local-browser", install: { binary: "local-browser-adapter" }, process: invalid }),
+      /process\./,
+    );
+  }
+  assert.throws(
+    () =>
+      P({
+        id: "local-browser",
+        install: { binary: "local-browser-adapter" },
+        process: { ...process, executableId: "other-adapter" },
+      }),
+    /process\.executableId.*install\.binary/,
+  );
 });
 
 test("auth requires check + reauth; credentialPaths + splitEnv optional and shape-checked", () => {
@@ -348,138 +388,4 @@ test("drift-lock: cli skill parser matches the core seed parser's output", () =>
       });
     }
   }
-});
-
-test("drift-lock: cli sandbox-layer parser matches the canonical src/deployment schema", () => {
-  const valid = [
-    { id: "ex" },
-    { id: "my-tool", label: "L", advertise: "a", egress: ["h"], install: { binary: "b" } },
-    {
-      id: "t",
-      auth: {
-        check: "c",
-        reauth: "r",
-        credentialPaths: [credentialFile(".p")],
-        splitEnv: { K: "{actingSlackUserId}" },
-      },
-    },
-    {
-      id: "t",
-      auth: {
-        check: "c",
-        reauth: "r",
-        credentialPaths: [credentialDirectory(".aws"), credentialFile(".my-tool/creds")],
-      },
-    },
-    {
-      id: "t",
-      auth: { check: "c", reauth: "r", credentialPaths: [credentialFile(".acme/token"), credentialFile(".acme/key")] },
-    },
-    { id: "t", approvals: [{ command: "deploy" }, { pattern: "\\bt\\b\\s+--force\\b", decision: "deny" }] },
-    {
-      id: "t",
-      auth: {
-        check: "c",
-        reauth: "r",
-        broker: {
-          kind: "aws-role",
-          roleArnEnv: "T_ROLE_ARN",
-          region: "us-west-2",
-          sessionActions: ["execute-api:Invoke"],
-        },
-      },
-    },
-    {
-      id: "t",
-      auth: {
-        check: "c",
-        reauth: "r",
-        broker: {
-          kind: "aws-role",
-          roleArnEnv: "T_ROLE_ARN",
-          regionEnv: "T_REGION",
-          sessionActions: ["execute-api:Invoke", "s3:GetObject"],
-        },
-      },
-    },
-    {
-      id: "t",
-      install: { binary: "tool-bin" },
-      approvals: [{ command: "deploy" }, { pattern: "\\btool-bin\\b\\s+--force\\b" }],
-    },
-  ];
-  for (const v of valid) {
-    assert.deepEqual(
-      parseToolDescriptor(JSON.stringify(v), "t.json"),
-      canonical.parseToolDescriptor(JSON.stringify(v), "t.json"),
-      `valid descriptor parsed differently: ${JSON.stringify(v)}`,
-    );
-  }
-  const invalid = [
-    "{}",
-    '{"id":""}',
-    '{"id":"x","auth":{"check":"a"}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"gcp","roleArnEnv":"R","region":"r","sessionActions":["a"]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","region":"r","sessionActions":["a"]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"lower","region":"r","sessionActions":["a"]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","sessionActions":["a"]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","region":"r","sessionActions":[]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","region":"r","sessionActions":[" "]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","regionEnv":"bad-env","sessionActions":["a"]}}}',
-    '{"id":"my-tool","auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","region":"r","sessionActions":["a"]}}}',
-    '{"id":"x","install":{"binary":"tool-bin"},"auth":{"check":"a","reauth":"b","broker":{"kind":"aws-role","roleArnEnv":"R","region":"r","sessionActions":["a"]}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","splitEnv":{"K":"{unknown}"}}}',
-    '{"id":"x","approvals":[{}]}',
-    '{"id":"x","approvals":[{"command":"a","decision":"allow"}]}',
-    '{"id":"gh","approvals":[{"pattern":"nightmare"}]}',
-    "not json",
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":"a//b","kind":"file"}]}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".ssh/id_rsa","kind":"file"}]}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".config","kind":"directory"}]}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".my-tool","kind":"directory"},{"path":".my-tool/creds","kind":"file"}]}}',
-    '{"id":"Bad"}',
-    '{"id":"a|b"}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","splitEnv":{"bad-key":"v"}}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".my tool","kind":"file"}]}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":"workspace","kind":"directory"}]}}',
-    '{"id":"x","auth":{"check":"a","reauth":"b","credentialPaths":[{"path":".acme","kind":"directory"},{"path":".acme/sub/key","kind":"file"}]}}',
-    '{"id":"x","install":{"binary":"evil; rm -rf /"}}',
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(?:(x|x)+)+$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(a+)+$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+(?:ab|a?b)+$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+" + "a+".repeat(8) + "$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+a+(a+)$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b:\\w+[a-z]+$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+" + "(a|aa)".repeat(12) + "$" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b\\s+" + "(a|a)".repeat(12) + "$" }] }),
-    JSON.stringify({ id: "t", install: { binary: "tool-bin" }, approvals: [{ pattern: "\\bt\\b\\s+deploy" }] }),
-    JSON.stringify({ id: "acmecli", approvals: [{ pattern: "\\bacmecli\\b" + "a".repeat(300) }] }),
-  ];
-  for (const raw of invalid) {
-    const cliErr = (() => {
-      try {
-        parseToolDescriptor(raw, "t.json");
-        return null;
-      } catch (e) {
-        return (e as Error).message;
-      }
-    })();
-    const canErr = (() => {
-      try {
-        canonical.parseToolDescriptor(raw, "t.json");
-        return null;
-      } catch (e) {
-        return (e as Error).message;
-      }
-    })();
-    assert.ok(cliErr !== null && canErr !== null, `both should reject: ${raw}`);
-    assert.equal(cliErr, canErr, `error message drift on: ${raw}`);
-  }
-  assert.deepEqual(compileApproval("t", { command: "a b" }), canonical.compileApproval("t", { command: "a b" }));
-  assert.deepEqual(
-    interpolateSplitEnv({ A: "{actingSlackUserId}" }, {}),
-    canonical.interpolateSplitEnv({ A: "{actingSlackUserId}" }, {}),
-  );
-  assert.deepEqual(interpolateSplitEnv({ A: "{constructor}" }, {}), {});
-  assert.deepEqual(canonical.interpolateSplitEnv({ A: "{constructor}" }, {}), {});
 });

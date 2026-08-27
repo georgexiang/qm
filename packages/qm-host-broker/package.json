@@ -1,0 +1,19 @@
+{
+  "name": "qm-host-broker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "qm-host-broker": "./src/bin/qm-host-broker.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts"
+  },
+  "dependencies": {
+    "qm-desktop-browser-contracts": "file:../desktop-browser-contracts"
+  },
+  "engines": {
+    "node": ">=24.15.0"
+  }
+}

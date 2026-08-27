@@ -25,6 +25,19 @@ import type { SessionStateBus, SessionStateEvent } from "../runs/session-state-b
 import type { RunActivityEntry, RunActivityStore } from "../runs/run-activity-store.ts";
 import type { RunSignal, RunSignalStore } from "../runs/run-signal-store.ts";
 import type { TaskStore, TaskStatus } from "../tasks/task-store.ts";
+import type { DesktopBrowserTaskStore } from "../desktop-browser/browser-task-store.ts";
+import type {
+  DesktopBrowserDeviceRegistry,
+  DesktopBrowserTaskRegistrationProjection,
+  DesktopBrowserSharedProfileProjection,
+} from "../desktop-browser/device-registry.ts";
+import type {
+  DesktopBrowserRelayConnectionProjection,
+  DesktopBrowserRelayRegistryBinding,
+  DesktopBrowserPublicIdentity,
+  DesktopBrowserRegistrationConfirmationEnvelope,
+  DesktopBrowserRegistrationReservationTuple,
+} from "qm-desktop-browser-contracts";
 import type { ModelGateway } from "../model/model-gateway.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { CustomProviderStore } from "../model/custom-provider-store.ts";
@@ -178,6 +191,7 @@ export type VisibleCron = Cron & { scopeName?: string };
 export type ProjectView = Project & {
   scopeId: ScopeId;
   members: Array<{ principalId: string; displayName: string; viaChannel?: boolean }>;
+  desktopBrowser?: DesktopBrowserSharedProfileProjection;
 };
 
 type ProjectViewMutation =
@@ -233,6 +247,74 @@ export interface SessionSearchHit {
 
 export interface App {
   turn(req: TurnRequest): Promise<TurnResult>;
+  desktopBrowserTaskAction(
+    taskId: string,
+    principalId: string,
+    authorityId: string,
+    action: "cancel",
+  ): Promise<TurnResult>;
+  desktopBrowserReserveRegistration(
+    taskId: string,
+    authorityId: string,
+    input: {
+      devicePublicKey: string;
+      brokerInstanceId: string;
+      browserInstanceId: string;
+      connectionEpoch: number;
+      operatingSystem: string;
+    },
+  ): Promise<
+    | {
+        status: "ok";
+        reservation: {
+          registrationTuple: DesktopBrowserRegistrationReservationTuple;
+          publicIdentity: DesktopBrowserPublicIdentity;
+          confirmationFingerprint: string;
+          publicDeviceFingerprint: string;
+          verificationBytesBase64: string;
+        };
+      }
+    | { status: "refused"; reason: string }
+  >;
+  desktopBrowserConfirmRegistration(
+    registrationId: string,
+    principalId: string,
+    authorityId: string,
+    input: {
+      taskId: string;
+      confirmationFingerprint: string;
+    },
+  ): Promise<
+    | {
+        status: "ok";
+        device: DesktopBrowserSharedProfileProjection;
+        desktopBrowserActivity: TurnResult["desktopBrowserActivity"];
+      }
+    | { status: "refused"; reason: string }
+  >;
+  desktopBrowserStageRegistrationConfirmation(
+    registrationId: string,
+    input: {
+      browserRuntimeStatus: "ready" | "offline";
+      envelope: DesktopBrowserRegistrationConfirmationEnvelope;
+    },
+  ): Promise<
+    { status: "ok"; registration: DesktopBrowserTaskRegistrationProjection } | { status: "refused"; reason: string }
+  >;
+  desktopBrowserMarkRegistrationOffline(
+    registrationId: string,
+    input: {
+      brokerInstanceId: string;
+      browserInstanceId: string;
+      connectionEpoch: number;
+    },
+  ): Promise<{ status: "ok"; device: DesktopBrowserSharedProfileProjection } | { status: "refused"; reason: string }>;
+  desktopBrowserResolveRelayBinding(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+  }): Promise<{ status: "ok"; binding: DesktopBrowserRelayRegistryBinding } | { status: "refused"; reason: string }>;
+  desktopBrowserPublishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
+  desktopBrowserClearRelayConnection(connectionId: string): Promise<void>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
   subscribeSessionStates(cb: (event: SessionStateEvent) => void): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;
@@ -495,6 +577,8 @@ export interface AppDeps {
   runActivity?: RunActivityStore;
   signals?: RunSignalStore;
   tasks?: TaskStore;
+  desktopBrowserTasks: DesktopBrowserTaskStore;
+  desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   modelGateway: ModelGateway;
   modelCredentials?: ModelCredentialStore;
   mcpServers?: McpServerStore;

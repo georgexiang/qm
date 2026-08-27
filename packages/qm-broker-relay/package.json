@@ -1,0 +1,21 @@
+{
+  "name": "qm-broker-relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "qm-broker-relay": "./src/bin/qm-broker-relay.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./process": "./src/process.ts",
+    "./server": "./src/server.ts"
+  },
+  "dependencies": {
+    "qm-desktop-browser-contracts": "file:../desktop-browser-contracts",
+    "ws": "^8.21.1"
+  },
+  "engines": {
+    "node": ">=24.15.0"
+  }
+}
