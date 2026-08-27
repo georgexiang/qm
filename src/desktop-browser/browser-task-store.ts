@@ -518,14 +518,14 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Host result browser does not match the prepared task";
           return task;
         }
-        const currentRefusal =
-          task.status !== "waiting_for_broker"
-            ? "Desktop Browser Task is no longer waiting"
-            : task.authorityExpiresAt <= at
-              ? "Desktop Browser Turn authority expired; start a new Turn"
-              : authorityState
-                ? currentAuthorityRefusal(task, execution, authorityState)
-                : null;
+        let currentRefusal: string | null = null;
+        if (task.status !== "waiting_for_broker") {
+          currentRefusal = "Desktop Browser Task is no longer waiting";
+        } else if (task.authorityExpiresAt <= at) {
+          currentRefusal = "Desktop Browser Turn authority expired; start a new Turn";
+        } else if (authorityState) {
+          currentRefusal = currentAuthorityRefusal(task, execution, authorityState);
+        }
         if (currentRefusal) {
           bound = {
             ...task,
