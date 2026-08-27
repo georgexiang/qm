@@ -19,9 +19,19 @@ import {
   waitForDaemonReadiness,
   writeBrowserSkillConformanceManifest,
 } from "../scripts/desktop-browser-conformance.ts";
-import { createNodeDesktopBrowserConformanceDeps as createNodeRunnerDeps } from "../scripts/run-browser-skill-conformance.ts";
+import {
+  browserSkillForegroundDaemonArgs,
+  createNodeDesktopBrowserConformanceDeps as createNodeRunnerDeps,
+} from "../scripts/run-browser-skill-conformance.ts";
 
 const sourceCommit = "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c";
+
+test("foreground daemon keeps BrowserSkill's extension-compatible default WebSocket port", () => {
+  const args = browserSkillForegroundDaemonArgs();
+  assert.deepEqual(args, ["daemon", "start", "--foreground", "--daemon-idle", "60s"]);
+  assert.equal(args.includes("--port"), false);
+  assert.equal(args.includes("0"), false);
+});
 
 const daemonRecord = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
   pid: 321,

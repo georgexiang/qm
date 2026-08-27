@@ -39,6 +39,14 @@ const readMode = (mode: string | undefined): "baseline-source-build" | "release-
   throw new Error(`invalid --mode ${mode}`);
 };
 
+export const browserSkillForegroundDaemonArgs = (): string[] => [
+  "daemon",
+  "start",
+  "--foreground",
+  "--daemon-idle",
+  "60s",
+];
+
 const parseArgs = (argv: string[]): Record<string, string> => {
   const options: Record<string, string> = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -239,7 +247,7 @@ export const createNodeDesktopBrowserConformanceDeps = ({
       timeoutMs: commandTimeoutMs,
     }),
   startDaemon: async (bskPath, environment) => {
-    const child = spawn(bskPath, ["daemon", "start", "--foreground", "--port", "0", "--daemon-idle", "60s"], {
+    const child = spawn(bskPath, browserSkillForegroundDaemonArgs(), {
       env: environment,
       stdio: ["ignore", "ignore", "pipe"],
     });
