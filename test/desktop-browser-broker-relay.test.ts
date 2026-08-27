@@ -287,6 +287,48 @@ function invocationWithDispatchId(dispatchId: string): RelayInvocationMessage {
   };
 }
 
+test("relay constructor enforces a positive safe integer max settled dispatch history", () => {
+  const createService = (maxSettledDispatchHistory: number) =>
+    new DesktopBrowserRelayService({
+      relayInstanceId: "relay-a",
+      deploymentCanonicalId: "qm://deployments/example",
+      supportedProtocolVersions: ["1.2"],
+      supportedPolicyGrammarVersions: ["1.0"],
+      registry: new FakeRegistryAdapter(),
+      maxSettledDispatchHistory,
+    });
+
+  assert.throws(
+    () => createService(Number.MAX_SAFE_INTEGER + 1),
+    /maxSettledDispatchHistory must be a positive safe integer/,
+  );
+  assert.throws(() => createService(-1), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.throws(() => createService(0), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.throws(() => createService(1.5), /maxSettledDispatchHistory must be a positive safe integer/);
+  assert.doesNotThrow(() => createService(Number.MAX_SAFE_INTEGER));
+});
+
+test("relay constructor enforces a positive safe integer settled dispatch history ttl", () => {
+  const createService = (settledDispatchHistoryTtlMs: number) =>
+    new DesktopBrowserRelayService({
+      relayInstanceId: "relay-a",
+      deploymentCanonicalId: "qm://deployments/example",
+      supportedProtocolVersions: ["1.2"],
+      supportedPolicyGrammarVersions: ["1.0"],
+      registry: new FakeRegistryAdapter(),
+      settledDispatchHistoryTtlMs,
+    });
+
+  assert.throws(
+    () => createService(Number.MAX_SAFE_INTEGER + 1),
+    /settledDispatchHistoryTtlMs must be a positive safe integer/,
+  );
+  assert.throws(() => createService(-1), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.throws(() => createService(0), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.throws(() => createService(1.5), /settledDispatchHistoryTtlMs must be a positive safe integer/);
+  assert.doesNotThrow(() => createService(Number.MAX_SAFE_INTEGER));
+});
+
 function hostChallengeResponse(
   challenge: RelayChallengeMessage,
   input: {

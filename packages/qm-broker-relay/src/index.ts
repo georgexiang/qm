@@ -275,11 +275,14 @@ export class DesktopBrowserRelayService {
     if (this.options.supportedPolicyGrammarVersions.length === 0) {
       throw new Error("at least one supported policy grammar version is required");
     }
-    if (!Number.isInteger(this.options.maxSettledDispatchHistory) || this.options.maxSettledDispatchHistory < 1) {
-      throw new Error("maxSettledDispatchHistory must be a positive integer");
+    if (!Number.isSafeInteger(this.options.maxSettledDispatchHistory) || this.options.maxSettledDispatchHistory < 1) {
+      throw new Error("maxSettledDispatchHistory must be a positive safe integer");
     }
-    if (!Number.isInteger(this.options.settledDispatchHistoryTtlMs) || this.options.settledDispatchHistoryTtlMs < 1) {
-      throw new Error("settledDispatchHistoryTtlMs must be a positive integer");
+    if (
+      !Number.isSafeInteger(this.options.settledDispatchHistoryTtlMs) ||
+      this.options.settledDispatchHistoryTtlMs < 1
+    ) {
+      throw new Error("settledDispatchHistoryTtlMs must be a positive safe integer");
     }
   }
 
