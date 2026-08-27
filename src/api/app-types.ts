@@ -37,6 +37,7 @@ import type {
   DesktopBrowserPublicIdentity,
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRegistrationReservationTuple,
+  HostAcceptedMessage,
   HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import type { ModelGateway } from "../model/model-gateway.ts";
@@ -320,6 +321,10 @@ export interface App {
     taskId: string,
     authorityId: string,
   ): ReturnType<DesktopBrowserTaskStore["prepareSessionStart"]>;
+  desktopBrowserConsumeSessionStartAccepted(
+    taskId: string,
+    accepted: HostAcceptedMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeSessionStartAccepted"]>;
   desktopBrowserConsumeSessionStartResult(
     taskId: string,
     result: HostResultMessage,

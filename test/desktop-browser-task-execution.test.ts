@@ -12,8 +12,10 @@ import {
   DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   DESKTOP_BROWSER_TASK_LEASE_DURATION_MS,
   parseDesktopBrowserSessionStartAuthorityEnvelope,
+  type HostAcceptedMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
+import { createTurnMethods } from "../src/api/app-turn.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/desktop-browser/browser-task-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { projectGroupRef } from "../src/projects/project-store.ts";
@@ -206,12 +208,22 @@ test("the application prepares the registered task from the current Relay projec
   assert.equal(first.operation.authority.membershipEpoch, project.updatedAt);
   assert.equal(first.operation.authority.deviceId, reserved.reservation.publicDeviceFingerprint);
   assert.equal(first.operation.authority.capabilitySet.cliShapeHash, "sha256:cli-shape-current");
+  const accepted: HostAcceptedMessage = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-1",
+      operationId: first.operation.authority.operationId,
+      requestHash: first.operation.requestHash,
+    },
+  };
+  const acceptedResult = await built.app.desktopBrowserConsumeSessionStartAccepted(taskId, accepted);
+  assert.equal(acceptedResult.status, "ok");
   const completed = await built.app.desktopBrowserConsumeSessionStartResult(taskId, {
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
       operationId: first.operation.authority.operationId,
-      accepted: true,
       outcome: "completed",
       resultHash: "sha256:result-current",
       result: {
@@ -281,12 +293,32 @@ test("a completed Host result atomically binds frozen browser ownership to its p
   const prepared = await store.prepareSessionStart(task.id);
   assert.equal(prepared.status, "ok");
   if (prepared.status !== "ok") return;
+  const accepted: HostAcceptedMessage = {
+    protocolVersion: "1.2",
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-1",
+      operationId: prepared.operation.authority.operationId,
+      requestHash: prepared.operation.requestHash,
+    },
+  };
+  assert.equal((await store.consumeSessionStartAccepted("task-2", accepted)).status, "refused");
+  assert.equal(
+    (
+      await store.consumeSessionStartAccepted(task.id, {
+        ...accepted,
+        payload: { ...accepted.payload, operationId: "operation-2" },
+      })
+    ).status,
+    "refused",
+  );
+  const acceptedResult = await store.consumeSessionStartAccepted(task.id, accepted);
+  assert.equal(acceptedResult.status, "ok");
   const completed = {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
       operationId: prepared.operation.authority.operationId,
-      accepted: true,
       outcome: "completed",
       resultHash: "sha256:result-1",
       result: {
@@ -405,9 +437,9 @@ test("Host pre-fence failure and accepted unknown remain distinct without creati
     kind: "host.result",
     payload: {
       operationId: preFence.prepared.operation.authority.operationId,
-      accepted: false,
       outcome: "failed",
       error: { code: "browser_cli_shape_changed", message: "CLI shape changed before acceptance" },
+      resultHash: "sha256:failed-1",
     },
   });
   assert.equal(preFenceResult.status, "ok");
@@ -418,12 +450,21 @@ test("Host pre-fence failure and accepted unknown remain distinct without creati
   assert.deepEqual(preFence.generatedIds, []);
 
   const acceptedUnknown = await preparedStore("task-accepted-unknown");
+  const acceptedUnknownAccepted = await acceptedUnknown.store.consumeSessionStartAccepted(acceptedUnknown.task.id, {
+    protocolVersion: "1.2",
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-accepted-unknown",
+      operationId: acceptedUnknown.prepared.operation.authority.operationId,
+      requestHash: acceptedUnknown.prepared.operation.requestHash,
+    },
+  });
+  assert.equal(acceptedUnknownAccepted.status, "ok");
   const unknownResult = await acceptedUnknown.store.consumeSessionStartResult(acceptedUnknown.task.id, {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
       operationId: acceptedUnknown.prepared.operation.authority.operationId,
-      accepted: true,
       outcome: "unknown",
       resultHash: "sha256:unknown-1",
     },
@@ -488,14 +529,24 @@ test("an expired prepared task refuses its first Host result without binding bro
   });
   const prepared = await store.prepareSessionStart(task.id);
   assert.equal(prepared.status, "ok");
+  if (prepared.status !== "ok") return;
+  const accepted = await store.consumeSessionStartAccepted(task.id, {
+    protocolVersion: "1.2",
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-expired",
+      operationId: prepared.operation.authority.operationId,
+      requestHash: prepared.operation.requestHash,
+    },
+  });
+  assert.equal(accepted.status, "ok");
   currentTime = issuedAt + 60_001;
 
   const consumed = await store.consumeSessionStartResult(task.id, {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
-      operationId: prepared.status === "ok" ? prepared.operation.authority.operationId : "unexpected",
-      accepted: true,
+      operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-1",
       result: {
@@ -591,14 +642,24 @@ test("the application refuses the first Host result after project membership dri
   });
   const prepared = await built.app.desktopBrowserPrepareSessionStart(taskId!, authorityId!);
   assert.equal(prepared.status, "ok");
+  if (prepared.status !== "ok") return;
+  const accepted = await built.app.desktopBrowserConsumeSessionStartAccepted(taskId!, {
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-drift",
+      operationId: prepared.operation.authority.operationId,
+      requestHash: prepared.operation.requestHash,
+    },
+  });
+  assert.equal(accepted.status, "ok");
   assert.equal((await built.app.addProjectMember(project.id, "owner", "member")).status, "ok");
 
   const consumed = await built.app.desktopBrowserConsumeSessionStartResult(taskId!, {
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
-      operationId: prepared.status === "ok" ? prepared.operation.authority.operationId : "unexpected",
-      accepted: true,
+      operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-current",
       result: {
@@ -614,4 +675,490 @@ test("the application refuses the first Host result after project membership dri
     reason: "Desktop Browser Task authorization is no longer current",
   });
   assert.equal((await built.desktopBrowserTasks.get(taskId!))?.browserSkillSessionId, undefined);
+});
+
+test("reserve rereads the current task inside the roster lock before registry mutation", async () => {
+  const task = {
+    id: "task-1",
+    status: "waiting_for_broker",
+    goal: "Open the shared browser",
+    actorId: "owner",
+    actorSnapshot: { id: "owner", displayName: "Owner" },
+    projectId: "project-1",
+    projectSnapshot: { id: "project-1", name: "Project" },
+    projectMembershipVersion: "42",
+    authorityId: "authority-1",
+    authorityExpiresAt: Date.now() + 60_000,
+    sessionId: "session-1",
+    threadRef: "thread-1",
+    createdAt: 1,
+    updatedAt: 1,
+  } satisfies DesktopBrowserTask;
+  let currentTask: DesktopBrowserTask | null = structuredClone(task);
+  let reserveCalls = 0;
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (principalId: string) => ({ id: principalId, type: "internal" }),
+        isInternal: () => true,
+      },
+      desktopBrowserTasks: {
+        get: async () => (currentTask ? structuredClone(currentTask) : null),
+      },
+      desktopBrowserDeviceRegistry: {
+        reserve: async () => {
+          reserveCalls += 1;
+          return { status: "refused", reason: "unexpected reserve" } as const;
+        },
+        taskRegistration: async () => null,
+      },
+      projects: {
+        withRosterLock: async (_projectId: string, fn: (project: any) => Promise<any>) => {
+          currentTask = { ...task, status: "canceled", updatedAt: task.updatedAt + 1 };
+          return fn({
+            id: task.projectId,
+            orgId: "acme",
+            ownerId: "owner",
+            memberIds: ["owner"],
+            channelMemberIds: [],
+            updatedAt: 42,
+          });
+        },
+      },
+      publicWebUrl: "https://qm.example.com",
+      auditLog: { record: () => undefined },
+    } as any,
+    {
+      withAdminLink: async (value: any) => value,
+      drive: () => ({ status: "failed", reason: "unused" }),
+      approvalRecordIsCurrent: async () => false,
+      approvalVisibleToViewer: async () => false,
+      pendingApprovalForSession: async () => [],
+      pendingApprovalResultForThread: async () => null,
+      mayUseSharedScope: async () => false,
+      viewerMayUseRun: async () => false,
+      sessionsForViewer: async () => [],
+      replayOrphanedRunSignals: async () => [],
+    } as any,
+    {
+      shouldRouteToSpine: () => false,
+      markTriggerHandled: () => undefined,
+      addressedWakeText: async () => "",
+    } as any,
+  );
+
+  const reserved = await app.desktopBrowserReserveRegistration(task.id, task.authorityId, {
+    devicePublicKey: "ed25519:device",
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+    operatingSystem: "macos-arm64",
+  });
+
+  assert.deepEqual(reserved, {
+    status: "refused",
+    reason: "Desktop Browser Task is no longer waiting",
+  });
+  assert.equal(reserveCalls, 0);
+});
+
+test("confirm rereads the current task inside the roster lock before registry mutation", async () => {
+  const task = {
+    id: "task-1",
+    status: "waiting_for_broker",
+    goal: "Open the shared browser",
+    actorId: "owner",
+    actorSnapshot: { id: "owner", displayName: "Owner" },
+    projectId: "project-1",
+    projectSnapshot: { id: "project-1", name: "Project" },
+    projectMembershipVersion: "42",
+    authorityId: "authority-1",
+    authorityExpiresAt: Date.now() + 60_000,
+    sessionId: "session-1",
+    threadRef: "thread-1",
+    createdAt: 1,
+    updatedAt: 1,
+  } satisfies DesktopBrowserTask;
+  let currentTask: DesktopBrowserTask | null = structuredClone(task);
+  let confirmCalls = 0;
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (principalId: string) => ({ id: principalId, type: "internal" }),
+        isInternal: () => true,
+      },
+      desktopBrowserTasks: {
+        get: async (id: string) => {
+          if (id === task.id) return currentTask ? structuredClone(currentTask) : null;
+          return null;
+        },
+      },
+      desktopBrowserDeviceRegistry: {
+        get: async () => ({
+          registrationId: "registration-1",
+          waitingTaskId: task.id,
+          actorId: task.actorId,
+          projectId: task.projectId,
+          membershipEpoch: 42,
+          authorityId: task.authorityId,
+          authorityExpiresAt: task.authorityExpiresAt,
+          status: "pending",
+          confirmationFingerprint: "fingerprint-1",
+        }),
+        stagedConfirmation: async () => ({
+          browserRuntimeStatus: "ready",
+          envelope: {
+            registrationTuple: {
+              registrationProtocolVersion: "1.0",
+              deploymentCanonicalId: "qm://deployments/example",
+              registrationId: "registration-1",
+              actorId: task.actorId,
+              originatingProjectId: task.projectId,
+              membershipEpoch: 42,
+              devicePublicKey: "ed25519:device",
+              brokerInstanceId: "broker-1",
+              browserInstanceId: "browser-1",
+              connectionEpoch: 7,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            },
+            publicIdentity: {
+              publicIdentityVersion: "1.0",
+              deploymentCanonicalId: "qm://deployments/example",
+              devicePublicKey: "ed25519:device",
+              brokerInstanceId: "broker-1",
+              browserInstanceId: "browser-1",
+            },
+            confirmationFingerprint: "fingerprint-1",
+            signatureAlgorithm: "ed25519",
+            signature: "signature",
+          },
+        }),
+        confirm: async () => {
+          confirmCalls += 1;
+          return { status: "refused", reason: "unexpected confirm" } as const;
+        },
+        invalidate: async () => undefined,
+        taskRegistration: async () => null,
+      },
+      projects: {
+        withRosterLock: async (_projectId: string, fn: (project: any) => Promise<any>) => {
+          currentTask = { ...task, status: "canceled", updatedAt: task.updatedAt + 1 };
+          return fn({
+            id: task.projectId,
+            orgId: "acme",
+            ownerId: "owner",
+            memberIds: ["owner"],
+            channelMemberIds: [],
+            updatedAt: 42,
+          });
+        },
+      },
+      publicWebUrl: "https://qm.example.com",
+      auditLog: { record: () => undefined },
+    } as any,
+    {
+      withAdminLink: async (value: any) => value,
+      drive: () => ({ status: "failed", reason: "unused" }),
+      approvalRecordIsCurrent: async () => false,
+      approvalVisibleToViewer: async () => false,
+      pendingApprovalForSession: async () => [],
+      pendingApprovalResultForThread: async () => null,
+      mayUseSharedScope: async () => false,
+      viewerMayUseRun: async () => false,
+      sessionsForViewer: async () => [],
+      replayOrphanedRunSignals: async () => [],
+    } as any,
+    {
+      shouldRouteToSpine: () => false,
+      markTriggerHandled: () => undefined,
+      addressedWakeText: async () => "",
+    } as any,
+  );
+
+  const confirmed = await app.desktopBrowserConfirmRegistration("registration-1", task.actorId, task.authorityId, {
+    taskId: task.id,
+    confirmationFingerprint: "fingerprint-1",
+  });
+
+  assert.deepEqual(confirmed, {
+    status: "refused",
+    reason: "Desktop Browser Task is no longer waiting",
+  });
+  assert.equal(confirmCalls, 0);
+});
+
+test("the application refuses the first Host bind when the registered device rotates after preparation", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-session-start-rotation-")),
+      publicWebUrl: "https://qm.example.com",
+    }),
+  );
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  const project = await built.app.createProject("owner", "Rotation Project");
+  assert.ok(project);
+  const created = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "owner", displayName: "Owner" },
+    conversation: {
+      kind: "group",
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:desktop-browser-session-start-rotation",
+      audience: [],
+    },
+    text: "/desktop-browser open the quarterly planning page",
+  });
+  const taskId = created.desktopBrowserActivity?.taskId;
+  const authorityId = created.desktopBrowserActivity?.actionAuthority;
+  assert.ok(taskId);
+  assert.ok(authorityId);
+  const firstKeys = generateKeyPairSync("ed25519");
+  const reserveOne = await built.app.desktopBrowserReserveRegistration(taskId!, authorityId!, {
+    devicePublicKey: `ed25519:${Buffer.from(firstKeys.publicKey.export({ format: "der", type: "spki" })).toString("base64")}`,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+    operatingSystem: "macos-arm64",
+  });
+  assert.equal(reserveOne.status, "ok");
+  if (reserveOne.status !== "ok") return;
+  const envelopeOne = {
+    registrationTuple: reserveOne.reservation.registrationTuple,
+    publicIdentity: reserveOne.reservation.publicIdentity,
+    confirmationFingerprint: reserveOne.reservation.confirmationFingerprint,
+    signatureAlgorithm: "ed25519" as const,
+    signature: Buffer.from(
+      sign(null, Buffer.from(reserveOne.reservation.verificationBytesBase64, "base64"), firstKeys.privateKey),
+    ).toString("base64"),
+  };
+  await built.app.desktopBrowserStageRegistrationConfirmation(reserveOne.reservation.registrationTuple.registrationId, {
+    browserRuntimeStatus: "ready",
+    envelope: envelopeOne,
+  });
+  assert.equal(
+    (
+      await built.app.desktopBrowserConfirmRegistration(
+        reserveOne.reservation.registrationTuple.registrationId,
+        "owner",
+        authorityId!,
+        { taskId: taskId!, confirmationFingerprint: reserveOne.reservation.confirmationFingerprint },
+      )
+    ).status,
+    "ok",
+  );
+  await built.app.desktopBrowserPublishRelayConnection({
+    connectionId: "connection-1",
+    publicDeviceFingerprint: reserveOne.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+    registrationState: "registered",
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    policyGrammarVersion: "1.0",
+    brokerVersion: "2.0.0",
+    bskVersion: "3.0.0",
+    extensionVersion: "4.0.0",
+    cliShapeHash: "sha256:cli-shape-current",
+    lastSeenAt: new Date().toISOString(),
+  });
+  const prepared = await built.app.desktopBrowserPrepareSessionStart(taskId!, authorityId!);
+  assert.equal(prepared.status, "ok");
+  if (prepared.status !== "ok") return;
+
+  const rotated = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "owner", displayName: "Owner" },
+    conversation: {
+      kind: "group",
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:owner:desktop-browser-session-start-rotation-next",
+      audience: [],
+    },
+    text: "/desktop-browser open the quarterly planning page again",
+  });
+  const rotatedTaskId = rotated.desktopBrowserActivity?.taskId;
+  const rotatedAuthorityId = rotated.desktopBrowserActivity?.actionAuthority;
+  assert.ok(rotatedTaskId);
+  assert.ok(rotatedAuthorityId);
+
+  const secondKeys = generateKeyPairSync("ed25519");
+  const reserveTwo = await built.app.desktopBrowserReserveRegistration(rotatedTaskId!, rotatedAuthorityId!, {
+    devicePublicKey: `ed25519:${Buffer.from(secondKeys.publicKey.export({ format: "der", type: "spki" })).toString("base64")}`,
+    brokerInstanceId: "broker-2",
+    browserInstanceId: "browser-secondary",
+    connectionEpoch: 8,
+    operatingSystem: "macos-arm64",
+  });
+  assert.equal(reserveTwo.status, "ok");
+  if (reserveTwo.status !== "ok") return;
+  const envelopeTwo = {
+    registrationTuple: reserveTwo.reservation.registrationTuple,
+    publicIdentity: reserveTwo.reservation.publicIdentity,
+    confirmationFingerprint: reserveTwo.reservation.confirmationFingerprint,
+    signatureAlgorithm: "ed25519" as const,
+    signature: Buffer.from(
+      sign(null, Buffer.from(reserveTwo.reservation.verificationBytesBase64, "base64"), secondKeys.privateKey),
+    ).toString("base64"),
+  };
+  await built.app.desktopBrowserStageRegistrationConfirmation(reserveTwo.reservation.registrationTuple.registrationId, {
+    browserRuntimeStatus: "ready",
+    envelope: envelopeTwo,
+  });
+  assert.equal(
+    (
+      await built.app.desktopBrowserConfirmRegistration(
+        reserveTwo.reservation.registrationTuple.registrationId,
+        "owner",
+        rotatedAuthorityId!,
+        { taskId: rotatedTaskId!, confirmationFingerprint: reserveTwo.reservation.confirmationFingerprint },
+      )
+    ).status,
+    "ok",
+  );
+  await built.app.desktopBrowserPublishRelayConnection({
+    connectionId: "connection-2",
+    publicDeviceFingerprint: reserveTwo.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-2",
+    browserInstanceId: "browser-secondary",
+    connectionEpoch: 8,
+    registrationState: "registered",
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    policyGrammarVersion: "1.0",
+    brokerVersion: "2.0.0",
+    bskVersion: "3.0.0",
+    extensionVersion: "4.0.0",
+    cliShapeHash: "sha256:cli-shape-current",
+    lastSeenAt: new Date().toISOString(),
+  });
+
+  const accepted = await built.app.desktopBrowserConsumeSessionStartAccepted(taskId!, {
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    kind: "host.accepted",
+    payload: {
+      dispatchId: "dispatch-rotation",
+      operationId: prepared.operation.authority.operationId,
+      requestHash: prepared.operation.requestHash,
+    },
+  });
+  assert.equal(accepted.status, "ok");
+  const consumed = await built.app.desktopBrowserConsumeSessionStartResult(taskId!, {
+    protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+    kind: "host.result",
+    payload: {
+      operationId: prepared.operation.authority.operationId,
+      outcome: "completed",
+      resultHash: "sha256:result-rotation",
+      result: {
+        session_id: "browser-skill-session-rotation",
+        browser_instance_id: "browser-primary",
+        agent_window_id: 77,
+      },
+    },
+  });
+
+  assert.deepEqual(consumed, {
+    status: "refused",
+    reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+  });
+  assert.equal((await built.desktopBrowserTasks.get(taskId!))?.browserSkillSessionId, undefined);
+});
+
+test("the task store refuses the first Host bind when the current capability set drifts after preparation", async () => {
+  const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
+  const generatedIds = ["task-1", "attempt-1", "lease-1", "operation-1", "nonce-1"];
+  let authorityState = {
+    registration: {
+      deploymentCanonicalId: "qm://deployments/example",
+      registrationId: "registration-1",
+      waitingTaskId: "task-1",
+      actorId: "actor-1",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: issuedAt + 120_000,
+      publicDeviceFingerprint: "sha256:device-1",
+      browserInstanceId: "browser-primary",
+      status: "online" as const,
+      browserRuntimeStatus: "ready" as const,
+    },
+    relayConnection: {
+      connectionId: "connection-1",
+      publicDeviceFingerprint: "sha256:device-1",
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-primary",
+      connectionEpoch: 7,
+      registrationState: "registered" as const,
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.0",
+      brokerVersion: "2.0.0",
+      bskVersion: "3.0.0",
+      extensionVersion: "4.0.0",
+      cliShapeHash: "sha256:cli-shape-1",
+      lastSeenAt: "2026-08-27T12:00:00.000Z",
+    },
+  };
+  const store = createDesktopBrowserTaskStore(createMemoryMap(), {
+    id: () => generatedIds.shift()!,
+    now: () => issuedAt,
+    sessionStartAuthority: async () => structuredClone(authorityState),
+  });
+  const task = await store.createWaiting({
+    goal: "Open the shared browser",
+    actorId: "actor-1",
+    projectId: "project-1",
+    projectName: "Apollo",
+    projectMembershipVersion: "42",
+    authorityId: "authority-1",
+    authorityExpiresAt: issuedAt + 120_000,
+    sessionId: "session-1",
+    threadRef: "thread-1",
+  });
+  const prepared = await store.prepareSessionStart(task.id);
+  assert.equal(prepared.status, "ok");
+  if (prepared.status !== "ok") return;
+  assert.equal(
+    (
+      await store.consumeSessionStartAccepted(task.id, {
+        protocolVersion: "1.2",
+        kind: "host.accepted",
+        payload: {
+          dispatchId: "dispatch-drift",
+          operationId: prepared.operation.authority.operationId,
+          requestHash: prepared.operation.requestHash,
+        },
+      })
+    ).status,
+    "ok",
+  );
+
+  authorityState = {
+    ...authorityState,
+    relayConnection: {
+      ...authorityState.relayConnection,
+      cliShapeHash: "sha256:cli-shape-2",
+    },
+  };
+
+  const consumed = await store.consumeSessionStartResult(task.id, {
+    protocolVersion: "1.2",
+    kind: "host.result",
+    payload: {
+      operationId: prepared.operation.authority.operationId,
+      outcome: "completed",
+      resultHash: "sha256:result-1",
+      result: {
+        session_id: "browser-skill-session-1",
+        browser_instance_id: "browser-primary",
+        agent_window_id: 42,
+      },
+    },
+  });
+
+  assert.deepEqual(consumed, {
+    status: "refused",
+    reason: "Desktop Browser Relay connection capability set no longer matches the prepared task",
+  });
+  assert.equal((await store.get(task.id))?.browserSkillSessionId, undefined);
 });

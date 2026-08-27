@@ -161,6 +161,11 @@ export interface DesktopBrowserDeviceRegistry {
   publishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
   clearRelayConnection(connectionId: string): Promise<void>;
   sessionStartAuthority(waitingTaskId: string): Promise<DesktopBrowserSessionStartAuthoritySnapshot | null>;
+  sessionStartAuthorityState(
+    waitingTaskId: string,
+  ): Promise<
+    { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string }
+  >;
 }
 
 function iso(at: number): string {
@@ -831,15 +836,25 @@ export function createDesktopBrowserDeviceRegistry(
     },
 
     async sessionStartAuthority(waitingTaskId) {
+      const state = await this.sessionStartAuthorityState(waitingTaskId);
+      return state.status === "ok" ? state.authority : null;
+    },
+
+    async sessionStartAuthorityState(waitingTaskId) {
       const state = await readState();
       const claim = claimForTask(state, waitingTaskId);
-      if (!claim) return null;
+      if (!claim) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
       const registration = state.registrations[claim.registrationId];
-      if (!registration || registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
-        return null;
-      }
+      if (!registration)
+        return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
       if (currentProjectHead(state, registration.projectId)?.registrationId !== registration.registrationId) {
-        return null;
+        return {
+          status: "refused",
+          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+        };
+      }
+      if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
+        return { status: "refused", reason: "Desktop Browser device is not online" };
       }
       const relayConnection = Object.values(state.relayConnections)
         .filter(
@@ -855,23 +870,31 @@ export function createDesktopBrowserDeviceRegistry(
             Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt) ||
             left.connectionId.localeCompare(right.connectionId),
         )[0];
-      if (!relayConnection) return null;
+      if (!relayConnection) {
+        return {
+          status: "refused",
+          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+        };
+      }
       return {
-        registration: {
-          deploymentCanonicalId: registration.registrationTuple.deploymentCanonicalId,
-          registrationId: registration.registrationId,
-          waitingTaskId: registration.waitingTaskId,
-          actorId: registration.actorId,
-          projectId: registration.projectId,
-          membershipEpoch: registration.membershipEpoch,
-          authorityId: registration.authorityId,
-          authorityExpiresAt: registration.authorityExpiresAt,
-          publicDeviceFingerprint: registration.publicDeviceFingerprint,
-          browserInstanceId: registration.registrationTuple.browserInstanceId,
-          status: "online",
-          browserRuntimeStatus: "ready",
+        status: "ok",
+        authority: {
+          registration: {
+            deploymentCanonicalId: registration.registrationTuple.deploymentCanonicalId,
+            registrationId: registration.registrationId,
+            waitingTaskId: registration.waitingTaskId,
+            actorId: registration.actorId,
+            projectId: registration.projectId,
+            membershipEpoch: registration.membershipEpoch,
+            authorityId: registration.authorityId,
+            authorityExpiresAt: registration.authorityExpiresAt,
+            publicDeviceFingerprint: registration.publicDeviceFingerprint,
+            browserInstanceId: registration.registrationTuple.browserInstanceId,
+            status: "online",
+            browserRuntimeStatus: "ready",
+          },
+          relayConnection: { ...relayConnection },
         },
-        relayConnection: { ...relayConnection },
       };
     },
   };
