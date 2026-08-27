@@ -613,6 +613,9 @@ export class DesktopBrowserRelayService {
       if (!pending.accepted) {
         throw new Error("host.result arrived before host.accepted");
       }
+      if (message.payload.dispatchId !== pending.accepted.payload.dispatchId) {
+        throw new Error("host.result dispatch does not match the accepted invocation");
+      }
       if (message.payload.operationId !== pending.accepted.payload.operationId) {
         throw new Error("host.result operation does not match the accepted invocation");
       }

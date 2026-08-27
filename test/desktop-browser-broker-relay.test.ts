@@ -267,6 +267,7 @@ function completedResultFor(
     ...desktopBrowserSessionStartCompletedResultFixture,
     payload: {
       ...desktopBrowserSessionStartCompletedResultFixture.payload,
+      dispatchId: invocation.payload.dispatchId,
       operationId: invocation.payload.authority.operationId,
       result: {
         ...desktopBrowserSessionStartCompletedResultFixture.payload.result,
@@ -682,6 +683,32 @@ test("relay fences the socket and returns accepted_unknown when host.result name
   assert.match(socket.closeReason ?? "", /operation does not match/i);
 });
 
+test("relay fences the socket and returns accepted_unknown when host.result names the wrong accepted dispatch", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const result = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  const accepted = acceptedMessageFor();
+  socket.message(JSON.stringify(accepted));
+  socket.message(
+    JSON.stringify({
+      ...completedResultFor(),
+      payload: {
+        ...completedResultFor().payload,
+        dispatchId: "0198f3d2-1950-7000-8000-000000000099",
+      },
+    }),
+  );
+
+  assertAcceptedUnknown(await result, accepted, /dispatch does not match the accepted invocation/i);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /dispatch does not match/i);
+});
+
 test("relay rejects a host.result that arrives before host.accepted", async () => {
   const { identity, service, socket } = await createRegisteredTicket05Relay();
   const result = service.dispatchInvocation({
@@ -814,7 +841,22 @@ test("relay returns not_accepted_or_unknown for a stale dispatch when a newer co
   });
   const currentSocket = new FakeSocket();
   service.acceptSocket(currentSocket);
-  currentSocket.message(hostHello(identity.devicePublicKey, "broker-a"));
+  currentSocket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.2"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
   await flushMessages();
   currentSocket.message(
     hostChallengeResponse(challengeAt(currentSocket), {
@@ -837,6 +879,81 @@ test("relay returns not_accepted_or_unknown for a stale dispatch when a newer co
   staleSocket.message(JSON.stringify(completedResultFor()));
   await flushMessages();
   assert.equal(currentSocket.closeCode, undefined);
+});
+
+test("relay ignores a delayed terminal from settled dispatch A and still resolves accepted dispatch B for the same operation and request hash", async () => {
+  const { adapter, identity, service, socket: staleSocket } = await createRegisteredTicket05Relay();
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+  const first = dispatch(desktopBrowserRelayInvocationFixture);
+  await flushMessages();
+  const firstAccepted = acceptedMessageFor();
+  staleSocket.message(JSON.stringify(firstAccepted));
+  await flushMessages();
+
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 8,
+  });
+  const currentSocket = new FakeSocket();
+  service.acceptSocket(currentSocket);
+  currentSocket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.2"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        bskVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.bskVersion,
+        extensionVersion: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.extensionVersion,
+        cliShapeHash: desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet.cliShapeHash,
+      },
+    }),
+  );
+  await flushMessages();
+  currentSocket.message(
+    hostChallengeResponse(challengeAt(currentSocket), {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+
+  assertAcceptedUnknown(await first, firstAccepted, /replaced by a newer relay registration/i);
+  assert.equal(staleSocket.closeCode, 1008);
+  assert.match(staleSocket.closeReason ?? "", /replaced by a newer relay registration/i);
+
+  const secondInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+    },
+  };
+  const second = dispatch(secondInvocation);
+  await flushMessages();
+  const secondAccepted = acceptedMessageFor(secondInvocation);
+  currentSocket.message(JSON.stringify(secondAccepted));
+  await flushMessages();
+
+  staleSocket.message(JSON.stringify(completedResultFor()));
+  await flushMessages();
+  assert.equal(currentSocket.closeCode, undefined);
+
+  const secondCompleted = completedResultFor(secondInvocation);
+  currentSocket.message(JSON.stringify(secondCompleted));
+  assertCompletedResult(await second, secondAccepted, secondCompleted);
 });
 
 test("relay negotiates the highest exact shared protocol version during hello", async () => {
