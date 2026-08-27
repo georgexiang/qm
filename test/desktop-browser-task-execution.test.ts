@@ -22,6 +22,127 @@ import { projectGroupRef } from "../src/projects/project-store.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 
+async function createPreparedCallbackHarness() {
+  const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
+  let currentTime = issuedAt;
+  const generatedIds = ["task-1", "attempt-1", "lease-1", "operation-1", "nonce-1"];
+  let sessionStartAuthorityStateCalls = 0;
+  let validatedAuthorityCalls = 0;
+  const authorityState = {
+    registration: {
+      deploymentCanonicalId: "qm://deployments/example",
+      registrationId: "registration-1",
+      waitingTaskId: "task-1",
+      actorId: "actor-1",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: issuedAt + 120_000,
+      publicDeviceFingerprint: "sha256:device-1",
+      browserInstanceId: "browser-primary",
+      status: "online" as const,
+      browserRuntimeStatus: "ready" as const,
+    },
+    relayConnection: {
+      connectionId: "connection-1",
+      publicDeviceFingerprint: "sha256:device-1",
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-primary",
+      connectionEpoch: 7,
+      registrationState: "registered" as const,
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.0",
+      brokerVersion: "2.0.0",
+      bskVersion: "3.0.0",
+      extensionVersion: "4.0.0",
+      cliShapeHash: "sha256:cli-shape-1",
+      lastSeenAt: "2026-08-27T12:00:00.000Z",
+    },
+  };
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const store = createDesktopBrowserTaskStore(backing, {
+    id: () => generatedIds.shift()!,
+    now: () => currentTime,
+    sessionStartAuthority: async () => structuredClone(authorityState),
+  });
+  const task = await store.createWaiting({
+    goal: "Open the shared browser",
+    actorId: "actor-1",
+    projectId: "project-1",
+    projectName: "Apollo",
+    projectMembershipVersion: "42",
+    authorityId: "authority-1",
+    authorityExpiresAt: issuedAt + 120_000,
+    sessionId: "session-1",
+    threadRef: "thread-1",
+  });
+  const prepared = await store.prepareSessionStart(task.id);
+  assert.equal(prepared.status, "ok");
+  if (prepared.status !== "ok") throw new Error("session start was not prepared");
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (principalId: string) => ({ id: principalId, type: "internal" }),
+        isInternal: () => true,
+      },
+      desktopBrowserTasks: store,
+      desktopBrowserDeviceRegistry: {
+        sessionStartAuthorityState: async () => {
+          sessionStartAuthorityStateCalls += 1;
+          return { status: "ok" as const, authority: structuredClone(authorityState) };
+        },
+        withValidatedSessionStartAuthority: async (
+          _waitingTaskId: string,
+          _operation: unknown,
+          fn: (currentAuthority: { status: "ok"; authority: typeof authorityState }) => Promise<unknown>,
+        ) => {
+          validatedAuthorityCalls += 1;
+          return await fn({ status: "ok", authority: structuredClone(authorityState) });
+        },
+      },
+      projects: {
+        withRosterLock: async () => {
+          throw new Error("roster lock should not be consulted for callback evidence");
+        },
+      },
+      publicWebUrl: "https://qm.example.com",
+      auditLog: { record: () => undefined },
+    } as any,
+    {
+      withAdminLink: async (value: any) => value,
+      drive: () => ({ status: "failed", reason: "unused" }),
+      approvalRecordIsCurrent: async () => false,
+      approvalVisibleToViewer: async () => false,
+      pendingApprovalForSession: async () => [],
+      pendingApprovalResultForThread: async () => null,
+      mayUseSharedScope: async () => false,
+      viewerMayUseRun: async () => false,
+      sessionsForViewer: async () => [],
+      replayOrphanedRunSignals: async () => [],
+    } as any,
+    {
+      shouldRouteToSpine: () => false,
+      markTriggerHandled: () => undefined,
+      addressedWakeText: async () => "",
+    } as any,
+  );
+  return {
+    app,
+    backing,
+    store,
+    task,
+    prepared: prepared.operation,
+    setCurrentTime: (value: number) => {
+      currentTime = value;
+    },
+    counters: {
+      sessionStartAuthorityStateCalls: () => sessionStartAuthorityStateCalls,
+      validatedAuthorityCalls: () => validatedAuthorityCalls,
+    },
+  };
+}
+
 test("an authorized waiting task prepares one durable session-start operation for its online bound device", async () => {
   const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
   const generatedIds = ["task-1", "attempt-1", "lease-1", "operation-1", "nonce-1"];
@@ -509,7 +630,104 @@ test("Host result requires prior acceptance while accepted unknown remains disti
   assert.deepEqual(acceptedUnknown.generatedIds, []);
 });
 
-test("an expired prepared task refuses its first Host result without binding browser ownership", async () => {
+test("the application records delayed Host acceptance after cancellation or authority expiry", async () => {
+  for (const scenario of ["canceled", "expired"] as const) {
+    const harness = await createPreparedCallbackHarness();
+    const accepted: HostAcceptedMessage = {
+      protocolVersion: "1.2",
+      kind: "host.accepted",
+      payload: {
+        dispatchId: `dispatch-${scenario}`,
+        operationId: harness.prepared.authority.operationId,
+        requestHash: harness.prepared.requestHash,
+      },
+    };
+
+    if (scenario === "canceled") {
+      assert.equal((await harness.store.cancelWaiting(harness.task.id))?.status, "canceled");
+    } else {
+      await harness.backing.update?.(harness.task.id, (current) => ({
+        ...current,
+        authorityExpiresAt: 1,
+        updatedAt: current.updatedAt + 1,
+      }));
+    }
+
+    const recorded = await harness.app.desktopBrowserConsumeSessionStartAccepted(harness.task.id, accepted);
+
+    assert.equal(recorded.status, "ok");
+    if (recorded.status !== "ok") return;
+    assert.deepEqual(recorded.task.execution?.hostAccepted, accepted);
+    assert.equal(recorded.task.status, scenario === "canceled" ? "canceled" : "waiting_for_broker");
+    assert.equal(harness.counters.sessionStartAuthorityStateCalls(), 0);
+    assert.equal(harness.counters.validatedAuthorityCalls(), 0);
+  }
+});
+
+test("the application records delayed failed and unknown Host results after cancellation without rewriting the first outcome", async () => {
+  for (const outcome of ["failed", "unknown"] as const) {
+    const harness = await createPreparedCallbackHarness();
+    const accepted: HostAcceptedMessage = {
+      protocolVersion: "1.2",
+      kind: "host.accepted",
+      payload: {
+        dispatchId: `dispatch-${outcome}`,
+        operationId: harness.prepared.authority.operationId,
+        requestHash: harness.prepared.requestHash,
+      },
+    };
+    assert.equal((await harness.store.consumeSessionStartAccepted(harness.task.id, accepted)).status, "ok");
+    assert.equal((await harness.store.cancelWaiting(harness.task.id))?.status, "canceled");
+
+    const recorded = await harness.app.desktopBrowserConsumeSessionStartResult(harness.task.id, {
+      protocolVersion: "1.2",
+      kind: "host.result",
+      payload:
+        outcome === "failed"
+          ? {
+              dispatchId: accepted.payload.dispatchId,
+              operationId: harness.prepared.authority.operationId,
+              outcome,
+              resultHash: `sha256:${outcome}-1`,
+              error: { code: "browser_cli_shape_changed", message: `${outcome} after cancel` },
+            }
+          : {
+              dispatchId: accepted.payload.dispatchId,
+              operationId: harness.prepared.authority.operationId,
+              outcome,
+              resultHash: `sha256:${outcome}-1`,
+            },
+    });
+
+    assert.equal(recorded.status, "ok");
+    if (recorded.status !== "ok") return;
+    assert.equal(recorded.task.status, "canceled");
+    assert.equal(recorded.task.browserSkillSessionId, undefined);
+    assert.equal(recorded.task.execution?.attemptStatus, outcome === "failed" ? "accepted_failed" : "accepted_unknown");
+    assert.equal(recorded.task.execution?.hostResult?.payload.outcome, outcome);
+    assert.equal(harness.counters.sessionStartAuthorityStateCalls(), 0);
+    assert.equal(harness.counters.validatedAuthorityCalls(), 0);
+
+    const refused = await harness.app.desktopBrowserConsumeSessionStartResult(harness.task.id, {
+      protocolVersion: "1.2",
+      kind: "host.result",
+      payload: {
+        dispatchId: accepted.payload.dispatchId,
+        operationId: harness.prepared.authority.operationId,
+        outcome: outcome === "failed" ? "unknown" : "failed",
+        resultHash: `sha256:${outcome}-2`,
+      },
+    });
+
+    assert.deepEqual(refused, {
+      status: "refused",
+      reason: "Desktop Browser Task already recorded a Host result",
+    });
+    assert.equal((await harness.store.get(harness.task.id))?.execution?.hostResult?.payload.outcome, outcome);
+  }
+});
+
+test("an expired prepared task records a completed Host result as evidence without binding browser ownership", async () => {
   const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
   let currentTime = issuedAt;
   const generatedIds = ["task-1", "attempt-1", "lease-1", "operation-1", "nonce-1"];
@@ -590,14 +808,14 @@ test("an expired prepared task refuses its first Host result without binding bro
     },
   });
 
-  assert.deepEqual(consumed, {
-    status: "refused",
-    reason: "Desktop Browser Turn authority expired; start a new Turn",
-  });
-  assert.equal((await store.get(task.id))?.browserSkillSessionId, undefined);
+  assert.equal(consumed.status, "ok");
+  if (consumed.status !== "ok") return;
+  assert.equal(consumed.task.browserSkillSessionId, undefined);
+  assert.equal(consumed.task.execution?.attemptStatus, "accepted_completed_unbound");
+  assert.equal(consumed.task.execution?.hostResult?.payload.outcome, "completed");
 });
 
-test("the application refuses the first Host result after project membership drift", async () => {
+test("the application retains a completed Host result as evidence after project membership drift without binding browser ownership", async () => {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-session-start-drift-")),
@@ -704,10 +922,11 @@ test("the application refuses the first Host result after project membership dri
     },
   });
 
-  assert.deepEqual(consumed, {
-    status: "refused",
-    reason: "Desktop Browser Task authorization is no longer current",
-  });
+  assert.equal(consumed.status, "ok");
+  if (consumed.status !== "ok") return;
+  assert.equal(consumed.task.browserSkillSessionId, undefined);
+  assert.equal(consumed.task.execution?.attemptStatus, "accepted_completed_unbound");
+  assert.equal(consumed.task.execution?.hostResult?.payload.outcome, "completed");
   assert.equal((await built.desktopBrowserTasks.get(taskId!))?.browserSkillSessionId, undefined);
 });
 
@@ -923,7 +1142,7 @@ test("confirm rereads the current task inside the roster lock before registry mu
   assert.equal(confirmCalls, 0);
 });
 
-test("the application refuses the first Host bind when the registered device rotates after preparation", async () => {
+test("the application retains a late completed Host result as evidence when the registered device rotates after preparation", async () => {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-session-start-rotation-")),
@@ -1093,14 +1312,15 @@ test("the application refuses the first Host bind when the registered device rot
     },
   });
 
-  assert.deepEqual(consumed, {
-    status: "refused",
-    reason: "Desktop Browser Relay connection is no longer bound to the registered device",
-  });
+  assert.equal(consumed.status, "ok");
+  if (consumed.status !== "ok") return;
+  assert.equal(consumed.task.browserSkillSessionId, undefined);
+  assert.equal(consumed.task.execution?.attemptStatus, "accepted_completed_unbound");
+  assert.equal(consumed.task.execution?.hostResult?.payload.outcome, "completed");
   assert.equal((await built.desktopBrowserTasks.get(taskId!))?.browserSkillSessionId, undefined);
 });
 
-test("the task store refuses the first Host bind when the current capability set drifts after preparation", async () => {
+test("the task store retains a completed Host result as evidence when the current capability set drifts after preparation", async () => {
   const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
   const generatedIds = ["task-1", "attempt-1", "lease-1", "operation-1", "nonce-1"];
   let authorityState = {
@@ -1192,9 +1412,10 @@ test("the task store refuses the first Host bind when the current capability set
     },
   });
 
-  assert.deepEqual(consumed, {
-    status: "refused",
-    reason: "Desktop Browser Relay connection capability set no longer matches the prepared task",
-  });
+  assert.equal(consumed.status, "ok");
+  if (consumed.status !== "ok") return;
+  assert.equal(consumed.task.browserSkillSessionId, undefined);
+  assert.equal(consumed.task.execution?.attemptStatus, "accepted_completed_unbound");
+  assert.equal(consumed.task.execution?.hostResult?.payload.outcome, "completed");
   assert.equal((await store.get(task.id))?.browserSkillSessionId, undefined);
 });

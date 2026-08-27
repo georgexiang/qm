@@ -796,12 +796,7 @@ export function createTurnMethods(
     async desktopBrowserConsumeSessionStartAccepted(taskId, accepted) {
       const task = await deps.desktopBrowserTasks.get(taskId);
       if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
-      if (task.execution?.hostAccepted || task.execution?.hostResult) {
-        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
-      }
-      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
-        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
-      });
+      return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
     },
 
     async desktopBrowserConsumeSessionStartResult(taskId, result) {
@@ -810,30 +805,36 @@ export function createTurnMethods(
       if (task.execution?.hostResult) {
         return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result);
       }
-      return withCurrentWaitingTask(taskId, task.authorityId, async (currentTask) => {
-        if (
-          currentTask.execution?.hostAccepted &&
-          !currentTask.execution.hostResult &&
-          result &&
-          typeof result === "object" &&
-          "kind" in result &&
-          result.kind === "host.result" &&
-          "payload" in result &&
-          result.payload &&
-          typeof result.payload === "object" &&
-          "outcome" in result.payload &&
-          result.payload.outcome === "completed"
-        ) {
-          return deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
-            taskId,
-            currentTask.execution.operation,
-            async (currentAuthority) =>
-              deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
-          );
+      if (
+        task.execution?.hostAccepted &&
+        !task.execution.hostResult &&
+        result &&
+        typeof result === "object" &&
+        "kind" in result &&
+        result.kind === "host.result" &&
+        "payload" in result &&
+        result.payload &&
+        typeof result.payload === "object" &&
+        "outcome" in result.payload &&
+        result.payload.outcome === "completed"
+      ) {
+        const validated = await withCurrentWaitingTask(
+          taskId,
+          task.authorityId,
+          async (currentTask) =>
+            deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+              taskId,
+              currentTask.execution!.operation,
+              async (currentAuthority) =>
+                deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
+            ),
+        );
+        if (validated && typeof validated === "object" && "status" in validated && validated.status === "refused") {
+          return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, validated);
         }
-        const currentAuthority = await deps.desktopBrowserDeviceRegistry.sessionStartAuthorityState(taskId);
-        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority);
-      });
+        return validated;
+      }
+      return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
     },
 
     subscribeSessionStates(cb) {

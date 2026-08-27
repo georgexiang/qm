@@ -786,6 +786,169 @@ test("confirm faults at each former boundary roll back atomically so retry can s
   }
 });
 
+test("validated session-start authority holds the registry lock until the bind decision finishes so rotation cannot interleave", async () => {
+  const { registry } = createRegistry();
+  const first = createKeyMaterial();
+  const second = createKeyMaterial();
+  const reserveOne = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: Date.parse("2026-08-27T12:01:00.000Z"),
+      devicePublicKey: first.devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  assert.equal(
+    (
+      await registry.confirm({
+        registrationId: reserveOne.reservation.registrationTuple.registrationId,
+        authorityId: "authority-1",
+        browserRuntimeStatus: "ready",
+        envelope: confirmationEnvelope(reserveOne.reservation, first.signEnvelope),
+      })
+    ).status,
+    "ok",
+  );
+  await registry.publishRelayConnection({
+    connectionId: "connection-1",
+    publicDeviceFingerprint: reserveOne.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+    registrationState: "registered",
+    protocolVersion: "1.2",
+    policyGrammarVersion: "1.0",
+    brokerVersion: "2.0.0",
+    bskVersion: "3.0.0",
+    extensionVersion: "4.0.0",
+    cliShapeHash: "sha256:cli-shape-1",
+    lastSeenAt: "2026-08-27T12:00:00.000Z",
+  });
+
+  const current = await registry.sessionStartAuthorityState("task-1");
+  assert.equal(current.status, "ok");
+  if (current.status !== "ok") return;
+
+  const authority = {
+    authorityVersion: "1.0" as const,
+    audience: "qm-desktop-broker-relay" as const,
+    deploymentCanonicalId: current.authority.registration.deploymentCanonicalId,
+    actorId: current.authority.registration.actorId,
+    actorSnapshotHash: "sha256:actor-snapshot-1",
+    projectId: current.authority.registration.projectId,
+    projectSnapshotHash: "sha256:project-snapshot-1",
+    membershipEpoch: current.authority.registration.membershipEpoch,
+    taskId: current.authority.registration.waitingTaskId,
+    attemptId: "attempt-1",
+    deviceId: current.authority.registration.publicDeviceFingerprint,
+    browserInstanceId: current.authority.registration.browserInstanceId,
+    leaseId: "lease-1",
+    leaseVersion: 1,
+    leaseExpiresAt: "2026-08-27T12:01:00.000Z",
+    operationId: "operation-1",
+    operationSequence: 1,
+    capabilitySet: {
+      protocolVersion: current.authority.relayConnection.protocolVersion as `${number}.${number}`,
+      policyGrammarVersion: current.authority.relayConnection.policyGrammarVersion as `${number}.${number}`,
+      bskVersion: current.authority.relayConnection.bskVersion,
+      extensionVersion: current.authority.relayConnection.extensionVersion,
+      cliShapeHash: current.authority.relayConnection.cliShapeHash,
+    },
+    argv: buildDesktopBrowserSessionStartArgv(current.authority.registration.browserInstanceId),
+    brokerOptions: { forceSharedRuntime: false },
+    effectClass: "local_effect" as const,
+    nonce: "nonce-1",
+    issuedAt: "2026-08-27T12:00:00.000Z",
+  };
+  const operation = {
+    authority,
+    requestHash: computeDesktopBrowserRequestHash(
+      authority,
+      current.authority.relayConnection.protocolVersion,
+      current.authority.relayConnection.policyGrammarVersion,
+    ),
+  } satisfies DesktopBrowserPreparedSessionStartOperation;
+
+  const reserveTwo = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-2",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 43,
+      authorityId: "authority-2",
+      authorityExpiresAt: Date.parse("2026-08-27T12:01:00.000Z"),
+      devicePublicKey: second.devicePublicKey,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+
+  let releaseBind!: () => void;
+  const bindStarted = new Promise<void>((resolve) => {
+    releaseBind = resolve;
+  });
+  let bindEntered = false;
+  const validated = registry.withValidatedSessionStartAuthority("task-1", operation, async () => {
+    bindEntered = true;
+    await bindStarted;
+    return { status: "ok" as const };
+  });
+
+  while (!bindEntered) {
+    await Promise.resolve();
+  }
+
+  let rotationCompleted = false;
+  const rotation = (async () => {
+    const confirmed = await registry.confirm({
+      registrationId: reserveTwo.reservation.registrationTuple.registrationId,
+      authorityId: "authority-2",
+      browserRuntimeStatus: "ready",
+      envelope: confirmationEnvelope(reserveTwo.reservation, second.signEnvelope),
+    });
+    if (confirmed.status !== "ok") return confirmed;
+    await registry.publishRelayConnection({
+      connectionId: "connection-2",
+      publicDeviceFingerprint: reserveTwo.reservation.publicDeviceFingerprint,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      registrationState: "registered",
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.0",
+      brokerVersion: "2.0.0",
+      bskVersion: "3.0.0",
+      extensionVersion: "4.0.0",
+      cliShapeHash: "sha256:cli-shape-1",
+      lastSeenAt: "2026-08-27T12:00:01.000Z",
+    });
+    rotationCompleted = true;
+    return confirmed;
+  })();
+
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(rotationCompleted, false);
+
+  releaseBind();
+  assert.deepEqual(await validated, { status: "ok" });
+  assert.equal((await rotation).status, "ok");
+  assert.equal(rotationCompleted, true);
+  assert.deepEqual(await registry.sessionStartAuthorityState("task-1"), {
+    status: "refused",
+    reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+  });
+});
+
 test("parallel reservations race through a task-scoped CAS and only one confirmation wins", async () => {
   const { registry } = createRegistry();
   const first = createKeyMaterial();

@@ -43,7 +43,13 @@ export interface DesktopBrowserPreparedSessionStartOperation {
 
 export interface DesktopBrowserTaskExecution {
   attemptId: string;
-  attemptStatus: "prepared" | "pre_fence_failed" | "accepted_failed" | "accepted_unknown" | "completed";
+  attemptStatus:
+    | "prepared"
+    | "pre_fence_failed"
+    | "accepted_failed"
+    | "accepted_unknown"
+    | "accepted_completed_unbound"
+    | "completed";
   leaseId: string;
   leaseVersion: number;
   operation: DesktopBrowserPreparedSessionStartOperation;
@@ -434,9 +440,7 @@ export function createDesktopBrowserTaskStore(
       const current = await backing.get(taskId);
       if (!current) return { status: "refused", reason: "Desktop Browser Task not found" };
       const needsCurrentAuthority =
-        !!current.execution?.hostAccepted &&
-        !current.execution?.hostResult &&
-        (result.payload.outcome === "completed" || result.payload.outcome === "unknown");
+        !!current.execution?.hostAccepted && !current.execution?.hostResult && result.payload.outcome === "completed";
       let authorityState = currentAuthority;
       if (needsCurrentAuthority && !authorityState) {
         if (!options.sessionStartAuthority) {
@@ -456,16 +460,6 @@ export function createDesktopBrowserTaskStore(
         if (!execution) {
           refusal = "Desktop Browser Task has no prepared session start";
           return task;
-        }
-        if (!execution.hostResult) {
-          if (task.status !== "waiting_for_broker") {
-            refusal = "Desktop Browser Task is no longer waiting";
-            return task;
-          }
-          if (task.authorityExpiresAt <= now()) {
-            refusal = "Desktop Browser Turn authority expired; start a new Turn";
-            return task;
-          }
         }
         if (result.payload.operationId !== execution.operation.authority.operationId) {
           refusal = "Desktop Browser Host result operation does not match the prepared task";
@@ -499,8 +493,8 @@ export function createDesktopBrowserTaskStore(
           refusal = capabilitySetRefusal();
           return task;
         }
+        const at = now();
         if (result.payload.outcome !== "completed") {
-          const at = now();
           let attemptStatus: DesktopBrowserTaskExecution["attemptStatus"];
           if (result.payload.outcome === "failed") {
             attemptStatus = "accepted_failed";
@@ -520,16 +514,31 @@ export function createDesktopBrowserTaskStore(
           };
           return bound;
         }
-        if (authorityState) {
-          const currentRefusal = currentAuthorityRefusal(task, execution, authorityState);
-          if (currentRefusal) {
-            refusal = currentRefusal;
-            return task;
-          }
-        }
         if (result.payload.result.browser_instance_id !== execution.operation.authority.browserInstanceId) {
           refusal = "Desktop Browser Host result browser does not match the prepared task";
           return task;
+        }
+        const currentRefusal =
+          task.status !== "waiting_for_broker"
+            ? "Desktop Browser Task is no longer waiting"
+            : task.authorityExpiresAt <= at
+              ? "Desktop Browser Turn authority expired; start a new Turn"
+              : authorityState
+                ? currentAuthorityRefusal(task, execution, authorityState)
+                : null;
+        if (currentRefusal) {
+          bound = {
+            ...task,
+            execution: {
+              ...execution,
+              attemptStatus: "accepted_completed_unbound",
+              resultHash: result.payload.resultHash,
+              resultRecordedAt: at,
+              hostResult: structuredClone(result),
+            },
+            updatedAt: at,
+          };
+          return bound;
         }
         if (
           task.browserSkillSessionId !== undefined ||
@@ -549,7 +558,6 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Task browser ownership is already bound";
           return task;
         }
-        const at = now();
         bound = {
           ...task,
           browserSkillSessionId: result.payload.result.session_id,
