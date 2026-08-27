@@ -41,6 +41,7 @@ import { createDesktopBrowserRelayServer } from "../packages/qm-broker-relay/src
 import { desktopBrowserRegistrationReservationTupleFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import {
   HOST_BROKER_CONTROL_NOTICE,
+  HostBrokerSpawnRejectedError,
   HostBrokerConnection,
   loadOrCreateDeviceIdentity,
   createRegistrationConfirmationPreview,
@@ -1206,8 +1207,8 @@ test("post-fence BrowserSkill timeout persists unknown without task ownership or
   await running;
 });
 
-test("disconnect after fencing persists unknown and a restarted host never retries the spawn", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "host-broker-disconnect-unknown-"));
+test("disconnect after durable completion preserves completed ownership and replays without respawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-disconnect-completed-"));
   let resolveRun: ((result: { exitCode: number; stdout: string; stderr: string }) => void) | undefined;
   let spawnCalls = 0;
   const sessionRunner: HostBrokerSessionRunner = {
@@ -1231,8 +1232,6 @@ test("disconnect after fencing persists unknown and a restarted host never retri
     () => (existsSync(join(dir, "operations")) && spawnCalls === 1 ? true : undefined),
     "accepted operation fence",
   );
-  first.socket.close(1006, "connection lost");
-  await assert.rejects(first.running, /retryable|transport|closed/i);
   resolveRun?.({
     exitCode: 0,
     stdout: JSON.stringify({
@@ -1242,12 +1241,25 @@ test("disconnect after fencing persists unknown and a restarted host never retri
     }),
     stderr: "",
   });
+  first.socket.close(1006, "connection lost");
+  await assert.rejects(first.running, /retryable|transport|closed/i);
   await waitFor(() => {
     const fenceFile = readdirSync(join(dir, "operations"))[0];
     if (!fenceFile) return undefined;
     const fence = JSON.parse(readFileSync(join(dir, "operations", fenceFile), "utf8")) as { state?: string };
-    return fence.state === "unknown" ? true : undefined;
-  }, "unknown operation fence");
+    return fence.state === "completed" ? true : undefined;
+  }, "completed operation fence");
+  const sessionFile = readdirSync(join(dir, "sessions"))[0];
+  assert.ok(sessionFile);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "sessions", sessionFile!), "utf8")), {
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    operationId: authority.operationId,
+    requestHash,
+    sessionId: "session-ambiguous",
+    browserInstanceId: "browser-primary",
+    agentWindowId: 42,
+  });
 
   const second = await connectOperationHost({ dataDir: dir, sessionRunner });
   second.socket.message(JSON.stringify(invocation));
@@ -1257,14 +1269,23 @@ test("disconnect after fencing persists unknown and a restarted host never retri
     "1.0",
   ) as HostAcceptedMessage;
   const replay = decodeDesktopBrowserMessage(
-    await waitFor(() => second.socket.sent[3], "unknown replay result"),
+    await waitFor(() => second.socket.sent[3], "completed replay result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
   assert.equal(accepted.payload.operationId, authority.operationId);
   assert.equal(accepted.payload.dispatchId, "dispatch-disconnect");
-  assert.equal(replay.payload.outcome, "unknown");
-  assert.equal(replay.payload.dispatchId, "dispatch-disconnect");
+  assert.deepEqual(replay.payload, {
+    dispatchId: "dispatch-disconnect",
+    operationId: authority.operationId,
+    outcome: "completed",
+    resultHash: replay.payload.resultHash,
+    result: {
+      session_id: "session-ambiguous",
+      browser_instance_id: "browser-primary",
+      agent_window_id: 42,
+    },
+  });
   assert.equal(spawnCalls, 1);
 
   const replayFenceFile = readdirSync(join(dir, "operations"))[0]!;
@@ -1288,22 +1309,113 @@ test("disconnect after fencing persists unknown and a restarted host never retri
     "1.2",
     "1.0",
   ) as HostAcceptedMessage;
-  const replayUnknown = decodeDesktopBrowserMessage(
-    await waitFor(() => third.socket.sent[3], "new dispatch unknown result"),
+  const replayCompleted = decodeDesktopBrowserMessage(
+    await waitFor(() => third.socket.sent[3], "new dispatch completed result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
   assert.equal(replayAccepted.payload.dispatchId, "dispatch-replay-unknown");
-  assert.deepEqual(replayUnknown.payload, {
+  assert.deepEqual(replayCompleted.payload, {
     dispatchId: "dispatch-replay-unknown",
     operationId: authority.operationId,
-    outcome: "unknown",
-    resultHash: replayUnknown.payload.resultHash,
-    error: replay.payload.error,
+    outcome: "completed",
+    resultHash: replayCompleted.payload.resultHash,
+    result: {
+      session_id: "session-ambiguous",
+      browser_instance_id: "browser-primary",
+      agent_window_id: 42,
+    },
   });
 
   third.socket.close(1000, "done");
   await third.running;
+});
+
+test("explicit spawn rejection after acceptance persists failed and replays without respawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-spawn-rejected-"));
+  let spawnCalls = 0;
+  const authority = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000052");
+  const requestHash = computeDesktopBrowserRequestHash(authority, "1.2", "1.0");
+  const invocation = {
+    protocolVersion: "1.2",
+    kind: "relay.invoke",
+    payload: { dispatchId: "dispatch-spawn-rejected", requestHash, authority },
+  };
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run() {
+      spawnCalls += 1;
+      throw new HostBrokerSpawnRejectedError("spawn ENOENT");
+    },
+  };
+
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner });
+  first.socket.message(JSON.stringify(invocation));
+  const accepted = decodeDesktopBrowserMessage(
+    await waitFor(() => first.socket.sent[2], "spawn rejected accepted result"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
+  const failed = decodeDesktopBrowserMessage(
+    await waitFor(() => first.socket.sent[3], "spawn rejected failed result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.deepEqual(accepted.payload, {
+    dispatchId: "dispatch-spawn-rejected",
+    operationId: authority.operationId,
+    requestHash,
+  });
+  assert.deepEqual(failed.payload, {
+    dispatchId: "dispatch-spawn-rejected",
+    operationId: authority.operationId,
+    outcome: "failed",
+    resultHash: failed.payload.resultHash,
+    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+  });
+  assert.equal(spawnCalls, 1);
+  assert.equal(existsSync(join(dir, "sessions")), false);
+  const fenceFile = readdirSync(join(dir, "operations"))[0]!;
+  const fence = JSON.parse(readFileSync(join(dir, "operations", fenceFile), "utf8")) as {
+    state: string;
+    terminalPayload?: { dispatchId?: string; outcome?: string; error?: { code?: string; message?: string } };
+  };
+  assert.equal(fence.state, "failed");
+  assert.deepEqual(fence.terminalPayload, {
+    dispatchId: "dispatch-spawn-rejected",
+    outcome: "failed",
+    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+  });
+  first.socket.close(1000, "done");
+  await first.running;
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner });
+  second.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: { ...invocation.payload, dispatchId: "dispatch-spawn-rejected-replay" },
+    }),
+  );
+  const replayAccepted = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[2], "spawn rejected replay accepted"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
+  const replayFailed = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[3], "spawn rejected replay failed"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(replayAccepted.payload.dispatchId, "dispatch-spawn-rejected-replay");
+  assert.deepEqual(replayFailed.payload, {
+    dispatchId: "dispatch-spawn-rejected-replay",
+    operationId: authority.operationId,
+    outcome: "failed",
+    resultHash: replayFailed.payload.resultHash,
+    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+  });
+  assert.equal(spawnCalls, 1);
+  second.socket.close(1000, "done");
+  await second.running;
 });
 
 test("host and relay fall back to protocol 1.0 during handshake interop when relay only supports 1.0", async () => {

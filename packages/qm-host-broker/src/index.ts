@@ -277,6 +277,13 @@ class RetryableHostBrokerError extends Error {
   }
 }
 
+export class HostBrokerSpawnRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HostBrokerSpawnRejectedError";
+  }
+}
+
 function encodeDevicePublicKey(publicKey: ReturnType<typeof createPublicKey>): string {
   return `ed25519:${publicKey.export({ format: "der", type: "spki" }).toString("base64url")}`;
 }
@@ -476,14 +483,53 @@ function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): 
   });
 }
 
+function classifyAcceptedFailure(error: unknown): {
+  state: "failed" | "unknown";
+  terminalPayload: PersistedHostTerminalPayload;
+} {
+  if (error instanceof HostBrokerSpawnRejectedError) {
+    return {
+      state: "failed",
+      terminalPayload: {
+        outcome: "failed",
+        error: {
+          code: "browser_cli_spawn_rejected",
+          message: error.message,
+        },
+      },
+    };
+  }
+  const unknownError = error instanceof Error ? error : new Error(String(error));
+  return {
+    state: "unknown",
+    terminalPayload: {
+      outcome: "unknown",
+      error: {
+        code: "host_operation_unknown",
+        message: unknownError.message,
+      },
+    },
+  };
+}
+
 const DEFAULT_SESSION_RUNNER: HostBrokerSessionRunner = {
   run(executable, argv, options) {
     return new Promise((resolve, reject) => {
-      const child = spawn(executable, [...argv], options);
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(executable, [...argv], options);
+      } catch (error) {
+        reject(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
+        return;
+      }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
       let outputExceeded = false;
+      if (!child.stdout || !child.stderr) {
+        reject(new HostBrokerSpawnRejectedError("BrowserSkill pipes were not available"));
+        return;
+      }
       const collect = (chunks: Buffer[], chunk: Buffer): void => {
         outputBytes += chunk.length;
         if (outputBytes > MAX_BROWSER_SKILL_OUTPUT_BYTES) {
@@ -511,7 +557,9 @@ const DEFAULT_SESSION_RUNNER: HostBrokerSessionRunner = {
             stderr: Buffer.concat(stderr).toString("utf8"),
           });
         })
-        .catch(reject);
+        .catch((error) => {
+          reject(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
+        });
     });
   },
 };
@@ -905,19 +953,6 @@ function terminalResult(
   };
 }
 
-function completedResult(
-  protocolVersion: `${number}.${number}`,
-  dispatchId: string,
-  operationId: string,
-  result: DesktopBrowserSessionStartResult,
-): HostResultMessage {
-  return terminalResult(protocolVersion, dispatchId, operationId, {
-    dispatchId,
-    outcome: "completed",
-    result,
-  });
-}
-
 function unknownResult(
   protocolVersion: `${number}.${number}`,
   dispatchId: string,
@@ -1268,6 +1303,8 @@ export class HostBrokerConnection {
     this.snapshotState.currentTaskPresent = true;
     this.emitState();
     input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+    let completedPersisted = false;
+    let runTimer: ReturnType<typeof setTimeout> | null = null;
     try {
       const runResult = await Promise.race([
         this.sessionRunner.run(this.browserSkillExecutable, authority.argv, {
@@ -1275,7 +1312,10 @@ export class HostBrokerConnection {
           stdio: ["ignore", "pipe", "pipe"],
         }),
         new Promise<HostBrokerSessionRunResult>((_, reject) => {
-          setTimeout(() => reject(new Error("BrowserSkill session start timed out")), this.browserSkillTimeoutMs);
+          runTimer = setTimeout(
+            () => reject(new Error("BrowserSkill session start timed out")),
+            this.browserSkillTimeoutMs,
+          );
         }),
       ]);
       if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
@@ -1315,31 +1355,34 @@ export class HostBrokerConnection {
         terminalPayload: completedTerminalPayload,
       };
       saveOperationFence(dataDir, completedFence);
+      completedPersisted = true;
       this.writeObserver?.onFenceSaved?.(completedFence);
-      if (!input.isActive()) throw new Error("relay disconnected after operation acceptance");
+      if (!input.isActive()) return;
       input.socket.send(encodeDesktopBrowserMessage(completed));
+      return;
     } catch (error) {
-      const unknownError = error instanceof Error ? error : new Error(String(error));
-      const unknownTerminalPayload: PersistedHostTerminalPayload = {
-        dispatchId: message.payload.dispatchId,
-        outcome: "unknown",
-        error: { code: "host_operation_unknown", message: unknownError.message },
-      };
-      const unknown = terminalResult(
+      if (completedPersisted) throw error;
+      const failure = classifyAcceptedFailure(error);
+      const terminal = terminalResult(
         input.protocolVersion,
         message.payload.dispatchId,
         authority.operationId,
-        unknownTerminalPayload,
+        failure.terminalPayload,
       );
-      const unknownFence = {
+      const failedFence = {
         ...fence,
-        state: "unknown" as const,
-        terminalPayload: unknownTerminalPayload,
+        state: failure.state,
+        terminalPayload: {
+          dispatchId: message.payload.dispatchId,
+          ...failure.terminalPayload,
+        },
       };
-      saveOperationFence(dataDir, unknownFence);
-      this.writeObserver?.onFenceSaved?.(unknownFence);
-      if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(unknown));
+      saveOperationFence(dataDir, failedFence);
+      this.writeObserver?.onFenceSaved?.(failedFence);
+      if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(terminal));
+      return;
     } finally {
+      if (runTimer !== null) clearTimeout(runTimer);
       this.snapshotState.currentTaskPresent = false;
       this.emitState();
     }
