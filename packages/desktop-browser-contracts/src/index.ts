@@ -54,26 +54,93 @@ export interface HostChallengeResponseMessage {
   };
 }
 
+export interface DesktopBrowserCapabilitySet {
+  protocolVersion: `${number}.${number}`;
+  policyGrammarVersion: `${number}.${number}`;
+  bskVersion: string;
+  extensionVersion: string;
+  cliShapeHash: string;
+}
+
+export interface DesktopBrowserBrokerOptions {
+  forceSharedRuntime: boolean;
+}
+
+export type DesktopBrowserSessionStartArgv = ["--json", "session", "start", "--browser", string];
+
+export interface DesktopBrowserSessionStartAuthorityEnvelope {
+  authorityVersion: `${number}.${number}`;
+  audience: typeof DESKTOP_BROWSER_RELAY_AUDIENCE;
+  deploymentCanonicalId: string;
+  actorId: string;
+  actorSnapshotHash: string;
+  projectId: string;
+  projectSnapshotHash: string;
+  membershipEpoch: number;
+  taskId: string;
+  attemptId: string;
+  deviceId: string;
+  browserInstanceId: string;
+  leaseId: string;
+  leaseVersion: number;
+  leaseExpiresAt: string;
+  operationId: string;
+  operationSequence: number;
+  capabilitySet: DesktopBrowserCapabilitySet;
+  argv: DesktopBrowserSessionStartArgv;
+  brokerOptions: DesktopBrowserBrokerOptions;
+  effectClass: "local_effect";
+  nonce: string;
+  issuedAt: string;
+}
+
 export interface RelayInvocationMessage {
   protocolVersion: `${number}.${number}`;
   kind: "relay.invoke";
   payload: {
     dispatchId: string;
-    operationId: string;
     requestHash: string;
-    argv: string[];
+    authority: DesktopBrowserSessionStartAuthorityEnvelope;
   };
 }
 
-export interface HostResultMessage {
+export interface DesktopBrowserSessionStartResult {
+  session_id: string;
+  browser_instance_id: string;
+  agent_window_id: number;
+}
+
+export interface DesktopBrowserHostFailure {
+  code: string;
+  message: string;
+}
+
+export type HostResultMessage = {
   protocolVersion: `${number}.${number}`;
   kind: "host.result";
-  payload: {
-    operationId: string;
-    outcome: "completed" | "failed" | "unknown";
-    resultHash: string;
-  };
-}
+} & {
+  payload:
+    | {
+        operationId: string;
+        accepted: false;
+        outcome: "failed";
+        error: DesktopBrowserHostFailure;
+      }
+    | {
+        operationId: string;
+        accepted: true;
+        outcome: "completed";
+        resultHash: string;
+        result: DesktopBrowserSessionStartResult;
+      }
+    | {
+        operationId: string;
+        accepted: true;
+        outcome: "failed" | "unknown";
+        resultHash: string;
+        error?: DesktopBrowserHostFailure;
+      };
+};
 
 export interface CompanionStatusMessage {
   protocolVersion: `${number}.${number}`;
@@ -174,16 +241,23 @@ export type DesktopBrowserMessage =
 type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
 
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION = "1.2" as const;
 export const DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION = "1.0" as const;
-export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS = [DESKTOP_BROWSER_PROTOCOL_VERSION] as const;
+export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS = [
+  DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_PROTOCOL_VERSION,
+] as const;
 export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS = [
   DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
 ] as const;
 export const DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION = "1.0" as const;
 export const DESKTOP_BROWSER_PUBLIC_IDENTITY_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_AUTHORITY_VERSION = "1.0" as const;
+export const DESKTOP_BROWSER_RELAY_AUDIENCE = "qm-desktop-broker-relay" as const;
 export const DESKTOP_BROWSER_RELAY_WSS_PATH = "/v1/device" as const;
+export const DESKTOP_BROWSER_TASK_LEASE_DURATION_MS = 60_000 as const;
 
-const PROTOCOL_VERSION_PATTERN = "^([0-9]{1,9})\\.[0-9]{1,9}$";
+const PROTOCOL_VERSION_PATTERN = "^([0-9]{1,9})\\.([0-9]{1,9})$";
 const CANONICAL_PROTOCOL_VERSION_PATTERN = "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$";
 const CANONICAL_LEXICAL_STRING_PATTERN = "^(?:\\S(?:.*\\S)?)$";
 const CANONICAL_UTC_MILLISECOND_INSTANT_PATTERN = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$";
@@ -216,6 +290,19 @@ const messageSchema = <const Kind extends DesktopBrowserMessageKind, const Paylo
     true,
   );
 
+const strictMessageSchema = <
+  const Kind extends DesktopBrowserMessageKind,
+  const Payload extends Record<string, unknown>,
+>(
+  kind: Kind,
+  payload: Payload,
+) =>
+  strictObjectSchema(["protocolVersion", "kind", "payload"], {
+    protocolVersion: { type: "string", pattern: PROTOCOL_VERSION_PATTERN },
+    kind: { const: kind },
+    payload,
+  });
+
 const nonEmptyStringSchema = { type: "string", minLength: 1 } as const;
 const canonicalLexicalStringSchema = {
   type: "string",
@@ -238,6 +325,88 @@ const strictObjectSchema = <const Required extends readonly string[], const Prop
   required: Required,
   properties: Properties,
 ) => objectSchema(required, properties, false);
+
+export const desktopBrowserCapabilitySetSchema = strictObjectSchema(
+  ["protocolVersion", "policyGrammarVersion", "bskVersion", "extensionVersion", "cliShapeHash"],
+  {
+    protocolVersion: canonicalProtocolVersionSchema,
+    policyGrammarVersion: canonicalProtocolVersionSchema,
+    bskVersion: canonicalLexicalStringSchema,
+    extensionVersion: canonicalLexicalStringSchema,
+    cliShapeHash: canonicalLexicalStringSchema,
+  },
+);
+
+export const desktopBrowserBrokerOptionsSchema = strictObjectSchema(["forceSharedRuntime"], {
+  forceSharedRuntime: { type: "boolean" },
+});
+
+export const desktopBrowserSessionStartAuthorityEnvelopeSchema = strictObjectSchema(
+  [
+    "authorityVersion",
+    "audience",
+    "deploymentCanonicalId",
+    "actorId",
+    "actorSnapshotHash",
+    "projectId",
+    "projectSnapshotHash",
+    "membershipEpoch",
+    "taskId",
+    "attemptId",
+    "deviceId",
+    "browserInstanceId",
+    "leaseId",
+    "leaseVersion",
+    "leaseExpiresAt",
+    "operationId",
+    "operationSequence",
+    "capabilitySet",
+    "argv",
+    "brokerOptions",
+    "effectClass",
+    "nonce",
+    "issuedAt",
+  ],
+  {
+    authorityVersion: canonicalProtocolVersionSchema,
+    audience: { const: DESKTOP_BROWSER_RELAY_AUDIENCE },
+    deploymentCanonicalId: canonicalLexicalStringSchema,
+    actorId: canonicalLexicalStringSchema,
+    actorSnapshotHash: canonicalLexicalStringSchema,
+    projectId: canonicalLexicalStringSchema,
+    projectSnapshotHash: canonicalLexicalStringSchema,
+    membershipEpoch: nonNegativeIntegerSchema,
+    taskId: canonicalLexicalStringSchema,
+    attemptId: canonicalLexicalStringSchema,
+    deviceId: canonicalLexicalStringSchema,
+    browserInstanceId: canonicalLexicalStringSchema,
+    leaseId: canonicalLexicalStringSchema,
+    leaseVersion: positiveIntegerSchema,
+    leaseExpiresAt: canonicalUtcMillisecondInstantSchema,
+    operationId: canonicalLexicalStringSchema,
+    operationSequence: positiveIntegerSchema,
+    capabilitySet: desktopBrowserCapabilitySetSchema,
+    argv: { type: "array", minItems: 1, items: { type: "string" } },
+    brokerOptions: desktopBrowserBrokerOptionsSchema,
+    effectClass: { const: "local_effect" },
+    nonce: canonicalLexicalStringSchema,
+    issuedAt: canonicalUtcMillisecondInstantSchema,
+  },
+);
+
+export const desktopBrowserSessionStartResultSchema = strictObjectSchema(
+  ["session_id", "browser_instance_id", "agent_window_id"],
+  {
+    session_id: canonicalLexicalStringSchema,
+    browser_instance_id: canonicalLexicalStringSchema,
+    agent_window_id: nonNegativeIntegerSchema,
+  },
+);
+
+export const desktopBrowserHostFailureSchema = strictObjectSchema(["code", "message"], {
+  code: canonicalLexicalStringSchema,
+  message: canonicalLexicalStringSchema,
+});
 
 export const desktopBrowserRegistrationReservationTupleSchema = strictObjectSchema(
   [
@@ -494,30 +663,24 @@ export const desktopBrowserMessageSchemas = {
       true,
     ),
   ),
-  "relay.invoke": messageSchema(
+  "relay.invoke": strictMessageSchema(
     "relay.invoke",
-    objectSchema(
-      ["dispatchId", "operationId", "requestHash", "argv"],
-      {
-        dispatchId: nonEmptyStringSchema,
-        operationId: nonEmptyStringSchema,
-        requestHash: nonEmptyStringSchema,
-        argv: { type: "array", minItems: 1, items: { type: "string" } },
-      },
-      true,
-    ),
+    strictObjectSchema(["dispatchId", "requestHash", "authority"], {
+      dispatchId: nonEmptyStringSchema,
+      requestHash: nonEmptyStringSchema,
+      authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
+    }),
   ),
-  "host.result": messageSchema(
+  "host.result": strictMessageSchema(
     "host.result",
-    objectSchema(
-      ["operationId", "outcome", "resultHash"],
-      {
-        operationId: nonEmptyStringSchema,
-        outcome: { enum: ["completed", "failed", "unknown"] },
-        resultHash: nonEmptyStringSchema,
-      },
-      true,
-    ),
+    strictObjectSchema(["operationId", "accepted", "outcome"], {
+      operationId: nonEmptyStringSchema,
+      accepted: { type: "boolean" },
+      outcome: { enum: ["completed", "failed", "unknown"] },
+      resultHash: nonEmptyStringSchema,
+      result: desktopBrowserSessionStartResultSchema,
+      error: desktopBrowserHostFailureSchema,
+    }),
   ),
   "companion.status": messageSchema(
     "companion.status",
@@ -533,12 +696,47 @@ export const desktopBrowserMessageSchemas = {
   ),
 } as const;
 
+const relayInvocationAdditiveMessageSchema = messageSchema(
+  "relay.invoke",
+  objectSchema(
+    ["dispatchId", "requestHash", "authority"],
+    {
+      dispatchId: nonEmptyStringSchema,
+      requestHash: nonEmptyStringSchema,
+      authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
+    },
+    true,
+  ),
+);
+
+const hostResultAdditiveMessageSchema = messageSchema(
+  "host.result",
+  objectSchema(
+    ["operationId", "accepted", "outcome"],
+    {
+      operationId: nonEmptyStringSchema,
+      accepted: { type: "boolean" },
+      outcome: { enum: ["completed", "failed", "unknown"] },
+      resultHash: nonEmptyStringSchema,
+      result: desktopBrowserSessionStartResultSchema,
+      error: desktopBrowserHostFailureSchema,
+    },
+    true,
+  ),
+);
+
 const messageParsers = Object.fromEntries(
   Object.entries(desktopBrowserMessageSchemas).map(([kind, schema]) => [
     kind,
     fromJSONSchema(schema as unknown as Parameters<typeof fromJSONSchema>[0]),
   ]),
 ) as Record<DesktopBrowserMessageKind, ReturnType<typeof fromJSONSchema>>;
+const relayInvocationAdditiveMessageParser = fromJSONSchema(
+  relayInvocationAdditiveMessageSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const hostResultAdditiveMessageParser = fromJSONSchema(
+  hostResultAdditiveMessageSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
 
 const registrationReservationTupleParser = fromJSONSchema(
   desktopBrowserRegistrationReservationTupleSchema as unknown as Parameters<typeof fromJSONSchema>[0],
@@ -567,7 +765,15 @@ const relayConnectionProjectionParser = fromJSONSchema(
 const relayConnectionPublishRequestParser = fromJSONSchema(
   desktopBrowserRelayConnectionPublishRequestSchema as unknown as Parameters<typeof fromJSONSchema>[0],
 );
-
+const capabilitySetParser = fromJSONSchema(
+  desktopBrowserCapabilitySetSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const brokerOptionsParser = fromJSONSchema(
+  desktopBrowserBrokerOptionsSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const sessionStartAuthorityEnvelopeParser = fromJSONSchema(
+  desktopBrowserSessionStartAuthorityEnvelopeSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
 export function encodeDesktopBrowserMessage(message: DesktopBrowserMessage): string {
   return JSON.stringify(message);
 }
@@ -576,6 +782,12 @@ function protocolMajor(version: string): string {
   const match = protocolVersionPattern.exec(version);
   if (!match) throw new Error(`invalid desktop browser protocol version ${JSON.stringify(version)}`);
   return match[1]!.replace(/^0+(?=[0-9])/, "");
+}
+
+function protocolMinor(version: string): number {
+  const match = protocolVersionPattern.exec(version);
+  if (!match) throw new Error(`invalid desktop browser protocol version ${JSON.stringify(version)}`);
+  return Number(match[2]);
 }
 
 function assertCanonicalProtocolVersion(version: string, label: string): void {
@@ -595,9 +807,12 @@ function assertCanonicalUtcMillisecondInstant(value: string, label: string): voi
 }
 
 function isCompatibleAdditiveMinorVersion(version: unknown, supportedVersion: string): version is string {
-  if (typeof version !== "string" || version === supportedVersion) return false;
+  if (typeof version !== "string") return false;
   try {
-    return isDesktopBrowserProtocolCompatible(version, supportedVersion);
+    return (
+      isDesktopBrowserProtocolCompatible(version, supportedVersion) &&
+      protocolMinor(version) > protocolMinor(supportedVersion)
+    );
   } catch {
     return false;
   }
@@ -607,9 +822,55 @@ export function isDesktopBrowserProtocolCompatible(remoteVersion: string, suppor
   return protocolMajor(remoteVersion) === protocolMajor(supportedVersion);
 }
 
+function assertTicket05OperationVersion(message: RelayInvocationMessage | HostResultMessage): void {
+  assertCanonicalProtocolVersion(message.protocolVersion, "protocolVersion");
+  if (
+    !isDesktopBrowserProtocolCompatible(message.protocolVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) ||
+    protocolMinor(message.protocolVersion) < protocolMinor(DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION)
+  ) {
+    throw new Error(
+      `${message.kind} requires Ticket 05 protocol version ${DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION} or newer compatible minor`,
+    );
+  }
+}
+
+function pickDesktopBrowserMessageParser(
+  kind: DesktopBrowserMessageKind,
+  supportedVersion: string,
+): ReturnType<typeof fromJSONSchema> {
+  if (
+    kind === "relay.invoke" &&
+    isCompatibleAdditiveMinorVersion(supportedVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION)
+  ) {
+    return relayInvocationAdditiveMessageParser;
+  }
+  if (
+    kind === "host.result" &&
+    isCompatibleAdditiveMinorVersion(supportedVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION)
+  ) {
+    return hostResultAdditiveMessageParser;
+  }
+  return messageParsers[kind];
+}
+
+function assertNegotiatedOperationVersion(
+  kind: DesktopBrowserMessageKind,
+  raw: Record<string, unknown>,
+  supportedVersion: string,
+): void {
+  if (kind !== "relay.invoke" && kind !== "host.result") return;
+  assertCanonicalProtocolVersion(supportedVersion, "supportedVersion");
+  if (typeof raw.protocolVersion === "string" && raw.protocolVersion !== supportedVersion) {
+    throw new Error(
+      `${kind} protocol version ${raw.protocolVersion} does not equal negotiated version ${supportedVersion}`,
+    );
+  }
+}
+
 export function decodeDesktopBrowserMessage(
   encoded: string,
   supportedVersion: string = DESKTOP_BROWSER_PROTOCOL_VERSION,
+  expectedPolicyGrammarVersion: string = DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
 ): DesktopBrowserMessage {
   const raw: unknown = JSON.parse(encoded);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -619,7 +880,8 @@ export function decodeDesktopBrowserMessage(
   if (typeof kind !== "string" || !Object.hasOwn(messageParsers, kind)) {
     throw new Error(`unsupported desktop browser message kind ${JSON.stringify(kind)}`);
   }
-  const parsed = messageParsers[kind as DesktopBrowserMessageKind].safeParse(raw);
+  assertNegotiatedOperationVersion(kind as DesktopBrowserMessageKind, raw as Record<string, unknown>, supportedVersion);
+  const parsed = pickDesktopBrowserMessageParser(kind as DesktopBrowserMessageKind, supportedVersion).safeParse(raw);
   if (!parsed.success) {
     throw new Error(
       `${kind} message does not match its schema: ${parsed.error.issues.map((issue) => issue.message).join("; ")}`,
@@ -631,7 +893,113 @@ export function decodeDesktopBrowserMessage(
       `protocol major ${protocolMajor(message.protocolVersion)} is incompatible with supported major ${protocolMajor(supportedVersion)}`,
     );
   }
+  if (message.kind === "relay.invoke") {
+    assertTicket05OperationVersion(message);
+    const authority = parseDesktopBrowserSessionStartAuthorityEnvelope(
+      message.payload.authority,
+      supportedVersion,
+      expectedPolicyGrammarVersion,
+    );
+    const canonicalRequestHash = computeDesktopBrowserRequestHash(
+      authority,
+      supportedVersion,
+      expectedPolicyGrammarVersion,
+    );
+    if (message.payload.requestHash !== canonicalRequestHash) {
+      throw new Error(
+        `relay.invoke requestHash ${JSON.stringify(message.payload.requestHash)} does not match canonical request hash ${JSON.stringify(canonicalRequestHash)}`,
+      );
+    }
+    return {
+      protocolVersion: message.protocolVersion,
+      kind: message.kind,
+      payload: {
+        dispatchId: message.payload.dispatchId,
+        requestHash: canonicalRequestHash,
+        authority,
+      },
+    };
+  }
+  if (message.kind === "host.result") {
+    assertTicket05OperationVersion(message);
+    assertDesktopBrowserHostResult(message);
+    return canonicalizeDesktopBrowserHostResult(message);
+  }
   return message;
+}
+
+function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostResultMessage {
+  const payload = message.payload;
+  if (!payload.accepted) {
+    return {
+      protocolVersion: message.protocolVersion,
+      kind: message.kind,
+      payload: {
+        operationId: payload.operationId,
+        accepted: false,
+        outcome: "failed",
+        error: { code: payload.error.code, message: payload.error.message },
+      },
+    };
+  }
+  if (payload.outcome === "completed") {
+    return {
+      protocolVersion: message.protocolVersion,
+      kind: message.kind,
+      payload: {
+        operationId: payload.operationId,
+        accepted: true,
+        outcome: "completed",
+        resultHash: payload.resultHash,
+        result: {
+          session_id: payload.result.session_id,
+          browser_instance_id: payload.result.browser_instance_id,
+          agent_window_id: payload.result.agent_window_id,
+        },
+      },
+    };
+  }
+  return {
+    protocolVersion: message.protocolVersion,
+    kind: message.kind,
+    payload: {
+      operationId: payload.operationId,
+      accepted: true,
+      outcome: payload.outcome,
+      resultHash: payload.resultHash,
+      ...(payload.error === undefined ? {} : { error: { code: payload.error.code, message: payload.error.message } }),
+    },
+  };
+}
+
+function assertDesktopBrowserHostResult(message: HostResultMessage): void {
+  const payload = message.payload as unknown as Record<string, unknown>;
+  if (payload.accepted === false) {
+    if (
+      payload.outcome !== "failed" ||
+      payload.error === undefined ||
+      payload.resultHash !== undefined ||
+      payload.result !== undefined
+    ) {
+      throw new Error("host.result message does not match its schema: invalid pre-fence failure");
+    }
+    return;
+  }
+  if (payload.resultHash === undefined) {
+    throw new Error("host.result message does not match its schema: accepted result requires resultHash");
+  }
+  if (payload.outcome === "completed") {
+    if (payload.result === undefined) {
+      throw new Error("host.result message does not match its schema: completed session start requires result");
+    }
+    if (payload.error !== undefined) {
+      throw new Error("host.result message does not match its schema: completed session start cannot include error");
+    }
+    return;
+  }
+  if (payload.result !== undefined) {
+    throw new Error("host.result message does not match its schema: result is only valid for completed session start");
+  }
 }
 
 function parseDesktopBrowserRecord<T>(parser: ReturnType<typeof fromJSONSchema>, label: string, raw: unknown): T {
@@ -803,6 +1171,184 @@ export function parseDesktopBrowserRelayConnectionPublishRequest(
   return {
     projection: parseDesktopBrowserRelayConnectionProjection(request.projection),
   };
+}
+
+export function parseDesktopBrowserCapabilitySet(
+  raw: unknown,
+  expectedProtocolVersion: string = DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  expectedPolicyGrammarVersion: string = DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
+): DesktopBrowserCapabilitySet {
+  const capabilitySet = parseDesktopBrowserRecord<DesktopBrowserCapabilitySet>(
+    capabilitySetParser,
+    "desktop browser capability set",
+    raw,
+  );
+  assertCanonicalProtocolVersion(expectedProtocolVersion, "expectedProtocolVersion");
+  assertCanonicalProtocolVersion(expectedPolicyGrammarVersion, "expectedPolicyGrammarVersion");
+  if (capabilitySet.protocolVersion !== expectedProtocolVersion) {
+    throw new Error(
+      `capability protocol version ${capabilitySet.protocolVersion} does not equal expected version ${expectedProtocolVersion}`,
+    );
+  }
+  if (capabilitySet.policyGrammarVersion !== expectedPolicyGrammarVersion) {
+    throw new Error(
+      `capability policy grammar version ${capabilitySet.policyGrammarVersion} does not equal expected version ${expectedPolicyGrammarVersion}`,
+    );
+  }
+  assertCanonicalProtocolVersion(capabilitySet.protocolVersion, "protocolVersion");
+  assertCanonicalProtocolVersion(capabilitySet.policyGrammarVersion, "policyGrammarVersion");
+  return {
+    protocolVersion: capabilitySet.protocolVersion,
+    policyGrammarVersion: capabilitySet.policyGrammarVersion,
+    bskVersion: capabilitySet.bskVersion,
+    extensionVersion: capabilitySet.extensionVersion,
+    cliShapeHash: capabilitySet.cliShapeHash,
+  };
+}
+
+export function buildDesktopBrowserSessionStartArgv(browserInstanceId: string): DesktopBrowserSessionStartArgv {
+  if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(browserInstanceId)) {
+    throw new Error("browserInstanceId must be a canonical lexical string");
+  }
+  return ["--json", "session", "start", "--browser", browserInstanceId];
+}
+
+export function validateDesktopBrowserSessionStartArgv(
+  raw: unknown,
+  browserInstanceId: string,
+): DesktopBrowserSessionStartArgv {
+  const expected = buildDesktopBrowserSessionStartArgv(browserInstanceId);
+  if (!Array.isArray(raw) || raw.length !== expected.length || raw.some((value, index) => value !== expected[index])) {
+    throw new Error(`argv must equal canonical session-start argv ${JSON.stringify(expected)}`);
+  }
+  return [...expected];
+}
+
+export function parseDesktopBrowserSessionStartAuthorityEnvelope(
+  raw: unknown,
+  expectedProtocolVersion: string = DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  expectedPolicyGrammarVersion: string = DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
+): DesktopBrowserSessionStartAuthorityEnvelope {
+  const authority = parseDesktopBrowserRecord<DesktopBrowserSessionStartAuthorityEnvelope>(
+    sessionStartAuthorityEnvelopeParser,
+    "desktop browser session-start authority envelope",
+    raw,
+  );
+  if (!isDesktopBrowserProtocolCompatible(authority.authorityVersion, DESKTOP_BROWSER_AUTHORITY_VERSION)) {
+    throw new Error(
+      `authority protocol major ${protocolMajor(authority.authorityVersion)} is incompatible with supported major ${protocolMajor(DESKTOP_BROWSER_AUTHORITY_VERSION)}`,
+    );
+  }
+  assertCanonicalProtocolVersion(authority.authorityVersion, "authorityVersion");
+  assertCanonicalUtcMillisecondInstant(authority.issuedAt, "issuedAt");
+  assertCanonicalUtcMillisecondInstant(authority.leaseExpiresAt, "leaseExpiresAt");
+  if (
+    Date.parse(authority.leaseExpiresAt) - Date.parse(authority.issuedAt) !==
+    DESKTOP_BROWSER_TASK_LEASE_DURATION_MS
+  ) {
+    throw new Error("desktop browser session-start authority lease must expire exactly 60 seconds after issuedAt");
+  }
+  const parsedCapabilitySet = parseDesktopBrowserCapabilitySet(
+    authority.capabilitySet,
+    expectedProtocolVersion,
+    expectedPolicyGrammarVersion,
+  );
+  const argv = validateDesktopBrowserSessionStartArgv(authority.argv, authority.browserInstanceId);
+  if (authority.brokerOptions.forceSharedRuntime) {
+    throw new Error("desktop browser session-start authority forceSharedRuntime must be false for Ticket 05");
+  }
+  return {
+    authorityVersion: authority.authorityVersion,
+    audience: authority.audience,
+    deploymentCanonicalId: authority.deploymentCanonicalId,
+    actorId: authority.actorId,
+    actorSnapshotHash: authority.actorSnapshotHash,
+    projectId: authority.projectId,
+    projectSnapshotHash: authority.projectSnapshotHash,
+    membershipEpoch: authority.membershipEpoch,
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    deviceId: authority.deviceId,
+    browserInstanceId: authority.browserInstanceId,
+    leaseId: authority.leaseId,
+    leaseVersion: authority.leaseVersion,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    operationId: authority.operationId,
+    operationSequence: authority.operationSequence,
+    capabilitySet: parsedCapabilitySet,
+    argv,
+    brokerOptions: { forceSharedRuntime: authority.brokerOptions.forceSharedRuntime },
+    effectClass: authority.effectClass,
+    nonce: authority.nonce,
+    issuedAt: authority.issuedAt,
+  };
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("desktop browser canonical request contains a non-JSON value");
+}
+
+export function computeDesktopBrowserRequestHash(
+  raw: unknown,
+  expectedProtocolVersion: string = DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  expectedPolicyGrammarVersion: string = DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
+): string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("desktop browser request hash input must be an object");
+  }
+  const input = raw as Record<string, unknown>;
+  const capabilitySet = parseDesktopBrowserCapabilitySet(
+    input.capabilitySet,
+    expectedProtocolVersion,
+    expectedPolicyGrammarVersion,
+  );
+  const argv = input.argv;
+  if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string")) {
+    throw new Error("desktop browser request hash argv must be a non-empty string array");
+  }
+  const brokerOptions = parseDesktopBrowserRecord<DesktopBrowserBrokerOptions>(
+    brokerOptionsParser,
+    "desktop browser broker options",
+    input.brokerOptions,
+  );
+  const requiredString = (key: string): string => {
+    const value = input[key];
+    if (typeof value !== "string" || !new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(value)) {
+      throw new Error(`${key} must be a canonical lexical string`);
+    }
+    return value;
+  };
+  if (!Number.isSafeInteger(input.operationSequence) || (input.operationSequence as number) < 1) {
+    throw new Error("operationSequence must be a positive safe integer");
+  }
+  const canonicalRequest = {
+    attemptId: requiredString("attemptId"),
+    argv: [...argv],
+    brokerOptions: { forceSharedRuntime: brokerOptions.forceSharedRuntime },
+    browserInstanceId: requiredString("browserInstanceId"),
+    capabilitySet,
+    deploymentCanonicalId: requiredString("deploymentCanonicalId"),
+    deviceId: requiredString("deviceId"),
+    effectClass: requiredString("effectClass"),
+    operationId: requiredString("operationId"),
+    operationSequence: input.operationSequence,
+    policyGrammarVersion: capabilitySet.policyGrammarVersion,
+    requestSchemaVersion: requiredString("authorityVersion"),
+    taskId: requiredString("taskId"),
+  };
+  return `sha256:${createHash("sha256").update(canonicalJson(canonicalRequest)).digest("hex")}`;
 }
 
 function canonicalizeDesktopBrowserRegistrationReservationTuple(

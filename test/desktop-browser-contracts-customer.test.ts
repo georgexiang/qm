@@ -5,7 +5,9 @@ import { phaseFContractFixtures } from "qm-desktop-browser-contracts/fixtures";
 
 test("customer-side consumers round-trip every Phase F fixture through the public contract", () => {
   for (const message of phaseFContractFixtures) {
-    assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(message)), message);
+    const supportedVersion =
+      message.kind === "relay.invoke" || message.kind === "host.result" ? message.protocolVersion : undefined;
+    assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(message), supportedVersion), message);
   }
 });
 
