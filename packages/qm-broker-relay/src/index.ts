@@ -138,10 +138,8 @@ function byteLength(raw: string): number {
   return Buffer.byteLength(raw, "utf8");
 }
 
-function identityKey(
-  binding: Pick<DesktopBrowserRelayBinding, "devicePublicKey" | "brokerInstanceId" | "browserInstanceId">,
-): string {
-  return `${binding.devicePublicKey}\u0000${binding.brokerInstanceId}\u0000${binding.browserInstanceId}`;
+function identityKey(binding: Pick<DesktopBrowserRelayBinding, "devicePublicKey" | "brokerInstanceId">): string {
+  return `${binding.devicePublicKey}\u0000${binding.brokerInstanceId}`;
 }
 
 function eventData(event?: unknown): string {
@@ -286,20 +284,16 @@ export class DesktopBrowserRelayService {
       });
       if (!latest) continue;
       if (!connection.binding) continue;
-      if (
+      const sameBinding =
         latest.browserInstanceId === connection.binding.browserInstanceId &&
-        latest.connectionEpoch === connection.binding.connectionEpoch &&
-        latest.registrationState !== connection.binding.registrationState
-      ) {
+        latest.connectionEpoch === connection.binding.connectionEpoch;
+      if (sameBinding && latest.registrationState !== connection.binding.registrationState) {
         connection.binding = latest;
         connection.stage = latest.registrationState;
         await this.publishProjection(connection);
         continue;
       }
-      if (
-        latest.browserInstanceId === connection.binding.browserInstanceId &&
-        latest.connectionEpoch > connection.binding.connectionEpoch
-      ) {
+      if (!sameBinding) {
         await this.failConnection(connection, "connection epoch has been replaced by a newer registration");
       }
     }
@@ -315,6 +309,9 @@ export class DesktopBrowserRelayService {
     if (!current) throw new Error("desktop browser host is not connected");
     const connection = this.connections.get(current);
     if (!connection || !connection.binding) throw new Error("desktop browser host is not connected");
+    if (connection.binding.browserInstanceId !== input.browserInstanceId) {
+      throw new Error("desktop browser host is not connected");
+    }
     if (connection.stage === "pending") {
       throw new Error("desktop browser host is pending registration and cannot receive task invocations");
     }

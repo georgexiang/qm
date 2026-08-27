@@ -193,6 +193,178 @@ test("duplicate reserve for the same tuple is deterministic and one-time even un
   assert.deepEqual(first.reservation, second.reservation);
 });
 
+test("replacement reserve for the same task atomically supersedes older pending or staged siblings", async () => {
+  const { registry } = createRegistry();
+  const first = createKeyMaterial();
+  const second = createKeyMaterial();
+  const reservedA = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: first.devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  const staged = await registry.stageConfirmation({
+    registrationId: reservedA.reservation.registrationTuple.registrationId,
+    browserRuntimeStatus: "ready",
+    envelope: confirmationEnvelope(reservedA.reservation, first.signEnvelope),
+  });
+  assert.equal(staged.status, "ok");
+
+  const reservedB = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: second.devicePublicKey,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+
+  assert.equal((await registry.get(reservedA.reservation.registrationTuple.registrationId))?.status, "offline");
+  assert.equal(await registry.stagedConfirmation(reservedA.reservation.registrationTuple.registrationId), null);
+  assert.equal(await registry.challengeBinding(reservedA.reservation.registrationTuple.registrationId), null);
+  assert.equal(
+    (await registry.taskRegistration("task-1"))?.registrationId,
+    reservedB.reservation.registrationTuple.registrationId,
+  );
+
+  const staleConfirm = await registry.confirm({
+    registrationId: reservedA.reservation.registrationTuple.registrationId,
+    authorityId: "authority-1",
+    browserRuntimeStatus: "ready",
+    envelope: confirmationEnvelope(reservedA.reservation, first.signEnvelope),
+  });
+  assert.deepEqual(staleConfirm, { status: "refused", reason: "registration is no longer pending" });
+
+  const confirmed = await registry.confirm({
+    registrationId: reservedB.reservation.registrationTuple.registrationId,
+    authorityId: "authority-1",
+    browserRuntimeStatus: "ready",
+    envelope: confirmationEnvelope(reservedB.reservation, second.signEnvelope),
+  });
+  assert.equal(confirmed.status, "ok");
+});
+
+test("parallel replacement reserves converge to one current reservation for the task", async () => {
+  const { registry } = createRegistry();
+  const first = createKeyMaterial();
+  const second = createKeyMaterial();
+  const [left, right] = await Promise.all([
+    registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: first.devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+    registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: second.devicePublicKey,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      operatingSystem: "macos-arm64",
+    }),
+  ]);
+  const reservedLeft = assertReserved(left);
+  const reservedRight = assertReserved(right);
+  const current = await registry.taskRegistration("task-1");
+  assert.ok(current);
+
+  const currentId = current.registrationId;
+  const staleId =
+    currentId === reservedLeft.reservation.registrationTuple.registrationId
+      ? reservedRight.reservation.registrationTuple.registrationId
+      : reservedLeft.reservation.registrationTuple.registrationId;
+  assert.equal((await registry.get(currentId))?.status, "pending");
+  assert.equal((await registry.get(staleId))?.status, "offline");
+  assert.equal(await registry.stagedConfirmation(staleId), null);
+});
+
+test("replacement reservations must advance the connection epoch and reject same-epoch different bindings", async () => {
+  const { registry } = createRegistry();
+  const identity = createKeyMaterial();
+  const initial = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+
+  const sameEpochDifferentBrowser = await registry.reserve({
+    waitingTaskId: "task-2",
+    actorId: "owner",
+    projectId: "project-1",
+    membershipEpoch: 43,
+    authorityId: "authority-2",
+    authorityExpiresAt: 1_725_000_600_000,
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-2",
+    connectionEpoch: 7,
+    operatingSystem: "macos-arm64",
+  });
+  assert.deepEqual(sameEpochDifferentBrowser, {
+    status: "refused",
+    reason: "desktop browser connection epoch must advance for a replacement binding",
+  });
+
+  const lowerEpoch = await registry.reserve({
+    waitingTaskId: "task-3",
+    actorId: "owner",
+    projectId: "project-1",
+    membershipEpoch: 44,
+    authorityId: "authority-3",
+    authorityExpiresAt: 1_725_000_600_000,
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-3",
+    connectionEpoch: 6,
+    operatingSystem: "macos-arm64",
+  });
+  assert.deepEqual(lowerEpoch, {
+    status: "refused",
+    reason: "desktop browser connection epoch is stale",
+  });
+
+  assert.equal((await registry.get(initial.reservation.registrationTuple.registrationId))?.status, "pending");
+});
+
 test("a pending reservation never evicts the current online device, and a later valid confirm swaps projection and offlines the old device", async () => {
   const { registry } = createRegistry();
   const first = createKeyMaterial();

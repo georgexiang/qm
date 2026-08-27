@@ -222,9 +222,20 @@ function offlineRecord(record: DesktopBrowserRegistrationRecord, at: number): De
     ...record,
     status: "offline",
     browserRuntimeStatus: "offline",
+    pendingConfirmation: null,
     updatedAt: at,
     lastSeenAt: iso(at),
   };
+}
+
+function reservationStillCurrent(record: DesktopBrowserRegistrationRecord, at: number): boolean {
+  if (record.status !== "pending") return false;
+  return Date.parse(record.registrationTuple.expiresAt) > at && record.authorityExpiresAt > at;
+}
+
+function relayBindingStillCurrent(record: DesktopBrowserRegistrationRecord, at: number): boolean {
+  if (record.status === "online") return true;
+  return reservationStillCurrent(record, at);
 }
 
 function toProjection(record: DesktopBrowserRegistrationRecord): DesktopBrowserSharedProfileProjection {
@@ -396,6 +407,39 @@ function verifiedEnvelope(
   }
 }
 
+function currentTaskReservation(
+  state: DesktopBrowserDeviceRegistryState,
+  waitingTaskId: string,
+  at: number,
+): DesktopBrowserRegistrationRecord | null {
+  const registrations = Object.values(state.registrations)
+    .filter((record) => record.waitingTaskId === waitingTaskId)
+    .filter((record) => reservationStillCurrent(record, at))
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt);
+  return registrations[0] ?? null;
+}
+
+function currentRelayRegistration(
+  state: DesktopBrowserDeviceRegistryState,
+  input: { devicePublicKey: string; brokerInstanceId: string },
+  at: number,
+): DesktopBrowserRegistrationRecord | null {
+  const registrations = Object.values(state.registrations)
+    .filter(
+      (record) =>
+        record.registrationTuple.devicePublicKey === input.devicePublicKey &&
+        record.registrationTuple.brokerInstanceId === input.brokerInstanceId,
+    )
+    .filter((record) => relayBindingStillCurrent(record, at))
+    .sort(
+      (left, right) =>
+        right.registrationTuple.connectionEpoch - left.registrationTuple.connectionEpoch ||
+        right.updatedAt - left.updatedAt ||
+        right.createdAt - left.createdAt,
+    );
+  return registrations[0] ?? null;
+}
+
 export function createDesktopBrowserDeviceRegistry(
   backing: DesktopBrowserDeviceRegistryBacking,
   options: {
@@ -505,16 +549,36 @@ export function createDesktopBrowserDeviceRegistry(
           return { status: "refused", reason: "desktop browser task already confirmed a device" };
         }
         const existing = state.registrations[registrationId];
-        if (!existing) {
-          state.registrations[registrationId] = record;
-          return { status: "ok", reservation: reservationView(record) };
-        }
-        const expired =
-          Date.parse(existing.registrationTuple.expiresAt) <= createdAt || existing.authorityExpiresAt <= createdAt;
-        if (existing.status === "pending" && !expired && sameReservationInput(existing, input)) {
+        if (existing && reservationStillCurrent(existing, createdAt) && sameReservationInput(existing, input)) {
           return { status: "ok", reservation: reservationView(existing) };
         }
+
+        const latestRelayRegistration = currentRelayRegistration(
+          state,
+          {
+            devicePublicKey: input.devicePublicKey,
+            brokerInstanceId: input.brokerInstanceId,
+          },
+          createdAt,
+        );
+        if (latestRelayRegistration && latestRelayRegistration.registrationId !== registrationId) {
+          if (input.connectionEpoch < latestRelayRegistration.registrationTuple.connectionEpoch) {
+            return { status: "refused", reason: "desktop browser connection epoch is stale" };
+          }
+          if (input.connectionEpoch === latestRelayRegistration.registrationTuple.connectionEpoch) {
+            return {
+              status: "refused",
+              reason: "desktop browser connection epoch must advance for a replacement binding",
+            };
+          }
+        }
+
         state.registrations[registrationId] = record;
+        for (const sibling of Object.values(state.registrations)) {
+          if (sibling.registrationId === registrationId || sibling.waitingTaskId !== input.waitingTaskId) continue;
+          if (sibling.status !== "pending") continue;
+          state.registrations[sibling.registrationId] = offlineRecord(sibling, createdAt);
+        }
         return { status: "ok", reservation: reservationView(record) };
       });
     },
@@ -552,7 +616,14 @@ export function createDesktopBrowserDeviceRegistry(
     },
 
     async stagedConfirmation(registrationId) {
-      const pending = (await readState()).registrations[registrationId]?.pendingConfirmation ?? null;
+      const at = now();
+      const state = await readState();
+      const record = state.registrations[registrationId] ?? null;
+      if (!record) return null;
+      if (record.status !== "pending") return null;
+      if (currentTaskReservation(state, record.waitingTaskId, at)?.registrationId !== record.registrationId)
+        return null;
+      const pending = record.pendingConfirmation ?? null;
       return pending
         ? {
             browserRuntimeStatus: pending.browserRuntimeStatus,
@@ -576,6 +647,10 @@ export function createDesktopBrowserDeviceRegistry(
         const stored = state.registrations[input.registrationId];
         if (!stored) return { status: "refused", reason: "registration not found" };
         if (stored.status !== "pending") return { status: "refused", reason: "registration is no longer pending" };
+        if (currentTaskReservation(state, stored.waitingTaskId, at)?.registrationId !== stored.registrationId) {
+          state.registrations[input.registrationId] = offlineRecord(stored, at);
+          return { status: "refused", reason: "registration is no longer pending" };
+        }
         if (Date.parse(stored.registrationTuple.expiresAt) <= at || stored.authorityExpiresAt <= at) {
           state.registrations[input.registrationId] = offlineRecord(stored, at);
           return { status: "refused", reason: "registration reservation expired" };
@@ -623,6 +698,10 @@ export function createDesktopBrowserDeviceRegistry(
         const stored = state.registrations[input.registrationId];
         if (!stored) return { status: "refused", reason: "registration not found" };
         if (stored.status !== "pending") return { status: "refused", reason: "registration is no longer pending" };
+        if (currentTaskReservation(state, stored.waitingTaskId, at)?.registrationId !== stored.registrationId) {
+          state.registrations[input.registrationId] = offlineRecord(stored, at);
+          return { status: "refused", reason: "registration is no longer pending" };
+        }
         if (!constantTimeEqual(stored.authorityId, input.authorityId) || stored.authorityExpiresAt <= at) {
           state.registrations[input.registrationId] = offlineRecord(stored, at);
           return { status: "refused", reason: "reservation authority is no longer current" };
@@ -729,10 +808,7 @@ export function createDesktopBrowserDeviceRegistry(
             record.registrationTuple.brokerInstanceId === input.brokerInstanceId,
         )
         .filter((record) => {
-          if (record.status === "pending") {
-            return Date.parse(record.registrationTuple.expiresAt) > at && record.authorityExpiresAt > at;
-          }
-          return record.status === "online";
+          return relayBindingStillCurrent(record, at);
         })
         .map(relayBindingFromRecord)
         .filter((binding): binding is DesktopBrowserRelayRegistryBinding => binding !== null)

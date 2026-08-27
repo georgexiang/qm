@@ -503,6 +503,74 @@ test("relay lets a newer epoch replace an in-flight stale epoch and fences the o
   assert.equal(adapter.published.has("connection-1"), false);
 });
 
+test("relay refresh fences an old socket when the current binding moves to a new browser instance", async () => {
+  const clock = new ManualClock();
+  const adapter = new FakeRegistryAdapter();
+  const identity = createDeviceIdentity();
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-a",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2"],
+    supportedPolicyGrammarVersions: ["1.1"],
+    registry: adapter,
+    clock,
+    createConnectionId: (() => {
+      let current = 0;
+      return () => `connection-${++current}`;
+    })(),
+  });
+  const socket1 = new FakeSocket();
+
+  service.acceptSocket(socket1);
+  socket1.message(hostHello(identity.devicePublicKey, "broker-a"));
+  await flushMessages();
+  const challenge1 = challengeAt(socket1);
+  socket1.message(
+    hostChallengeResponse(challenge1, {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+  assert.equal(adapter.published.get("connection-1")?.browserInstanceId, "browser-a");
+
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-b",
+    connectionEpoch: 8,
+  });
+  await service.refreshBinding({ devicePublicKey: identity.devicePublicKey, brokerInstanceId: "broker-a" });
+  assert.equal(socket1.closeCode, 1008);
+  assert.match(socket1.closeReason ?? "", /replaced by a newer registration/i);
+  assert.equal(adapter.published.has("connection-1"), false);
+
+  const socket2 = new FakeSocket();
+  service.acceptSocket(socket2);
+  socket2.message(hostHello(identity.devicePublicKey, "broker-a"));
+  await flushMessages();
+  const challenge2 = challengeAt(socket2);
+  socket2.message(
+    hostChallengeResponse(challenge2, {
+      devicePublicKey: identity.devicePublicKey,
+      signResponse: identity.signResponse,
+    }),
+  );
+  await flushMessages();
+
+  assert.equal(socket2.closeCode, undefined);
+  assert.equal(adapter.published.get("connection-2")?.browserInstanceId, "browser-b");
+  assert.equal(adapter.published.get("connection-2")?.connectionEpoch, 8);
+});
+
 test("relay heartbeats a registered connection, refreshes lastSeenAt on pong, and drops liveness on a missed heartbeat", async () => {
   const clock = new ManualClock();
   const adapter = new FakeRegistryAdapter();

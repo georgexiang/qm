@@ -44,6 +44,28 @@ function signed(
   };
 }
 
+function assertReservation(json: unknown): {
+  registrationTuple: Record<string, unknown>;
+  publicIdentity: Record<string, unknown>;
+  confirmationFingerprint: string;
+  verificationBytesBase64: string;
+} {
+  assert.ok(json && typeof json === "object");
+  assert.ok("reservation" in json);
+  const reservation = (json as { reservation: unknown }).reservation;
+  assert.ok(reservation && typeof reservation === "object");
+  assert.ok("registrationTuple" in reservation);
+  assert.ok("publicIdentity" in reservation);
+  assert.ok("confirmationFingerprint" in reservation);
+  assert.ok("verificationBytesBase64" in reservation);
+  return reservation as {
+    registrationTuple: Record<string, unknown>;
+    publicIdentity: Record<string, unknown>;
+    confirmationFingerprint: string;
+    verificationBytesBase64: string;
+  };
+}
+
 async function openWaitingTask(
   built: ReturnType<typeof buildApp>,
   actorId = "owner",
@@ -123,18 +145,11 @@ test("signed reservation and confirmation routes publish the shared-profile proj
         signature,
       },
     });
-    const stage = await fetch(
-      `${base}${stagePath(String(reserved.reservation.registrationTuple.registrationId))}`,
-      {
-        method: "POST",
-        headers: signed(
-          "POST",
-          stagePath(String(reserved.reservation.registrationTuple.registrationId)),
-          stageBody,
-        ),
-        body: stageBody,
-      },
-    );
+    const stage = await fetch(`${base}${stagePath(String(reserved.reservation.registrationTuple.registrationId))}`, {
+      method: "POST",
+      headers: signed("POST", stagePath(String(reserved.reservation.registrationTuple.registrationId)), stageBody),
+      body: stageBody,
+    });
     assert.equal(stage.status, 200);
 
     const confirmBody = JSON.stringify({
@@ -525,48 +540,34 @@ test("concurrent confirm delivery is deterministic at the HTTP seam and only ins
     ]);
     assert.equal(reserveOne.status, 200);
     assert.equal(reserveTwo.status, 200);
-    const reservedOne = (await reserveOne.json()) as {
-      reservation: {
-        registrationTuple: Record<string, unknown>;
-        publicIdentity: Record<string, unknown>;
-        confirmationFingerprint: string;
-        verificationBytesBase64: string;
-      };
-    };
-    const reservedTwo = (await reserveTwo.json()) as {
-      reservation: {
-        registrationTuple: Record<string, unknown>;
-        publicIdentity: Record<string, unknown>;
-        confirmationFingerprint: string;
-        verificationBytesBase64: string;
-      };
-    };
+    const reservedOne = assertReservation(await reserveOne.json());
+    const reservedTwo = assertReservation(await reserveTwo.json());
     const stageOneBody = JSON.stringify({
       browserRuntimeStatus: "ready",
       envelope: {
-        registrationTuple: reservedOne.reservation.registrationTuple,
-        publicIdentity: reservedOne.reservation.publicIdentity,
-        confirmationFingerprint: reservedOne.reservation.confirmationFingerprint,
+        registrationTuple: reservedOne.registrationTuple,
+        publicIdentity: reservedOne.publicIdentity,
+        confirmationFingerprint: reservedOne.confirmationFingerprint,
         signatureAlgorithm: "ed25519",
         signature: Buffer.from(
-          sign(null, Buffer.from(reservedOne.reservation.verificationBytesBase64, "base64"), first.privateKey),
+          sign(null, Buffer.from(reservedOne.verificationBytesBase64, "base64"), first.privateKey),
         ).toString("base64"),
       },
     });
     const stageTwoBody = JSON.stringify({
       browserRuntimeStatus: "ready",
       envelope: {
-        registrationTuple: reservedTwo.reservation.registrationTuple,
-        publicIdentity: reservedTwo.reservation.publicIdentity,
-        confirmationFingerprint: reservedTwo.reservation.confirmationFingerprint,
+        registrationTuple: reservedTwo.registrationTuple,
+        publicIdentity: reservedTwo.publicIdentity,
+        confirmationFingerprint: reservedTwo.confirmationFingerprint,
         signatureAlgorithm: "ed25519",
         signature: Buffer.from(
-          sign(null, Buffer.from(reservedTwo.reservation.verificationBytesBase64, "base64"), second.privateKey),
+          sign(null, Buffer.from(reservedTwo.verificationBytesBase64, "base64"), second.privateKey),
         ).toString("base64"),
       },
     });
-    const stageOnePath = stagePath(String(reservedOne.reservation.registrationTuple.registrationId));
-    const stageTwoPath = stagePath(String(reservedTwo.reservation.registrationTuple.registrationId));
+    const stageOnePath = stagePath(String(reservedOne.registrationTuple.registrationId));
+    const stageTwoPath = stagePath(String(reservedTwo.registrationTuple.registrationId));
     const [stageOne, stageTwo] = await Promise.all([
       fetch(`${base}${stageOnePath}`, {
         method: "POST",
@@ -579,22 +580,25 @@ test("concurrent confirm delivery is deterministic at the HTTP seam and only ins
         body: stageTwoBody,
       }),
     ]);
-    assert.equal(stageOne.status, 200);
-    assert.equal(stageTwo.status, 200);
+    assert.deepEqual(
+      [stageOne.status, stageTwo.status].sort((left, right) => left - right),
+      [200, 409],
+    );
+    const stageOneAccepted = stageOne.status === 200;
     const confirmOneBody = JSON.stringify({
       principalId: "owner",
       taskId,
       authorityId,
-      confirmationFingerprint: reservedOne.reservation.confirmationFingerprint,
+      confirmationFingerprint: reservedOne.confirmationFingerprint,
     });
     const confirmTwoBody = JSON.stringify({
       principalId: "owner",
       taskId,
       authorityId,
-      confirmationFingerprint: reservedTwo.reservation.confirmationFingerprint,
+      confirmationFingerprint: reservedTwo.confirmationFingerprint,
     });
-    const confirmOnePath = confirmPath(String(reservedOne.reservation.registrationTuple.registrationId));
-    const confirmTwoPath = confirmPath(String(reservedTwo.reservation.registrationTuple.registrationId));
+    const confirmOnePath = confirmPath(String(reservedOne.registrationTuple.registrationId));
+    const confirmTwoPath = confirmPath(String(reservedTwo.registrationTuple.registrationId));
     const [confirmOne, confirmTwo] = await Promise.all([
       fetch(`${base}${confirmOnePath}`, {
         method: "POST",
@@ -611,6 +615,8 @@ test("concurrent confirm delivery is deterministic at the HTTP seam and only ins
       [confirmOne.status, confirmTwo.status].sort((left, right) => left - right),
       [200, 409],
     );
+    assert.equal(confirmOne.status, stageOneAccepted ? 200 : 409);
+    assert.equal(confirmTwo.status, stageOneAccepted ? 409 : 200);
 
     const projects = await fetch(`${base}/v1/projects?principalId=owner`, {
       headers: signed("GET", "/v1/projects?principalId=owner", ""),
@@ -621,6 +627,103 @@ test("concurrent confirm delivery is deterministic at the HTTP seam and only ins
     };
     assert.equal(body.projects[0]?.desktopBrowser?.device.status, "online");
     assert.equal("devicePublicKey" in (body.projects[0]?.desktopBrowser?.device ?? {}), false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("replacement reservations reject an old staged confirmation envelope at the route seam", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-registration-routes-stale-stage-")),
+      publicWebUrl: "https://qm.example.com",
+      signingSecret: SECRET,
+    }),
+  );
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  const { taskId, authorityId } = await openWaitingTask(built);
+  const server = createServer(built.app, { signingSecret: SECRET });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+
+  try {
+    const first = generateKeyPairSync("ed25519");
+    const second = generateKeyPairSync("ed25519");
+    const reserveOneBody = JSON.stringify({
+      authorityId,
+      devicePublicKey: `ed25519:${Buffer.from(first.publicKey.export({ format: "der", type: "spki" })).toString("base64")}`,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    });
+    const reserveOne = await fetch(`${base}${reservePath(taskId)}`, {
+      method: "POST",
+      headers: signed("POST", reservePath(taskId), reserveOneBody),
+      body: reserveOneBody,
+    });
+    assert.equal(reserveOne.status, 200);
+    const reservedOne = assertReservation(await reserveOne.json());
+
+    const reserveTwoBody = JSON.stringify({
+      authorityId,
+      devicePublicKey: `ed25519:${Buffer.from(second.publicKey.export({ format: "der", type: "spki" })).toString("base64")}`,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      operatingSystem: "macos-arm64",
+    });
+    const reserveTwo = await fetch(`${base}${reservePath(taskId)}`, {
+      method: "POST",
+      headers: signed("POST", reservePath(taskId), reserveTwoBody),
+      body: reserveTwoBody,
+    });
+    assert.equal(reserveTwo.status, 200);
+    const reservedTwo = assertReservation(await reserveTwo.json());
+
+    const staleStageBody = JSON.stringify({
+      browserRuntimeStatus: "ready",
+      envelope: {
+        registrationTuple: reservedOne.registrationTuple,
+        publicIdentity: reservedOne.publicIdentity,
+        confirmationFingerprint: reservedOne.confirmationFingerprint,
+        signatureAlgorithm: "ed25519",
+        signature: Buffer.from(
+          sign(null, Buffer.from(reservedOne.verificationBytesBase64, "base64"), first.privateKey),
+        ).toString("base64"),
+      },
+    });
+    const staleStagePath = stagePath(String(reservedOne.registrationTuple.registrationId));
+    const staleStage = await fetch(`${base}${staleStagePath}`, {
+      method: "POST",
+      headers: signed("POST", staleStagePath, staleStageBody),
+      body: staleStageBody,
+    });
+    assert.equal(staleStage.status, 409);
+    assert.deepEqual(await staleStage.json(), {
+      error: "conflict",
+      message: "registration is no longer pending",
+    });
+
+    const currentStageBody = JSON.stringify({
+      browserRuntimeStatus: "ready",
+      envelope: {
+        registrationTuple: reservedTwo.registrationTuple,
+        publicIdentity: reservedTwo.publicIdentity,
+        confirmationFingerprint: reservedTwo.confirmationFingerprint,
+        signatureAlgorithm: "ed25519",
+        signature: Buffer.from(
+          sign(null, Buffer.from(reservedTwo.verificationBytesBase64, "base64"), second.privateKey),
+        ).toString("base64"),
+      },
+    });
+    const currentStagePath = stagePath(String(reservedTwo.registrationTuple.registrationId));
+    const currentStage = await fetch(`${base}${currentStagePath}`, {
+      method: "POST",
+      headers: signed("POST", currentStagePath, currentStageBody),
+      body: currentStageBody,
+    });
+    assert.equal(currentStage.status, 200);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
