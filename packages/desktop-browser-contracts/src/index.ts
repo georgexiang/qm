@@ -131,12 +131,14 @@ export type HostResultMessage = {
 } & {
   payload:
     | {
+        dispatchId: string;
         operationId: string;
         outcome: "completed";
         resultHash: string;
         result: DesktopBrowserSessionStartResult;
       }
     | {
+        dispatchId: string;
         operationId: string;
         outcome: "failed" | "unknown";
         resultHash: string;
@@ -684,7 +686,8 @@ export const desktopBrowserMessageSchemas = {
   ),
   "host.result": strictMessageSchema(
     "host.result",
-    strictObjectSchema(["operationId", "outcome", "resultHash"], {
+    strictObjectSchema(["dispatchId", "operationId", "outcome", "resultHash"], {
+      dispatchId: nonEmptyStringSchema,
       operationId: nonEmptyStringSchema,
       outcome: { enum: ["completed", "failed", "unknown"] },
       resultHash: nonEmptyStringSchema,
@@ -726,7 +729,8 @@ const hostAcceptedAdditiveMessageSchema = messageSchema(
 
 const hostResultAdditiveMessageSchema = messageSchema(
   "host.result",
-  strictObjectSchema(["operationId", "outcome", "resultHash"], {
+  strictObjectSchema(["dispatchId", "operationId", "outcome", "resultHash"], {
+    dispatchId: nonEmptyStringSchema,
     operationId: nonEmptyStringSchema,
     outcome: { enum: ["completed", "failed", "unknown"] },
     resultHash: nonEmptyStringSchema,
@@ -972,6 +976,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
       protocolVersion: message.protocolVersion,
       kind: message.kind,
       payload: {
+        dispatchId: payload.dispatchId,
         operationId: payload.operationId,
         outcome: "completed",
         resultHash: payload.resultHash,
@@ -987,6 +992,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
     protocolVersion: message.protocolVersion,
     kind: message.kind,
     payload: {
+      dispatchId: payload.dispatchId,
       operationId: payload.operationId,
       outcome: payload.outcome,
       resultHash: payload.resultHash,
