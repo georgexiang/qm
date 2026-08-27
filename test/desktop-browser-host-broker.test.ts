@@ -771,6 +771,7 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
   });
   assert.equal(completed.protocolVersion, "1.2");
   assert.deepEqual(completed.payload, {
+    dispatchId: "0198f3d2-1950-7000-8000-000000000012",
     operationId: authority.operationId,
     outcome: "completed",
     resultHash: completed.payload.resultHash,
@@ -1007,7 +1008,12 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
   await first.running;
 
   const second = await connectOperationHost({ dataDir: dir, sessionRunner });
-  second.socket.message(JSON.stringify(invocation));
+  second.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: { ...invocation.payload, dispatchId: "dispatch-replay" },
+    }),
+  );
   const duplicateAccepted = decodeDesktopBrowserMessage(
     await waitFor(() => second.socket.sent[2], "duplicate accepted result"),
     "1.2",
@@ -1018,9 +1024,20 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
     "1.2",
     "1.0",
   ) as HostResultMessage;
-  assert.equal(duplicateAccepted.payload.dispatchId, "dispatch-first");
-  assert.deepEqual(duplicateResult.payload, firstResult.payload);
+  assert.equal(duplicateAccepted.payload.dispatchId, "dispatch-replay");
+  assert.deepEqual(duplicateResult.payload, {
+    dispatchId: "dispatch-replay",
+    operationId: firstResult.payload.operationId,
+    outcome: "completed",
+    resultHash: duplicateResult.payload.resultHash,
+    result: firstResult.payload.result,
+  });
   assert.equal(spawnCalls, 1);
+  const duplicateFenceFile = readdirSync(join(dir, "operations"))[0]!;
+  const duplicateFence = JSON.parse(readFileSync(join(dir, "operations", duplicateFenceFile), "utf8")) as {
+    terminalPayload?: { dispatchId?: string };
+  };
+  assert.equal(duplicateFence.terminalPayload?.dispatchId, "dispatch-first");
 
   const mismatchedAuthority = { ...authority, attemptId: "attempt-2" };
   second.socket.message(
@@ -1037,7 +1054,12 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
   assert.equal(spawnCalls, 1);
 
   const third = await connectOperationHost({ dataDir: dir, sessionRunner });
-  third.socket.message(JSON.stringify(invocation));
+  third.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: { ...invocation.payload, dispatchId: "dispatch-preserved" },
+    }),
+  );
   const preservedAccepted = decodeDesktopBrowserMessage(
     await waitFor(() => third.socket.sent[2], "preserved accepted result"),
     "1.2",
@@ -1048,8 +1070,14 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
     "1.2",
     "1.0",
   ) as HostResultMessage;
-  assert.equal(preservedAccepted.payload.dispatchId, "dispatch-first");
-  assert.deepEqual(preservedResult.payload, firstResult.payload);
+  assert.equal(preservedAccepted.payload.dispatchId, "dispatch-preserved");
+  assert.deepEqual(preservedResult.payload, {
+    dispatchId: "dispatch-preserved",
+    operationId: firstResult.payload.operationId,
+    outcome: "completed",
+    resultHash: preservedResult.payload.resultHash,
+    result: firstResult.payload.result,
+  });
   assert.equal(spawnCalls, 1);
 
   third.socket.close(1000, "done");
@@ -1234,10 +1262,48 @@ test("disconnect after fencing persists unknown and a restarted host never retri
     "1.0",
   ) as HostResultMessage;
   assert.equal(accepted.payload.operationId, authority.operationId);
+  assert.equal(accepted.payload.dispatchId, "dispatch-disconnect");
   assert.equal(replay.payload.outcome, "unknown");
+  assert.equal(replay.payload.dispatchId, "dispatch-disconnect");
   assert.equal(spawnCalls, 1);
-  second.socket.close(1000, "done");
+
+  const replayFenceFile = readdirSync(join(dir, "operations"))[0]!;
+  const replayFence = JSON.parse(readFileSync(join(dir, "operations", replayFenceFile), "utf8")) as {
+    terminalPayload?: { dispatchId?: string };
+  };
+  assert.equal(replayFence.terminalPayload?.dispatchId, "dispatch-disconnect");
+
+  second.socket.close(1000, "replayed");
   await second.running;
+
+  const third = await connectOperationHost({ dataDir: dir, sessionRunner });
+  third.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: { ...invocation.payload, dispatchId: "dispatch-replay-unknown" },
+    }),
+  );
+  const replayAccepted = decodeDesktopBrowserMessage(
+    await waitFor(() => third.socket.sent[2], "new dispatch accepted result"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
+  const replayUnknown = decodeDesktopBrowserMessage(
+    await waitFor(() => third.socket.sent[3], "new dispatch unknown result"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(replayAccepted.payload.dispatchId, "dispatch-replay-unknown");
+  assert.deepEqual(replayUnknown.payload, {
+    dispatchId: "dispatch-replay-unknown",
+    operationId: authority.operationId,
+    outcome: "unknown",
+    resultHash: replayUnknown.payload.resultHash,
+    error: replay.payload.error,
+  });
+
+  third.socket.close(1000, "done");
+  await third.running;
 });
 
 test("host and relay fall back to protocol 1.0 during handshake interop when relay only supports 1.0", async () => {

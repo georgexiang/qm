@@ -33,6 +33,7 @@ import {
   parseDesktopBrowserRegistrationConfirmationEnvelope,
   parseDesktopBrowserRegistrationReservationTuple,
   projectDesktopBrowserPublicIdentity,
+  type DesktopBrowserHostFailure,
   type DesktopBrowserSessionStartAuthorityEnvelope,
   type DesktopBrowserSessionStartResult,
   type DesktopBrowserRegistrationConfirmationEnvelope,
@@ -222,13 +223,29 @@ interface RegistrationTupleBinding {
   now?: number;
 }
 
+type PersistedHostTerminalPayload =
+  | {
+      dispatchId?: string;
+      operationId?: string;
+      outcome: "completed";
+      resultHash?: string;
+      result: DesktopBrowserSessionStartResult;
+    }
+  | {
+      dispatchId?: string;
+      operationId?: string;
+      outcome: "failed" | "unknown";
+      resultHash?: string;
+      error?: DesktopBrowserHostFailure;
+    };
+
 interface HostOperationFence {
   operationId: string;
   requestHash: string;
   taskId: string;
   attemptId: string;
   state: "accepted" | "completed" | "failed" | "unknown";
-  terminalPayload?: HostResultMessage["payload"];
+  terminalPayload?: PersistedHostTerminalPayload;
 }
 
 const DEVICE_KEY_FILE = "device-key.json";
@@ -842,35 +859,77 @@ function accepted(
   };
 }
 
-function completedResult(
-  protocolVersion: `${number}.${number}`,
+function materializeHostResultPayload(
+  dispatchId: string,
   operationId: string,
-  result: DesktopBrowserSessionStartResult,
+  terminalPayload: PersistedHostTerminalPayload,
+): HostResultMessage["payload"] {
+  if (terminalPayload.outcome === "completed") {
+    return {
+      dispatchId,
+      operationId,
+      outcome: "completed",
+      resultHash: computeHostResultHash({
+        dispatchId,
+        operationId,
+        outcome: "completed",
+        result: terminalPayload.result,
+      }),
+      result: terminalPayload.result,
+    };
+  }
+  return {
+    dispatchId,
+    operationId,
+    outcome: terminalPayload.outcome,
+    resultHash: computeHostResultHash({
+      dispatchId,
+      operationId,
+      outcome: terminalPayload.outcome,
+      ...(terminalPayload.error === undefined ? {} : { error: terminalPayload.error }),
+    }),
+    ...(terminalPayload.error === undefined ? {} : { error: terminalPayload.error }),
+  };
+}
+
+function terminalResult(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  terminalPayload: PersistedHostTerminalPayload,
 ): HostResultMessage {
   return {
     protocolVersion,
     kind: "host.result",
-    payload: {
-      operationId,
-      outcome: "completed",
-      resultHash: computeHostResultHash({ operationId, outcome: "completed", result }),
-      result,
-    },
+    payload: materializeHostResultPayload(dispatchId, operationId, terminalPayload),
   };
 }
 
-function unknownResult(protocolVersion: `${number}.${number}`, operationId: string, error?: Error): HostResultMessage {
+function completedResult(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  result: DesktopBrowserSessionStartResult,
+): HostResultMessage {
+  return terminalResult(protocolVersion, dispatchId, operationId, {
+    dispatchId,
+    outcome: "completed",
+    result,
+  });
+}
+
+function unknownResult(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  error?: Error,
+): HostResultMessage {
   const errorPayload = error ? { code: "host_operation_unknown", message: error.message } : undefined;
-  return {
-    protocolVersion,
-    kind: "host.result",
-    payload: {
-      operationId,
-      outcome: "unknown",
-      resultHash: computeHostResultHash({ operationId, outcome: "unknown", error: errorPayload }),
-      ...(errorPayload ? { error: errorPayload } : {}),
-    },
-  };
+  return terminalResult(protocolVersion, dispatchId, operationId, {
+    dispatchId,
+    outcome: "unknown",
+    ...(errorPayload ? { error: errorPayload } : {}),
+  });
 }
 
 function defaultTransport(): HostBrokerTransport {
@@ -1146,11 +1205,14 @@ export class HostBrokerConnection {
       if (existingFence.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
         input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
-          encodeDesktopBrowserMessage({
-            protocolVersion: input.protocolVersion,
-            kind: "host.result",
-            payload: existingFence.terminalPayload,
-          }),
+          encodeDesktopBrowserMessage(
+            terminalResult(
+              input.protocolVersion,
+              message.payload.dispatchId,
+              authority.operationId,
+              existingFence.terminalPayload,
+            ),
+          ),
         );
         return;
       }
@@ -1158,7 +1220,7 @@ export class HostBrokerConnection {
         throw new Error("operationId is already bound to a different request hash");
       }
       input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
-      const unknown = unknownResult(input.protocolVersion, authority.operationId);
+      const unknown = unknownResult(input.protocolVersion, message.payload.dispatchId, authority.operationId);
       input.socket.send(encodeDesktopBrowserMessage(unknown));
       return;
     }
@@ -1175,11 +1237,14 @@ export class HostBrokerConnection {
       if (existingFence?.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
         input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
-          encodeDesktopBrowserMessage({
-            protocolVersion: input.protocolVersion,
-            kind: "host.result",
-            payload: existingFence.terminalPayload,
-          }),
+          encodeDesktopBrowserMessage(
+            terminalResult(
+              input.protocolVersion,
+              message.payload.dispatchId,
+              authority.operationId,
+              existingFence.terminalPayload,
+            ),
+          ),
         );
         return;
       }
@@ -1191,6 +1256,7 @@ export class HostBrokerConnection {
         encodeDesktopBrowserMessage(
           unknownResult(
             input.protocolVersion,
+            message.payload.dispatchId,
             authority.operationId,
             new Error("operation was fenced concurrently and cannot be spawned again"),
           ),
@@ -1217,7 +1283,17 @@ export class HostBrokerConnection {
       if (result.browser_instance_id !== authority.browserInstanceId) {
         throw new Error("BrowserSkill returned a browser outside the authority binding");
       }
-      const completed = completedResult(input.protocolVersion, authority.operationId, result);
+      const completedTerminalPayload: PersistedHostTerminalPayload = {
+        dispatchId: message.payload.dispatchId,
+        outcome: "completed",
+        result,
+      };
+      const completed = terminalResult(
+        input.protocolVersion,
+        message.payload.dispatchId,
+        authority.operationId,
+        completedTerminalPayload,
+      );
       const sessionOwnership = {
         taskId: authority.taskId,
         attemptId: authority.attemptId,
@@ -1233,18 +1309,33 @@ export class HostBrokerConnection {
         SAFE_FILE_MODE,
       );
       this.writeObserver?.onSessionOwnershipSaved(sessionOwnership);
-      const completedFence = { ...fence, state: "completed" as const, terminalPayload: completed.payload };
+      const completedFence = {
+        ...fence,
+        state: "completed" as const,
+        terminalPayload: completedTerminalPayload,
+      };
       saveOperationFence(dataDir, completedFence);
       this.writeObserver?.onFenceSaved?.(completedFence);
       if (!input.isActive()) throw new Error("relay disconnected after operation acceptance");
       input.socket.send(encodeDesktopBrowserMessage(completed));
     } catch (error) {
-      const unknown = unknownResult(
+      const unknownError = error instanceof Error ? error : new Error(String(error));
+      const unknownTerminalPayload: PersistedHostTerminalPayload = {
+        dispatchId: message.payload.dispatchId,
+        outcome: "unknown",
+        error: { code: "host_operation_unknown", message: unknownError.message },
+      };
+      const unknown = terminalResult(
         input.protocolVersion,
+        message.payload.dispatchId,
         authority.operationId,
-        error instanceof Error ? error : new Error(String(error)),
+        unknownTerminalPayload,
       );
-      const unknownFence = { ...fence, state: "unknown" as const, terminalPayload: unknown.payload };
+      const unknownFence = {
+        ...fence,
+        state: "unknown" as const,
+        terminalPayload: unknownTerminalPayload,
+      };
       saveOperationFence(dataDir, unknownFence);
       this.writeObserver?.onFenceSaved?.(unknownFence);
       if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(unknown));
