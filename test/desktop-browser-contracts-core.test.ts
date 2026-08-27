@@ -146,6 +146,7 @@ test("Core publishes one schema for every Phase F message kind", () => {
   assert.deepEqual(Object.keys(desktopBrowserMessageSchemas).sort(), [
     "companion.status",
     "core.authority",
+    "host.accepted",
     "host.challenge-response",
     "host.hello",
     "host.result",
