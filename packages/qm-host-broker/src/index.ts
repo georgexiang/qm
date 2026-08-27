@@ -1,4 +1,5 @@
 import {
+  accessSync,
   chmodSync,
   closeSync,
   constants as fsConstants,
@@ -15,7 +16,7 @@ import {
 import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { isIP } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
@@ -52,8 +53,12 @@ const RECONNECT_BACKOFF_BASE_MS = 250;
 const RECONNECT_BACKOFF_MAX_MS = 5_000;
 const SAFE_DIR_MODE = 0o700;
 const SAFE_FILE_MODE = 0o600;
+const SAFE_INSTALL_FILE_MAX_MODE = 0o755;
+const DEFAULT_CHILD_KILL_GRACE_MS = 250;
 const HOST_BROKER_RELAY_URL_ENV = "QM_HOST_BROKER_RELAY_URL";
 const HOST_BROKER_RELAY_WSS_PATH_ENV = "QM_HOST_BROKER_RELAY_WSS_PATH";
+const HOST_BROKER_BSK_EXECUTABLE_ENV = "QM_HOST_BROKER_BSK_EXECUTABLE";
+const HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE = "browser-skill-executable.txt";
 
 export const HOST_BROKER_CONTROL_NOTICE =
   "QM controls the browser on this device. The browser profile is shared across this deployment.";
@@ -193,12 +198,37 @@ export interface HostBrokerSessionRunResult {
   stderr: string;
 }
 
+export interface HostBrokerSessionRunControl {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface HostBrokerSessionRunHandle {
+  result: Promise<HostBrokerSessionRunResult>;
+  cancel(reason?: Error): Promise<void>;
+}
+
 export interface HostBrokerSessionRunner {
   run(
     executable: string,
     argv: readonly string[],
     options: HostBrokerSessionRunOptions,
-  ): Promise<HostBrokerSessionRunResult>;
+    control?: HostBrokerSessionRunControl,
+  ): Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle;
+}
+
+export interface ResolveInstalledBrowserSkillExecutableOptions {
+  env?: NodeJS.ProcessEnv;
+  installRoot: string;
+}
+
+export interface CreateDefaultHostBrokerSessionRunnerOptions {
+  spawn?: typeof spawn;
+  defaultTimeoutMs?: number;
+  maxOutputBytes?: number;
+  killGraceMs?: number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 }
 
 type HostBrokerTimer = ReturnType<typeof setTimeout>;
@@ -417,25 +447,70 @@ function createOperationFence(dataDir: string, fence: HostOperationFence): boole
   return true;
 }
 
-function waitForExitWithTimeout(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<number | null> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        return;
-      }
-    }, timeoutMs);
-    const finish = (callback: () => void): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      callback();
-    };
-    child.once("error", (error) => finish(() => reject(error)));
-    child.once("close", (exitCode) => finish(() => resolve(exitCode)));
-  });
+function assertSafeInstallOwnedFile(path: string): void {
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink()) throw new Error(`refusing symbolic link path ${JSON.stringify(path)}`);
+  if (!stats.isFile()) throw new Error(`expected regular file at ${JSON.stringify(path)}`);
+  if ((stats.mode & 0o022) !== 0) {
+    throw new Error(`file ${JSON.stringify(path)} must not be writable by group or others`);
+  }
+  if ((stats.mode & 0o777) > SAFE_INSTALL_FILE_MAX_MODE) {
+    throw new Error(`file ${JSON.stringify(path)} uses an unsafe mode`);
+  }
+  const currentUid = process.getuid?.();
+  if (currentUid !== undefined && stats.uid !== currentUid && stats.uid !== 0) {
+    throw new Error(`file ${JSON.stringify(path)} must be owned by the current user or root`);
+  }
+}
+
+function assertSafeExecutableFile(path: string): void {
+  if (!isAbsolute(path)) throw new Error("BrowserSkill executable path must be absolute");
+  assertSafeInstallOwnedFile(path);
+  try {
+    accessSync(path, fsConstants.X_OK);
+  } catch {
+    throw new Error(`BrowserSkill executable is not executable at ${path}`);
+  }
+}
+
+function normalizeInstalledExecutablePath(text: string): string {
+  const executable = text.trim();
+  if (!executable) throw new Error("BrowserSkill executable config is empty");
+  if (!isAbsolute(executable)) throw new Error("BrowserSkill executable path must be absolute");
+  return executable;
+}
+
+export function resolveInstalledBrowserSkillExecutable(options: ResolveInstalledBrowserSkillExecutableOptions): string {
+  const env = options.env ?? process.env;
+  if (env[HOST_BROKER_BSK_EXECUTABLE_ENV]?.trim()) {
+    throw new Error(
+      `${HOST_BROKER_BSK_EXECUTABLE_ENV} is removed; configure ${HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE}`,
+    );
+  }
+  const configPath = join(options.installRoot, HOST_BROKER_BSK_EXECUTABLE_CONFIG_FILE);
+  if (!existsSync(configPath)) {
+    throw new Error(`BrowserSkill executable config is missing at ${JSON.stringify(configPath)}`);
+  }
+  assertSafeInstallOwnedFile(configPath);
+  const executable = normalizeInstalledExecutablePath(readFileSync(configPath, "utf8"));
+  assertSafeExecutableFile(executable);
+  return executable;
+}
+
+function isSessionRunHandle(
+  value: Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle,
+): value is HostBrokerSessionRunHandle {
+  return typeof value === "object" && value !== null && "result" in value && "cancel" in value;
+}
+
+function normalizeSessionRunHandle(
+  value: Promise<HostBrokerSessionRunResult> | HostBrokerSessionRunHandle,
+): HostBrokerSessionRunHandle {
+  if (isSessionRunHandle(value)) return value;
+  return {
+    result: value,
+    async cancel() {},
+  };
 }
 
 function stableJson(value: unknown): string {
@@ -512,57 +587,150 @@ function classifyAcceptedFailure(error: unknown): {
   };
 }
 
-const DEFAULT_SESSION_RUNNER: HostBrokerSessionRunner = {
-  run(executable, argv, options) {
-    return new Promise((resolve, reject) => {
+export function createDefaultHostBrokerSessionRunner(
+  options: CreateDefaultHostBrokerSessionRunnerOptions = {},
+): HostBrokerSessionRunner {
+  const spawnProcess = options.spawn ?? spawn;
+  const setTimer = options.setTimeout ?? setTimeout;
+  const clearTimer = options.clearTimeout ?? clearTimeout;
+  const defaultTimeoutMs = options.defaultTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
+  const maxOutputBytes = options.maxOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
+  const killGraceMs = options.killGraceMs ?? DEFAULT_CHILD_KILL_GRACE_MS;
+  return {
+    run(executable, argv, runOptions, control) {
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(executable, [...argv], options);
+        child = spawnProcess(executable, [...argv], runOptions);
       } catch (error) {
-        reject(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
-        return;
+        return {
+          result: Promise.reject(
+            new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)),
+          ),
+          async cancel() {},
+        };
+      }
+      if (!child.stdout || !child.stderr) {
+        return {
+          result: Promise.reject(new HostBrokerSpawnRejectedError("BrowserSkill pipes were not available")),
+          async cancel() {},
+        };
       }
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let outputBytes = 0;
-      let outputExceeded = false;
-      if (!child.stdout || !child.stderr) {
-        reject(new HostBrokerSpawnRejectedError("BrowserSkill pipes were not available"));
-        return;
-      }
-      const collect = (chunks: Buffer[], chunk: Buffer): void => {
-        outputBytes += chunk.length;
-        if (outputBytes > MAX_BROWSER_SKILL_OUTPUT_BYTES) {
-          outputExceeded = true;
-          child.kill("SIGKILL");
-          return;
+      let settled = false;
+      let finish: (() => void) | null = null;
+      let rejectResult: ((error: Error) => void) | null = null;
+      let terminationReason: Error | null = null;
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearTerminationTimers = (): void => {
+        if (timeoutTimer !== null) {
+          clearTimer(timeoutTimer);
+          timeoutTimer = null;
         }
-        chunks.push(chunk);
+        if (killTimer !== null) {
+          clearTimer(killTimer);
+          killTimer = null;
+        }
       };
-      child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
-      child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
-      waitForExitWithTimeout(child, MAX_BROWSER_SKILL_RUN_MS)
-        .then((exitCode) => {
-          if (outputExceeded) {
-            reject(new Error("BrowserSkill output exceeded the maximum size"));
-            return;
-          }
-          if (exitCode === null) {
-            reject(new Error("BrowserSkill session start timed out"));
-            return;
-          }
-          resolve({
+      const cleanupAbortListener = (): void => {
+        control?.signal?.removeEventListener("abort", onAbort);
+      };
+      const settleRejection = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTerminationTimers();
+        cleanupAbortListener();
+        rejectResult?.(error);
+        finish?.();
+      };
+      const settleResolution = (exitCode: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTerminationTimers();
+        cleanupAbortListener();
+        if (terminationReason) {
+          rejectResult?.(terminationReason);
+        } else {
+          finish?.();
+        }
+        if (!terminationReason && exitCode !== null) {
+          resolveResult({
             exitCode,
             stdout: Buffer.concat(stdout).toString("utf8"),
             stderr: Buffer.concat(stderr).toString("utf8"),
           });
-        })
-        .catch((error) => {
-          reject(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
-        });
-    });
-  },
-};
+        } else if (!terminationReason && exitCode === null) {
+          rejectResult?.(new Error("BrowserSkill session start terminated"));
+        }
+      };
+      let resolveResult!: (value: HostBrokerSessionRunResult) => void;
+      const result = new Promise<HostBrokerSessionRunResult>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = (error) => reject(error);
+        finish = () => {};
+      });
+      const terminate = (reason: Error): Promise<void> => {
+        if (!terminationReason) {
+          terminationReason = reason;
+          if (!settled) {
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              return result.then(
+                () => undefined,
+                () => undefined,
+              );
+            }
+            killTimer = setTimer(() => {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                return;
+              }
+            }, killGraceMs);
+          }
+        }
+        return result.then(
+          () => undefined,
+          () => undefined,
+        );
+      };
+      const collect = (chunks: Buffer[], chunk: Buffer): void => {
+        outputBytes += chunk.length;
+        if (outputBytes > maxOutputBytes) {
+          void terminate(new Error("BrowserSkill output exceeded the maximum size"));
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onAbort = (): void => {
+        void terminate(new Error("BrowserSkill session start cancelled"));
+      };
+      child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+      child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+      child.once("error", (error) => {
+        settleRejection(new HostBrokerSpawnRejectedError(error instanceof Error ? error.message : String(error)));
+      });
+      child.once("close", (exitCode) => {
+        settleResolution(exitCode);
+      });
+      control?.signal?.addEventListener("abort", onAbort, { once: true });
+      timeoutTimer = setTimer(() => {
+        void terminate(new Error("BrowserSkill session start timed out"));
+      }, control?.timeoutMs ?? defaultTimeoutMs);
+      return {
+        result,
+        cancel(reason) {
+          return terminate(reason ?? new Error("BrowserSkill session start cancelled"));
+        },
+      };
+    },
+  };
+}
+
+const DEFAULT_SESSION_RUNNER = createDefaultHostBrokerSessionRunner();
 
 function identityFromPrivateKeyPem(privateKeyPem: string): DeviceIdentity {
   const privateKey = createPrivateKey(privateKeyPem);
@@ -1166,6 +1334,7 @@ export class HostBrokerConnection {
   private readonly maxBrowserSkillOutputBytes: number;
   private readonly browserSkillTimeoutMs: number;
   private readonly writeObserver: HostBrokerWriteObserver | null;
+  private readonly activeSessionRuns = new Set<HostBrokerSessionRunHandle>();
 
   constructor(options: HostBrokerConnectionOptions) {
     this.options = options;
@@ -1206,6 +1375,7 @@ export class HostBrokerConnection {
     policyGrammarVersion: string;
     now: () => number;
     isActive: () => boolean;
+    signal: AbortSignal;
   }): Promise<void> {
     const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
     if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
@@ -1304,20 +1474,23 @@ export class HostBrokerConnection {
     this.emitState();
     input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
     let completedPersisted = false;
-    let runTimer: ReturnType<typeof setTimeout> | null = null;
-    try {
-      const runResult = await Promise.race([
-        this.sessionRunner.run(this.browserSkillExecutable, authority.argv, {
+    const runHandle = normalizeSessionRunHandle(
+      this.sessionRunner.run(
+        this.browserSkillExecutable,
+        authority.argv,
+        {
           shell: false,
           stdio: ["ignore", "pipe", "pipe"],
-        }),
-        new Promise<HostBrokerSessionRunResult>((_, reject) => {
-          runTimer = setTimeout(
-            () => reject(new Error("BrowserSkill session start timed out")),
-            this.browserSkillTimeoutMs,
-          );
-        }),
-      ]);
+        },
+        {
+          signal: input.signal,
+          timeoutMs: this.browserSkillTimeoutMs,
+        },
+      ),
+    );
+    this.activeSessionRuns.add(runHandle);
+    try {
+      const runResult = await runHandle.result;
       if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
       const result = parseBrowserSkillSessionStartResult(runResult.stdout, this.maxBrowserSkillOutputBytes);
       if (result.browser_instance_id !== authority.browserInstanceId) {
@@ -1382,7 +1555,7 @@ export class HostBrokerConnection {
       if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(terminal));
       return;
     } finally {
-      if (runTimer !== null) clearTimeout(runTimer);
+      this.activeSessionRuns.delete(runHandle);
       this.snapshotState.currentTaskPresent = false;
       this.emitState();
     }
@@ -1411,6 +1584,7 @@ export class HostBrokerConnection {
       let handshakeComplete = false;
       let active = true;
       let locallyRequestedStop = false;
+      const invocationAbortController = new AbortController();
       const handshakeTimeout = scheduler.setTimeout(() => {
         finish(
           undefined,
@@ -1463,6 +1637,7 @@ export class HostBrokerConnection {
                 policyGrammarVersion: negotiatedPolicyGrammarVersion,
                 now: () => scheduler.now(),
                 isActive: () => active,
+                signal: invocationAbortController.signal,
               }).catch((error: unknown) => {
                 finish(undefined, error instanceof Error ? error : new Error(String(error)));
               });
@@ -1562,11 +1737,22 @@ export class HostBrokerConnection {
         detachListeners();
         clearHandshakeTimeout();
         this.options.signal?.removeEventListener("abort", onAbort);
+        invocationAbortController.abort();
         if (!locallyRequestedStop) closeSocket(1000, error ? "local cleanup" : "settled");
         this.snapshotState.brokerStatus = "disconnected";
         this.emitState();
-        if (error) reject(error);
-        else resolve(result ?? { reason: "settled", ready: challenged });
+        const cancelReason = error
+          ? new Error(`BrowserSkill session start interrupted: ${error.message}`)
+          : new Error(
+              result?.reason === "stopped"
+                ? "BrowserSkill session start stopped"
+                : "BrowserSkill session start cancelled",
+            );
+        const inFlightCancels = [...this.activeSessionRuns].map((handle) => handle.cancel(cancelReason));
+        void Promise.allSettled(inFlightCancels).then(() => {
+          if (error) reject(error);
+          else resolve(result ?? { reason: "settled", ready: challenged });
+        });
       };
       this.options.signal?.addEventListener("abort", onAbort, { once: true });
       socket.addEventListener("open", openListener);

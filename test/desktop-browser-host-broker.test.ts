@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { once } from "node:events";
 import {
+  accessSync,
   chmodSync,
   existsSync,
   mkdtempSync,
@@ -43,9 +45,11 @@ import {
   HOST_BROKER_CONTROL_NOTICE,
   HostBrokerSpawnRejectedError,
   HostBrokerConnection,
+  createDefaultHostBrokerSessionRunner,
   loadOrCreateDeviceIdentity,
   createRegistrationConfirmationPreview,
   confirmRegistration,
+  resolveInstalledBrowserSkillExecutable,
   runHostBrokerCli,
   resolveRelayUrlFromEnv,
   verifyHostChallengeResponseMessage,
@@ -269,6 +273,32 @@ function runtime(): BrowserRuntimeMetadata {
   };
 }
 
+function writeExecutable(path: string, body: string = "#!/bin/sh\nexit 0\n"): string {
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  accessSync(path);
+  return path;
+}
+
+class FakeChildProcess extends EventEmitter {
+  readonly stdout = new EventEmitter();
+  readonly stderr = new EventEmitter();
+  readonly killSignals: string[] = [];
+
+  kill(signal: string): boolean {
+    this.killSignals.push(signal);
+    return true;
+  }
+
+  close(exitCode: number | null = null): void {
+    this.emit("close", exitCode);
+  }
+
+  fail(error: Error): void {
+    this.emit("error", error);
+  }
+}
+
 function sessionStartAuthority(
   operationId: string,
   now: number = Date.now(),
@@ -311,6 +341,7 @@ async function connectOperationHost(input: {
   dataDir: string;
   sessionRunner: HostBrokerSessionRunner;
   browserSkillTimeoutMs?: number;
+  browserSkillExecutable?: string;
   now?: number;
   supportedPolicyGrammarVersions?: string[];
   challengePolicyGrammarVersion?: string;
@@ -331,7 +362,7 @@ async function connectOperationHost(input: {
     identity,
     runtime: runtime(),
     dataDir: input.dataDir,
-    browserSkillExecutable: "bsk",
+    browserSkillExecutable: input.browserSkillExecutable ?? "bsk",
     sessionRunner: input.sessionRunner,
     browserSkillTimeoutMs: input.browserSkillTimeoutMs,
     scheduler,
@@ -1158,16 +1189,22 @@ test("post-fence BrowserSkill output failures persist unknown without task owner
 
 test("post-fence BrowserSkill timeout persists unknown without task ownership or retry", async () => {
   const dir = mkdtempSync(join(tmpdir(), "host-broker-timeout-"));
-  let spawnCalls = 0;
+  const child = new FakeChildProcess();
+  const originalKill = child.kill.bind(child);
+  child.kill = (signal: string): boolean => {
+    const result = originalKill(signal);
+    if (signal === "SIGKILL") setImmediate(() => child.close(null));
+    return result;
+  };
+  const sessionRunner = createDefaultHostBrokerSessionRunner({
+    spawn: () => child as never,
+    defaultTimeoutMs: 5,
+    killGraceMs: 5,
+  });
   const { socket, running } = await connectOperationHost({
     dataDir: dir,
     browserSkillTimeoutMs: 5,
-    sessionRunner: {
-      async run() {
-        spawnCalls += 1;
-        return await new Promise<never>(() => {});
-      },
-    },
+    sessionRunner,
   });
   const authority = {
     ...sessionStartAuthority("0198f3d2-1950-7000-8000-000000000060"),
@@ -1201,10 +1238,107 @@ test("post-fence BrowserSkill timeout persists unknown without task ownership or
   ) as HostResultMessage;
   assert.equal(accepted.payload.operationId, authority.operationId);
   assert.equal(result.payload.outcome, "unknown");
-  assert.equal(spawnCalls, 1);
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
   assert.equal(existsSync(join(dir, "sessions")), false);
   socket.close(1000, "done");
   await running;
+});
+
+test("disconnect waits for runner cancellation before settling and persisting unknown replay state", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-disconnect-cancel-"));
+  let releaseCancel: (() => void) | undefined;
+  let cancelCalls = 0;
+  let settled = false;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    sessionRunner: {
+      run(_executable, _argv, _options, control) {
+        assert.ok(control?.signal instanceof AbortSignal);
+        let rejectRun: ((error: Error) => void) | undefined;
+        return {
+          result: new Promise<never>((_resolve, reject) => {
+            rejectRun = reject;
+          }),
+          async cancel(reason) {
+            cancelCalls += 1;
+            assert.match(reason?.message ?? "", /disconnect|closed|stop/i);
+            await new Promise<void>((resolve) => {
+              releaseCancel = resolve;
+            });
+            rejectRun?.(reason ?? new Error("cancelled"));
+          },
+        };
+      },
+    },
+  });
+  void running.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  const authority = {
+    ...sessionStartAuthority("0198f3d2-1950-7000-8000-000000000061"),
+    taskId: "task-disconnect-cancel-1",
+    attemptId: "attempt-disconnect-cancel-1",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-disconnect-cancel-1",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  await waitFor(() => (cancelCalls === 0 ? true : undefined), "invoke accepted before disconnect");
+  socket.close(1006, "connection lost");
+  await flushAsyncWork();
+  assert.equal(cancelCalls, 1);
+  assert.equal(settled, false);
+  releaseCancel?.();
+  await assert.rejects(running, /retryable|transport|closed/i);
+  const fenceFile = readdirSync(join(dir, "operations"))[0]!;
+  const fence = JSON.parse(readFileSync(join(dir, "operations", fenceFile), "utf8")) as {
+    state?: string;
+    terminalPayload?: { outcome?: string };
+  };
+  assert.equal(fence.state, "unknown");
+  assert.equal(fence.terminalPayload?.outcome, "unknown");
+});
+
+test("default runner timeout sends TERM then bounded KILL and waits for child close", async () => {
+  const child = new FakeChildProcess();
+  const runner = createDefaultHostBrokerSessionRunner({
+    spawn: () => child as never,
+    defaultTimeoutMs: 5,
+    killGraceMs: 5,
+  });
+  const run = runner.run("/opt/qm/browser-skill/bsk", ["--json", "session", "start", "--browser", "browser-primary"], {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.equal(typeof run, "object");
+  assert.ok("result" in run);
+  const handle = run;
+  await delay(12);
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+  let settled = false;
+  void handle.result.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  assert.equal(settled, false);
+  child.close(null);
+  await assert.rejects(handle.result, /timed out/);
 });
 
 test("disconnect after durable completion preserves completed ownership and replays without respawn", async () => {
@@ -1903,6 +2037,103 @@ test("device identity refuses insecure existing files and symlinks", async () =>
   );
   symlinkSync(symlinkTarget, join(symlinkDir, "device-key.json"));
   await assert.rejects(() => loadOrCreateDeviceIdentity(symlinkDir), /symlink|regular file/);
+});
+
+test("installed BrowserSkill executable rejects legacy env, relative paths, PATH lookups, symlinks, and non-executables", () => {
+  const installDir = mkdtempSync(join(tmpdir(), "host-broker-bsk-install-"));
+  const configPath = join(installDir, "browser-skill-executable.txt");
+  const target = writeExecutable(join(installDir, "bsk"));
+  const symlinkPath = join(installDir, "bsk-link");
+  const nonExecutablePath = join(installDir, "bsk-noexec");
+  writeFileSync(nonExecutablePath, "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(nonExecutablePath, 0o644);
+  symlinkSync(target, symlinkPath);
+
+  assert.throws(
+    () =>
+      resolveInstalledBrowserSkillExecutable({
+        env: { QM_HOST_BROKER_BSK_EXECUTABLE: target },
+        installRoot: installDir,
+      }),
+    /QM_HOST_BROKER_BSK_EXECUTABLE.*unsupported|rejected|removed/i,
+  );
+
+  writeFileSync(configPath, "bsk\n", "utf8");
+  chmodSync(configPath, 0o600);
+  assert.throws(() => resolveInstalledBrowserSkillExecutable({ env: {}, installRoot: installDir }), /absolute/i);
+
+  writeFileSync(configPath, "./bsk\n", "utf8");
+  chmodSync(configPath, 0o600);
+  assert.throws(() => resolveInstalledBrowserSkillExecutable({ env: {}, installRoot: installDir }), /absolute/i);
+
+  writeFileSync(configPath, `${symlinkPath}\n`, "utf8");
+  chmodSync(configPath, 0o600);
+  assert.throws(
+    () => resolveInstalledBrowserSkillExecutable({ env: {}, installRoot: installDir }),
+    /symlink|symbolic link/i,
+  );
+
+  writeFileSync(configPath, `${nonExecutablePath}\n`, "utf8");
+  chmodSync(configPath, 0o600);
+  assert.throws(() => resolveInstalledBrowserSkillExecutable({ env: {}, installRoot: installDir }), /executable/i);
+});
+
+test("installed BrowserSkill executable resolves one fixed absolute path and the broker spawns it with shell disabled", async () => {
+  const installDir = mkdtempSync(join(tmpdir(), "host-broker-bsk-absolute-"));
+  const executable = writeExecutable(join(installDir, "bsk"));
+  writeFileSync(join(installDir, "browser-skill-executable.txt"), `${executable}\n`, "utf8");
+  chmodSync(join(installDir, "browser-skill-executable.txt"), 0o600);
+  assert.equal(resolveInstalledBrowserSkillExecutable({ env: {}, installRoot: installDir }), executable);
+
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-absolute-spawn-"));
+  const spawnCalls: Array<{ executable: string; argv: readonly string[]; options: unknown }> = [];
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    browserSkillExecutable: executable,
+    sessionRunner: {
+      run(nextExecutable, argv, options) {
+        spawnCalls.push({ executable: nextExecutable, argv, options });
+        return {
+          result: Promise.resolve({
+            exitCode: 0,
+            stdout: JSON.stringify({
+              session_id: "session-absolute",
+              browser_instance_id: "browser-primary",
+              agent_window_id: 7,
+            }),
+            stderr: "",
+          }),
+          async cancel() {},
+        };
+      },
+    },
+  });
+  const authority = {
+    ...sessionStartAuthority("0198f3d2-1950-7000-8000-000000000062"),
+    taskId: "task-absolute-1",
+    attemptId: "attempt-absolute-1",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-absolute-1",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  await waitFor(() => (spawnCalls.length === 1 ? true : undefined), "absolute spawn call");
+  assert.deepEqual(spawnCalls, [
+    {
+      executable,
+      argv: ["--json", "session", "start", "--browser", "browser-primary"],
+      options: { shell: false, stdio: ["ignore", "pipe", "pipe"] },
+    },
+  ]);
+  socket.close(1000, "done");
+  await running;
 });
 
 test("connect handshake sends shared hello and signed challenge response through the injected transport seam", async () => {
