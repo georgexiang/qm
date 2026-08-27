@@ -280,6 +280,10 @@ function writeExecutable(path: string, body: string = "#!/bin/sh\nexit 0\n"): st
   return path;
 }
 
+const TEST_BROWSER_SKILL_EXECUTABLE = writeExecutable(
+  join(mkdtempSync(join(tmpdir(), "host-broker-test-executable-")), "bsk"),
+);
+
 class FakeChildProcess extends EventEmitter {
   readonly stdout = new EventEmitter();
   readonly stderr = new EventEmitter();
@@ -362,7 +366,7 @@ async function connectOperationHost(input: {
     identity,
     runtime: runtime(),
     dataDir: input.dataDir,
-    browserSkillExecutable: input.browserSkillExecutable ?? "bsk",
+    browserSkillExecutable: input.browserSkillExecutable ?? TEST_BROWSER_SKILL_EXECUTABLE,
     sessionRunner: input.sessionRunner,
     browserSkillTimeoutMs: input.browserSkillTimeoutMs,
     scheduler,
@@ -434,6 +438,7 @@ test("connect defaults the relay URL to the shared QM device websocket path", as
     brokerInstanceId: "broker-default",
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   });
 
   await new Promise((resolve) => setImmediate(resolve));
@@ -471,6 +476,7 @@ test("host relay URL override accepts a safe wss URL with a custom path and host
     brokerInstanceId: "broker-default",
     brokerVersion: "0.0.0-test",
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
   });
 
   await new Promise((resolve) => setImmediate(resolve));
@@ -544,6 +550,7 @@ test("default host support interoperates with the default relay handshake throug
     supportedPolicyGrammarVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -623,6 +630,7 @@ test("host and relay prefer protocol 1.2 during handshake interop and publish th
     supportedPolicyGrammarVersions: ["1.0", "1.1"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -695,7 +703,7 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
       };
       assert.equal(fence.operationId, "0198f3d2-1950-7000-8000-000000000011");
       assert.equal(fence.requestHash, authorityRequestHash);
-      eventLog.push("spawn:bsk");
+      eventLog.push("spawn:browser-skill");
       spawnCalls.push({ executable, argv, options });
       return {
         exitCode: 0,
@@ -733,7 +741,7 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
     identity,
     runtime: runtime(),
     dataDir: dir,
-    browserSkillExecutable: "bsk",
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     sessionRunner,
     writeObserver,
     transport: {
@@ -816,14 +824,14 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
   assert.deepEqual(eventLog, [
     "durable:fence-created",
     "send:host.accepted",
-    "spawn:bsk",
+    "spawn:browser-skill",
     "durable:session-owned",
     "durable:fence-completed",
     "send:host.result",
   ]);
   assert.deepEqual(spawnCalls, [
     {
-      executable: "bsk",
+      executable: TEST_BROWSER_SKILL_EXECUTABLE,
       argv: ["--json", "session", "start", "--browser", "browser-primary"],
       options: { shell: false, stdio: ["ignore", "pipe", "pipe"] },
     },
@@ -1317,6 +1325,7 @@ test("default runner timeout sends TERM then bounded KILL and waits for child cl
     spawn: () => child as never,
     defaultTimeoutMs: 5,
     killGraceMs: 5,
+    closeGraceMs: 5,
   });
   const run = runner.run("/opt/qm/browser-skill/bsk", ["--json", "session", "start", "--browser", "browser-primary"], {
     shell: false,
@@ -1339,6 +1348,30 @@ test("default runner timeout sends TERM then bounded KILL and waits for child cl
   assert.equal(settled, false);
   child.close(null);
   await assert.rejects(handle.result, /timed out/);
+});
+
+test("default runner cancellation fails after a second close deadline when SIGKILL never closes the child", async () => {
+  const child = new FakeChildProcess();
+  const runner = createDefaultHostBrokerSessionRunner({
+    spawn: () => child as never,
+    defaultTimeoutMs: 60_000,
+    killGraceMs: 5,
+    closeGraceMs: 5,
+  });
+  const run = runner.run(
+    TEST_BROWSER_SKILL_EXECUTABLE,
+    ["--json", "session", "start", "--browser", "browser-primary"],
+    {
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  assert.equal(typeof run, "object");
+  assert.ok("result" in run);
+  const handle = run;
+  await assert.rejects(handle.cancel(new Error("disconnect")), /failed to terminate after SIGKILL/);
+  await assert.rejects(handle.result, /failed to terminate after SIGKILL/);
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("disconnect after durable completion preserves completed ownership and replays without respawn", async () => {
@@ -1584,6 +1617,7 @@ test("host and relay fall back to protocol 1.0 during handshake interop when rel
     supportedPolicyGrammarVersions: ["1.0", "1.1"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -1636,6 +1670,7 @@ test("host and relay fall back to protocol 1.0 during handshake interop when the
     supportedPolicyGrammarVersions: ["1.0", "1.1"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -1691,6 +1726,7 @@ test("host and relay reject same-major protocol versions without an exact shared
     supportedPolicyGrammarVersions: ["1.1"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -1740,6 +1776,7 @@ test("host and relay reject incompatible protocol majors during handshake intero
     supportedPolicyGrammarVersions: ["1.0"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -1803,6 +1840,7 @@ test("host challenge-response signature fails and relay rejects the frame if the
     supportedPolicyGrammarVersions: ["1.0", "1.1"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -2136,6 +2174,57 @@ test("installed BrowserSkill executable resolves one fixed absolute path and the
   await running;
 });
 
+test("direct HostBrokerConnection construction requires an absolute BrowserSkill executable for the default runner", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-direct-library-reject-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+
+  assert.throws(
+    () =>
+      new HostBrokerConnection({
+        qmUrl: "https://qm.example.com",
+        relayUrl: "wss://relay.example.com/v1/device",
+        brokerInstanceId: "broker-local-1",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.0"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        identity,
+        runtime: runtime(),
+        transport: new FakeTransport(new FakeSocket(), "wss://relay.example.com/v1/device"),
+      }),
+    /required/i,
+  );
+
+  assert.throws(
+    () =>
+      new HostBrokerConnection({
+        qmUrl: "https://qm.example.com",
+        relayUrl: "wss://relay.example.com/v1/device",
+        brokerInstanceId: "broker-local-1",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.0"],
+        supportedPolicyGrammarVersions: ["1.0"],
+        identity,
+        runtime: runtime(),
+        browserSkillExecutable: "./bsk",
+        transport: new FakeTransport(new FakeSocket(), "wss://relay.example.com/v1/device"),
+      }),
+    /absolute/i,
+  );
+});
+
+test("runHostBrokerCli connect rejects omitted and relative BrowserSkill executables for the default runner", async () => {
+  const makeDeps = (browserSkillExecutable?: string) => ({
+    dataDir: mkdtempSync(join(tmpdir(), "host-broker-cli-library-reject-")),
+    stdout: { write() {} },
+    stderr: { write() {} },
+    runtime: runtime(),
+    ...(browserSkillExecutable === undefined ? {} : { browserSkillExecutable }),
+  });
+
+  await assert.rejects(() => runHostBrokerCli(["connect", "https://qm.example.com"], makeDeps()), /required/i);
+  await assert.rejects(() => runHostBrokerCli(["connect", "https://qm.example.com"], makeDeps("./bsk")), /absolute/i);
+});
+
 test("connect handshake sends shared hello and signed challenge response through the injected transport seam", async () => {
   const dir = mkdtempSync(join(tmpdir(), "host-broker-transport-"));
   const identity = await loadOrCreateDeviceIdentity(dir);
@@ -2149,6 +2238,7 @@ test("connect handshake sends shared hello and signed challenge response through
     supportedPolicyGrammarVersions: ["1.0"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
   });
 
@@ -2329,6 +2419,7 @@ test("host challenge response signature fails if any signed binding field is mut
     supportedPolicyGrammarVersions: ["1.0"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
   });
 
@@ -2384,6 +2475,7 @@ test("connect clears the handshake timeout after the validated challenge and kee
     supportedPolicyGrammarVersions: ["1.0"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
     handshakeTimeoutMs: 15,
   });
@@ -2488,6 +2580,7 @@ test("connect fails closed when a relay message exceeds the configured message b
     supportedPolicyGrammarVersions: ["1.0"],
     identity,
     runtime: runtime(),
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
     transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
     maxMessageBytes: 32,
   });
@@ -2531,6 +2624,7 @@ test("connect never accepts a relay challenge missing any authoritative binding 
       supportedPolicyGrammarVersions: ["1.0"],
       identity,
       runtime: runtime(),
+      browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
       transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
     });
 

@@ -227,6 +227,7 @@ export interface CreateDefaultHostBrokerSessionRunnerOptions {
   defaultTimeoutMs?: number;
   maxOutputBytes?: number;
   killGraceMs?: number;
+  closeGraceMs?: number;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
 }
@@ -480,6 +481,20 @@ function normalizeInstalledExecutablePath(text: string): string {
   return executable;
 }
 
+function normalizeBrowserSkillExecutable(
+  executable: string | undefined,
+  sessionRunner: HostBrokerSessionRunner | undefined,
+): string {
+  if (executable === undefined) {
+    if (!sessionRunner) {
+      throw new Error("BrowserSkill executable is required when using the default host broker session runner");
+    }
+    return "";
+  }
+  assertSafeExecutableFile(executable);
+  return executable;
+}
+
 export function resolveInstalledBrowserSkillExecutable(options: ResolveInstalledBrowserSkillExecutableOptions): string {
   const env = options.env ?? process.env;
   if (env[HOST_BROKER_BSK_EXECUTABLE_ENV]?.trim()) {
@@ -596,6 +611,7 @@ export function createDefaultHostBrokerSessionRunner(
   const defaultTimeoutMs = options.defaultTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
   const maxOutputBytes = options.maxOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
   const killGraceMs = options.killGraceMs ?? DEFAULT_CHILD_KILL_GRACE_MS;
+  const closeGraceMs = options.closeGraceMs ?? killGraceMs;
   return {
     run(executable, argv, runOptions, control) {
       let child: ReturnType<typeof spawn>;
@@ -624,6 +640,7 @@ export function createDefaultHostBrokerSessionRunner(
       let terminationReason: Error | null = null;
       let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
       let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let closeTimer: ReturnType<typeof setTimeout> | null = null;
       const clearTerminationTimers = (): void => {
         if (timeoutTimer !== null) {
           clearTimer(timeoutTimer);
@@ -632,6 +649,10 @@ export function createDefaultHostBrokerSessionRunner(
         if (killTimer !== null) {
           clearTimer(killTimer);
           killTimer = null;
+        }
+        if (closeTimer !== null) {
+          clearTimer(closeTimer);
+          closeTimer = null;
         }
       };
       const cleanupAbortListener = (): void => {
@@ -675,26 +696,21 @@ export function createDefaultHostBrokerSessionRunner(
         if (!terminationReason) {
           terminationReason = reason;
           if (!settled) {
-            try {
-              child.kill("SIGTERM");
-            } catch {
-              return result.then(
-                () => undefined,
-                () => undefined,
-              );
-            }
+            void child.kill("SIGTERM");
             killTimer = setTimer(() => {
-              try {
-                child.kill("SIGKILL");
-              } catch {
-                return;
-              }
+              void child.kill("SIGKILL");
+              closeTimer = setTimer(() => {
+                settleRejection(new Error("BrowserSkill session start failed to terminate after SIGKILL"));
+              }, closeGraceMs);
             }, killGraceMs);
           }
         }
         return result.then(
           () => undefined,
-          () => undefined,
+          (error) => {
+            if (error === terminationReason) return;
+            throw error;
+          },
         );
       };
       const collect = (chunks: Buffer[], chunk: Buffer): void => {
@@ -1340,7 +1356,10 @@ export class HostBrokerConnection {
     this.options = options;
     this.dataDir = options.dataDir ?? null;
     this.deviceId = options.deviceId ?? null;
-    this.browserSkillExecutable = options.browserSkillExecutable ?? "bsk";
+    this.browserSkillExecutable = normalizeBrowserSkillExecutable(
+      options.browserSkillExecutable,
+      options.sessionRunner,
+    );
     this.sessionRunner = options.sessionRunner ?? DEFAULT_SESSION_RUNNER;
     this.maxBrowserSkillOutputBytes = options.maxBrowserSkillOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
     this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
@@ -1749,7 +1768,17 @@ export class HostBrokerConnection {
                 : "BrowserSkill session start cancelled",
             );
         const inFlightCancels = [...this.activeSessionRuns].map((handle) => handle.cancel(cancelReason));
-        void Promise.allSettled(inFlightCancels).then(() => {
+        void Promise.allSettled(inFlightCancels).then((cancelResults) => {
+          const cleanupFailure = cancelResults.find((entry) => entry.status === "rejected");
+          if (cleanupFailure) {
+            const reason = cleanupFailure.reason;
+            reject(
+              new Error(
+                `Host broker terminal cleanup failed: ${reason instanceof Error ? reason.message : String(reason)}`,
+              ),
+            );
+            return;
+          }
           if (error) reject(error);
           else resolve(result ?? { reason: "settled", ready: challenged });
         });
