@@ -58,24 +58,39 @@ function applyPatch<T>(value: T, patch: Partial<T>): T {
 
 export function createMemoryMap<T>(): DurableMap<T> {
   const m = new Map<string, T>();
-  let writeChain = Promise.resolve();
+  const waiters: (() => void)[] = [];
+  let held = false;
   const sortedEntries = () =>
     [...m.entries()].sort(([a], [b]) => {
       if (a < b) return -1;
       if (a > b) return 1;
       return 0;
     });
-  async function serializeWrite<R>(fn: () => R | Promise<R>): Promise<R> {
-    const previous = writeChain;
-    let release!: () => void;
-    writeChain = new Promise<void>((resolve) => {
-      release = resolve;
+  function releaseWrite(): void {
+    const next = waiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    held = false;
+  }
+  function serializeWrite<R>(fn: () => R): R | Promise<R> {
+    if (!held) return fn();
+    return new Promise<void>((resolve) => waiters.push(resolve)).then(() => {
+      try {
+        return fn();
+      } finally {
+        releaseWrite();
+      }
     });
-    await previous;
+  }
+  async function serializeAsyncWrite<R>(fn: () => Promise<R>): Promise<R> {
+    if (held) await new Promise<void>((resolve) => waiters.push(resolve));
+    held = true;
     try {
       return await fn();
     } finally {
-      release();
+      releaseWrite();
     }
   }
   return {
@@ -88,37 +103,45 @@ export function createMemoryMap<T>(): DurableMap<T> {
     async get(id) {
       return m.get(id) ?? null;
     },
-    async put(id, value) {
-      await serializeWrite(() => {
-        m.set(id, value);
-      });
+    put(id, value) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          m.set(id, value);
+        }),
+      );
     },
-    async putIfAbsent(id, value) {
-      return await serializeWrite(() => {
-        const existing = m.get(id);
-        if (existing !== undefined) return existing;
-        m.set(id, value);
-        return value;
-      });
+    putIfAbsent(id, value) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          const existing = m.get(id);
+          if (existing !== undefined) return existing;
+          m.set(id, value);
+          return value;
+        }),
+      );
     },
-    async insertIfAbsent(id, value) {
-      return await serializeWrite(() => {
-        if (m.has(id)) return false;
-        m.set(id, value);
-        return true;
-      });
+    insertIfAbsent(id, value) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          if (m.has(id)) return false;
+          m.set(id, value);
+          return true;
+        }),
+      );
     },
-    async merge(id, patch) {
-      return await serializeWrite(() => {
-        const v = m.get(id);
-        if (v == null) return null;
-        const merged = applyPatch(v, patch);
-        m.set(id, merged);
-        return merged;
-      });
+    merge(id, patch) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          const v = m.get(id);
+          if (v == null) return null;
+          const merged = applyPatch(v, patch);
+          m.set(id, merged);
+          return merged;
+        }),
+      );
     },
     async update(id, fn) {
-      return await serializeWrite(async () => {
+      return await serializeAsyncWrite(async () => {
         const v = m.get(id);
         if (v == null) return null;
         const next = await fn(v);
@@ -126,25 +149,31 @@ export function createMemoryMap<T>(): DurableMap<T> {
         return next;
       });
     },
-    async deleteIf(id, predicate) {
-      return await serializeWrite(() => {
-        const value = m.get(id);
-        if (value === undefined || !predicate(value)) return false;
-        m.delete(id);
-        return true;
-      });
+    deleteIf(id, predicate) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          const value = m.get(id);
+          if (value === undefined || !predicate(value)) return false;
+          m.delete(id);
+          return true;
+        }),
+      );
     },
-    async delete(id) {
-      await serializeWrite(() => {
-        m.delete(id);
-      });
+    delete(id) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          m.delete(id);
+        }),
+      );
     },
-    async take(id) {
-      return await serializeWrite(() => {
-        const v = m.get(id) ?? null;
-        m.delete(id);
-        return v;
-      });
+    take(id) {
+      return Promise.resolve(
+        serializeWrite(() => {
+          const v = m.get(id) ?? null;
+          m.delete(id);
+          return v;
+        }),
+      );
     },
   };
 }

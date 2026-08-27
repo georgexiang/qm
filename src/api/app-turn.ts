@@ -818,16 +818,13 @@ export function createTurnMethods(
         "outcome" in result.payload &&
         result.payload.outcome === "completed"
       ) {
-        const validated = await withCurrentWaitingTask(
-          taskId,
-          task.authorityId,
-          async (currentTask) =>
-            deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
-              taskId,
-              currentTask.execution!.operation,
-              async (currentAuthority) =>
-                deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
-            ),
+        const validated = await withCurrentWaitingTask(taskId, task.authorityId, async (currentTask) =>
+          deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+            taskId,
+            currentTask.execution!.operation,
+            async (currentAuthority) =>
+              deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
+          ),
         );
         if (validated && typeof validated === "object" && "status" in validated && validated.status === "refused") {
           return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, validated);
