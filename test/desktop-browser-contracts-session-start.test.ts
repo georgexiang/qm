@@ -5,6 +5,7 @@ import {
   buildDesktopBrowserSessionStartArgv,
   computeDesktopBrowserRequestHash,
   decodeDesktopBrowserMessage,
+  encodeDesktopBrowserMessage,
   parseDesktopBrowserCapabilitySet,
   parseDesktopBrowserSessionStartAuthorityEnvelope,
   type DesktopBrowserCapabilitySet,
@@ -354,6 +355,7 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: "0198f3d2-1950-7000-8000-000000000002",
       operationId: authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-1",
@@ -368,6 +370,7 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: completed.payload.dispatchId,
       operationId: authority.operationId,
       outcome: "failed",
       resultHash: "sha256:failed-1",
@@ -378,6 +381,7 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: completed.payload.dispatchId,
       operationId: authority.operationId,
       outcome: "unknown",
       resultHash: "sha256:unknown-1",
@@ -390,6 +394,10 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
   assert.throws(
     () => decodeDesktopBrowserMessage(JSON.stringify(completed), "1.0"),
     /host\.result protocol version 1\.2 does not equal negotiated version 1\.0/,
+  );
+  assert.throws(
+    () => decodeDesktopBrowserMessage(JSON.stringify(completed), "1.7"),
+    /host\.result protocol version 1\.2 does not equal negotiated version 1\.7/,
   );
   assert.throws(
     () => decodeDesktopBrowserMessage(JSON.stringify({ ...completed, traceContext: "not-valid-in-1.2" }), "1.2"),
@@ -416,6 +424,11 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
     ...completed,
     protocolVersion: "1.7",
   });
+  const canonicalAdditiveCompleted = decodeDesktopBrowserMessage(JSON.stringify(additiveCompleted), "1.7");
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(canonicalAdditiveCompleted), "1.7"), {
+    ...completed,
+    protocolVersion: "1.7",
+  });
   assert.throws(
     () =>
       decodeDesktopBrowserMessage(
@@ -439,6 +452,7 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
     protocolVersion: "1.7",
     kind: "host.result",
     payload: {
+      dispatchId: completed.payload.dispatchId,
       operationId: authority.operationId,
       outcome: "failed",
       resultHash: "sha256:failed-1",
@@ -515,21 +529,75 @@ test("Ticket 05 host.result is terminal-only after host.accepted", () => {
   );
 });
 
+test("Ticket 05 host.result keeps dispatch identity distinct for the same operation", () => {
+  const first = decodeDesktopBrowserMessage(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.result",
+      payload: {
+        dispatchId: "0198f3d2-1950-7000-8000-000000000002",
+        operationId: authority.operationId,
+        outcome: "completed",
+        resultHash: "sha256:result-1",
+        result: {
+          session_id: "session-1",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        },
+      },
+    }),
+    "1.2",
+  );
+  const second = decodeDesktopBrowserMessage(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.result",
+      payload: {
+        dispatchId: "0198f3d2-1950-7000-8000-000000000099",
+        operationId: authority.operationId,
+        outcome: "completed",
+        resultHash: "sha256:result-1",
+        result: {
+          session_id: "session-1",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        },
+      },
+    }),
+    "1.2",
+  );
+
+  assert.equal(first.kind, "host.result");
+  assert.equal(second.kind, "host.result");
+  assert.equal(first.payload.operationId, second.payload.operationId);
+  assert.notEqual(first.payload.dispatchId, second.payload.dispatchId);
+  assert.notDeepEqual(first, second);
+});
+
 test("Ticket 05 host.result rejects every invalid discriminator and field combination", () => {
   const operationId = authority.operationId;
   const error = { code: "browser_cli_failed", message: "Browser CLI failed" };
   const result = { session_id: "session-1", browser_instance_id: "browser-primary", agent_window_id: 42 };
   const invalidPayloads: Record<string, unknown>[] = [
+    { dispatchId: "dispatch-1", accepted: false, operationId, outcome: "failed", error },
     { operationId, accepted: false, outcome: "failed", error },
-    { operationId, dispatchId: "dispatch-1", outcome: "failed", error },
+    { dispatchId: "dispatch-1", operationId, outcome: "failed", error },
+    { dispatchId: "dispatch-1", operationId, outcome: "completed", result },
     { operationId, outcome: "completed", result },
-    { operationId, outcome: "completed", resultHash: "sha256:result", result, error },
-    { operationId, outcome: "completed", resultHash: "sha256:result" },
-    { operationId, outcome: "completed", resultHash: "sha256:result", result, accepted: true },
-    { operationId, outcome: "failed", resultHash: "sha256:failed", result },
-    { operationId, outcome: "unknown", resultHash: "sha256:unknown", result },
-    { operationId, outcome: "failed" },
-    { operationId, outcome: "unknown" },
+    { dispatchId: "dispatch-1", operationId, outcome: "completed", resultHash: "sha256:result", result, error },
+    { dispatchId: "dispatch-1", operationId, outcome: "completed", resultHash: "sha256:result" },
+    {
+      dispatchId: "dispatch-1",
+      operationId,
+      outcome: "completed",
+      resultHash: "sha256:result",
+      result,
+      accepted: true,
+    },
+    { dispatchId: "dispatch-1", operationId, outcome: "failed", resultHash: "sha256:failed", result },
+    { dispatchId: "dispatch-1", operationId, outcome: "unknown", resultHash: "sha256:unknown", result },
+    { dispatchId: "dispatch-1", operationId, outcome: "failed" },
+    { dispatchId: "dispatch-1", operationId, outcome: "unknown" },
   ];
 
   for (const payload of invalidPayloads) {
