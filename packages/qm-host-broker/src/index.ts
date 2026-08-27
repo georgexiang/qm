@@ -346,19 +346,19 @@ function createInitialState(input: {
 
 function createHostChallengeResponse(
   identity: DeviceIdentity,
-  challenge: RelayChallengeMessage["payload"],
+  challenge: RelayChallengeMessage,
 ): HostChallengeResponseMessage {
   const signingPayload = {
-    relayInstanceId: challenge.relayInstanceId,
-    deploymentCanonicalId: challenge.deploymentCanonicalId,
+    relayInstanceId: challenge.payload.relayInstanceId,
+    deploymentCanonicalId: challenge.payload.deploymentCanonicalId,
     devicePublicKey: identity.devicePublicKey,
-    brokerInstanceId: challenge.brokerInstanceId,
-    browserInstanceId: challenge.browserInstanceId,
-    connectionEpoch: challenge.connectionEpoch,
-    challengeNonce: challenge.challengeNonce,
+    brokerInstanceId: challenge.payload.brokerInstanceId,
+    browserInstanceId: challenge.payload.browserInstanceId,
+    connectionEpoch: challenge.payload.connectionEpoch,
+    challengeNonce: challenge.payload.challengeNonce,
   };
   const unsignedMessage = {
-    protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
+    protocolVersion: challenge.protocolVersion,
     payload: signingPayload,
   };
   return {
@@ -804,11 +804,11 @@ export class HostBrokerConnection {
           if (Buffer.byteLength(raw, "utf8") > (this.options.maxMessageBytes ?? MAX_RELAY_MESSAGE_BYTES)) {
             throw new Error("relay message exceeded the maximum allowed size");
           }
-          const message = decodeDesktopBrowserMessage(raw);
+          const message = decodeDesktopBrowserMessage(raw, this.options.supportedProtocolVersions[0]);
           if (message.kind === "relay.challenge") {
             if (challenged) throw new Error("relay sent multiple challenge messages for one host registration");
             assertTrustedRelayChallenge(message.payload, this.snapshotState);
-            const response = createHostChallengeResponse(this.options.identity, message.payload);
+            const response = createHostChallengeResponse(this.options.identity, message);
             if (!verifyHostChallengeResponseMessage(response)) {
               throw new Error("host challenge response failed local signature verification");
             }

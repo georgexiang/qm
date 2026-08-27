@@ -177,8 +177,16 @@ class MemoryRegistryAdapter implements DesktopBrowserRelayRegistryAdapter {
 
 class LinkedSocket implements HostBrokerSocket, DesktopBrowserRelaySocket {
   private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
+  private readonly transformOutbound: ((data: string) => string) | null;
   private peer: LinkedSocket | null = null;
   private closed = false;
+
+  closeCode: number | undefined;
+  closeReason: string | undefined;
+
+  constructor(transformOutbound?: (data: string) => string) {
+    this.transformOutbound = transformOutbound ?? null;
+  }
 
   attachPeer(peer: LinkedSocket): void {
     this.peer = peer;
@@ -191,12 +199,14 @@ class LinkedSocket implements HostBrokerSocket, DesktopBrowserRelaySocket {
   }
 
   send(data: string): void {
-    this.peer?.emit("message", { data });
+    this.peer?.emit("message", { data: this.transformOutbound ? this.transformOutbound(data) : data });
   }
 
   close(code?: number, reason?: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.emit("close", { code, reason });
     this.peer?.closeFromPeer(code, reason);
   }
@@ -212,6 +222,8 @@ class LinkedSocket implements HostBrokerSocket, DesktopBrowserRelaySocket {
   private closeFromPeer(code?: number, reason?: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.emit("close", { code, reason });
   }
 
@@ -220,9 +232,12 @@ class LinkedSocket implements HostBrokerSocket, DesktopBrowserRelaySocket {
   }
 }
 
-function createLinkedSocketPair(): { host: LinkedSocket; relay: LinkedSocket } {
-  const host = new LinkedSocket();
-  const relay = new LinkedSocket();
+function createLinkedSocketPair(input?: {
+  hostToRelay?: (data: string) => string;
+  relayToHost?: (data: string) => string;
+}): { host: LinkedSocket; relay: LinkedSocket } {
+  const host = new LinkedSocket(input?.hostToRelay);
+  const relay = new LinkedSocket(input?.relayToHost);
   host.attachPeer(relay);
   relay.attachPeer(host);
   return { host, relay };
@@ -437,6 +452,333 @@ test("default host support interoperates with the default relay handshake throug
 
   sockets.host.close(1000, "done");
   await running;
+});
+
+test("host and relay prefer protocol 1.2 during handshake interop and publish the negotiated version", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-preferred-minor-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-preferred-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2", "1.0"],
+    supportedPolicyGrammarVersions: ["1.1", "1.0"],
+    registry,
+    createNonce: () => "nonce-preferred-1",
+    createConnectionId: () => "connection-preferred-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: ["1.0", "1.1"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+  await flushAsyncWork();
+  const published = await waitFor(
+    () => registry.published.get("connection-preferred-1"),
+    "preferred relay publication",
+  );
+
+  assert.equal(published.protocolVersion, "1.2");
+  assert.equal(published.policyGrammarVersion, "1.1");
+
+  sockets.host.close(1000, "done");
+  await running;
+});
+
+test("host and relay fall back to protocol 1.0 during handshake interop when relay only supports 1.0", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-fallback-minor-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-fallback-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.0"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry,
+    createNonce: () => "nonce-fallback-1",
+    createConnectionId: () => "connection-fallback-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: ["1.0", "1.1"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+  await flushAsyncWork();
+  const published = await waitFor(() => registry.published.get("connection-fallback-1"), "fallback relay publication");
+
+  assert.equal(published.protocolVersion, "1.0");
+  assert.equal(published.policyGrammarVersion, "1.0");
+
+  sockets.host.close(1000, "done");
+  await running;
+});
+
+test("host and relay fall back to protocol 1.0 during handshake interop when the host only supports 1.0", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-mirror-fallback-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-mirror-fallback-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2", "1.0"],
+    supportedPolicyGrammarVersions: ["1.1", "1.0"],
+    registry,
+    createNonce: () => "nonce-mirror-fallback-1",
+    createConnectionId: () => "connection-mirror-fallback-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0"],
+    supportedPolicyGrammarVersions: ["1.0", "1.1"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+  await flushAsyncWork();
+  const published = await waitFor(
+    () => registry.published.get("connection-mirror-fallback-1"),
+    "mirror fallback relay publication",
+  );
+
+  assert.equal(published.protocolVersion, "1.0");
+  assert.equal(published.policyGrammarVersion, "1.1");
+
+  sockets.host.close(1000, "done");
+  await running;
+});
+
+test("host and relay reject same-major protocol versions without an exact shared version during handshake interop", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-same-major-no-exact-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-same-major-no-exact-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2"],
+    supportedPolicyGrammarVersions: ["1.1"],
+    registry,
+    createNonce: () => "nonce-same-major-no-exact-1",
+    createConnectionId: () => "connection-same-major-no-exact-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.1"],
+    supportedPolicyGrammarVersions: ["1.1"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+
+  await assert.rejects(running, /no compatible desktop browser protocol version available/);
+  assert.equal(registry.published.size, 0);
+  assert.equal(sockets.host.closeCode, 1008);
+  assert.match(sockets.host.closeReason ?? "", /no compatible desktop browser protocol version available/);
+});
+
+test("host and relay reject incompatible protocol majors during handshake interop", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-incompatible-major-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-incompatible-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["2.0"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry,
+    createNonce: () => "nonce-incompatible-1",
+    createConnectionId: () => "connection-incompatible-1",
+  });
+  const sockets = createLinkedSocketPair();
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: ["1.0"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+
+  await assert.rejects(
+    running,
+    /protocol major 1 is incompatible with supported major 2|no compatible desktop browser protocol version available/,
+  );
+  assert.equal(registry.published.size, 0);
+  assert.equal(sockets.host.closeCode, 1008);
+  assert.match(
+    sockets.host.closeReason ?? "",
+    /protocol major 1 is incompatible with supported major 2|no compatible desktop browser protocol version available/,
+  );
+});
+
+test("host challenge-response signature fails and relay rejects the frame if the protocol version is mutated on the wire", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-mutated-version-interop-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "reg-mutated-1",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-local-1",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2", "1.0"],
+    supportedPolicyGrammarVersions: ["1.1", "1.0"],
+    registry,
+    createNonce: () => "nonce-mutated-1",
+    createConnectionId: () => "connection-mutated-1",
+  });
+  let originalResponse: HostChallengeResponseMessage | null = null;
+  const sockets = createLinkedSocketPair({
+    hostToRelay(data: string): string {
+      const message = decodeDesktopBrowserMessage(data);
+      if (message.kind !== "host.challenge-response") return data;
+      originalResponse = message as HostChallengeResponseMessage;
+      return JSON.stringify({ ...message, protocolVersion: "1.0" });
+    },
+  });
+  service.acceptSocket(sockets.relay);
+  const connection = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    brokerInstanceId: "broker-local-1",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedPolicyGrammarVersions: ["1.0", "1.1"],
+    identity,
+    runtime: runtime(),
+    transport: {
+      connect(url: string): HostBrokerSocket {
+        assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
+        return sockets.host;
+      },
+    },
+  });
+
+  const running = connection.start();
+  sockets.host.open();
+
+  await assert.rejects(running, /protocol version does not match the negotiated version/);
+  if (!originalResponse) throw new Error("expected the host to emit a challenge response before relay rejection");
+  const capturedResponse = originalResponse as HostChallengeResponseMessage;
+  assert.equal(capturedResponse.protocolVersion, "1.2");
+  assert.equal(verifyHostChallengeResponseMessage({ ...capturedResponse, protocolVersion: "1.0" }), false);
+  assert.equal(registry.published.size, 0);
+  assert.equal(sockets.host.closeCode, 1008);
+  assert.match(sockets.host.closeReason ?? "", /protocol version does not match the negotiated version/);
 });
 
 test("host relay path override validates and interoperates with a custom relay websocket path", async () => {

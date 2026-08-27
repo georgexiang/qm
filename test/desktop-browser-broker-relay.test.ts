@@ -179,13 +179,13 @@ function createDeviceIdentity() {
 
 function hostHello(devicePublicKey: string, brokerInstanceId: string) {
   return JSON.stringify({
-    protocolVersion: "1.7",
+    protocolVersion: "1.2",
     kind: "host.hello",
     payload: {
       devicePublicKey,
       brokerInstanceId,
       brokerVersion: "0.0.0-test",
-      supportedProtocolVersions: ["1.7"],
+      supportedProtocolVersions: ["1.2"],
       supportedPolicyGrammarVersions: ["1.1", "1.0"],
       bskVersion: "bsk-1",
       extensionVersion: "extension-1",
@@ -226,7 +226,7 @@ function hostChallengeResponse(
     challengeNonce: input.challengeNonce ?? challenge.payload.challengeNonce,
   };
   return JSON.stringify({
-    protocolVersion: "1.2",
+    protocolVersion: challenge.protocolVersion,
     kind: "host.challenge-response",
     payload: {
       ...payload,
@@ -308,6 +308,93 @@ test("relay keeps a verified host pending until registration refresh promotes it
       }),
     /not implemented/,
   );
+});
+
+test("relay negotiates the highest exact shared protocol version during hello", async () => {
+  const clock = new ManualClock();
+  const adapter = new FakeRegistryAdapter();
+  const identity = createDeviceIdentity();
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-a",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2", "1.0"],
+    supportedPolicyGrammarVersions: ["1.1", "1.0"],
+    registry: adapter,
+    clock,
+  });
+  const socket = new FakeSocket();
+
+  service.acceptSocket(socket);
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.0",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.0"],
+        supportedPolicyGrammarVersions: ["1.1", "1.0"],
+        bskVersion: "bsk-1",
+        extensionVersion: "extension-1",
+        cliShapeHash: "shape-1",
+      },
+    }),
+  );
+  await flushMessages();
+
+  assert.equal(challengeAt(socket).protocolVersion, "1.0");
+});
+
+test("relay rejects same-major protocol versions when there is no exact overlap", async () => {
+  const clock = new ManualClock();
+  const adapter = new FakeRegistryAdapter();
+  const identity = createDeviceIdentity();
+  adapter.setBinding({
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-a",
+    connectionEpoch: 7,
+  });
+  const service = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-a",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: ["1.2"],
+    supportedPolicyGrammarVersions: ["1.1"],
+    registry: adapter,
+    clock,
+  });
+  const socket = new FakeSocket();
+
+  service.acceptSocket(socket);
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.1",
+      kind: "host.hello",
+      payload: {
+        devicePublicKey: identity.devicePublicKey,
+        brokerInstanceId: "broker-a",
+        brokerVersion: "0.0.0-test",
+        supportedProtocolVersions: ["1.1"],
+        supportedPolicyGrammarVersions: ["1.1"],
+        bskVersion: "bsk-1",
+        extensionVersion: "extension-1",
+        cliShapeHash: "shape-1",
+      },
+    }),
+  );
+  await flushMessages();
+
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /no compatible desktop browser protocol version available/);
 });
 
 test("relay rejects a stale challenge nonce after the response timeout elapses", async () => {

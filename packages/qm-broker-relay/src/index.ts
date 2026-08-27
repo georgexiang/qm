@@ -3,7 +3,6 @@ import {
   computeDesktopBrowserPublicDeviceFingerprint,
   decodeDesktopBrowserMessage,
   encodeDesktopBrowserMessage,
-  isDesktopBrowserProtocolCompatible,
   projectDesktopBrowserPublicIdentity,
   verifyHostChallengeResponseMessage,
   type DesktopBrowserRelayConnectionProjection,
@@ -118,9 +117,10 @@ function compareCanonicalVersions(left: string, right: string): number {
 }
 
 function negotiateProtocolVersion(remoteSupported: string[], localSupported: string[]): `${number}.${number}` {
+  const remote = new Set(remoteSupported);
   const candidates = [...localSupported].sort((left, right) => compareCanonicalVersions(right, left));
   for (const candidate of candidates) {
-    if (remoteSupported.some((remote) => isDesktopBrowserProtocolCompatible(remote, candidate))) {
+    if (remote.has(candidate)) {
       return candidate as `${number}.${number}`;
     }
   }
