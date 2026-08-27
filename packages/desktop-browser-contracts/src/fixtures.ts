@@ -1,8 +1,15 @@
 import {
+  DESKTOP_BROWSER_AUTHORITY_VERSION,
+  DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_PROTOCOL_VERSION,
   DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_RELAY_AUDIENCE,
+  DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
+  computeDesktopBrowserRequestHash,
+  type DesktopBrowserCapabilitySet,
+  type DesktopBrowserSessionStartAuthorityEnvelope,
   type DesktopBrowserRelayConnectionProjection,
   type DesktopBrowserRelayRegistryBinding,
   type DesktopBrowserMessage,
@@ -11,6 +18,66 @@ import {
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRegistrationReservationTuple,
 } from "./index.ts";
+
+export const desktopBrowserCapabilitySetFixture: DesktopBrowserCapabilitySet = {
+  protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  policyGrammarVersion: "1.0",
+  bskVersion: "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c",
+  extensionVersion: "2.0.19",
+  cliShapeHash: "sha256:browser-cli-shape-v1",
+};
+
+export const desktopBrowserSessionStartAuthorityFixture: DesktopBrowserSessionStartAuthorityEnvelope = {
+  authorityVersion: DESKTOP_BROWSER_AUTHORITY_VERSION,
+  audience: DESKTOP_BROWSER_RELAY_AUDIENCE,
+  deploymentCanonicalId: "qm://deployments/example",
+  actorId: "actor-1",
+  actorSnapshotHash: "sha256:actor-snapshot-1",
+  projectId: "project-1",
+  projectSnapshotHash: "sha256:project-snapshot-1",
+  membershipEpoch: 42,
+  taskId: "task-1",
+  attemptId: "attempt-1",
+  deviceId: "device-1",
+  browserInstanceId: "browser-primary",
+  leaseId: "lease-1",
+  leaseVersion: 3,
+  leaseExpiresAt: "2026-08-27T12:01:00.000Z",
+  operationId: "0198f3d2-1950-7000-8000-000000000001",
+  operationSequence: 1,
+  capabilitySet: desktopBrowserCapabilitySetFixture,
+  argv: ["--json", "session", "start", "--browser", "browser-primary"],
+  brokerOptions: { forceSharedRuntime: false },
+  effectClass: "local_effect",
+  nonce: "nonce-1",
+  issuedAt: "2026-08-27T12:00:00.000Z",
+};
+
+export const desktopBrowserRelayInvocationFixture = {
+  protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  kind: "relay.invoke",
+  payload: {
+    dispatchId: "0198f3d2-1950-7000-8000-000000000002",
+    requestHash: computeDesktopBrowserRequestHash(desktopBrowserSessionStartAuthorityFixture),
+    authority: desktopBrowserSessionStartAuthorityFixture,
+  },
+} as const satisfies DesktopBrowserMessage;
+
+export const desktopBrowserSessionStartCompletedResultFixture = {
+  protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  kind: "host.result",
+  payload: {
+    operationId: desktopBrowserSessionStartAuthorityFixture.operationId,
+    accepted: true,
+    outcome: "completed",
+    resultHash: "sha256:result-1",
+    result: {
+      session_id: "session-1",
+      browser_instance_id: desktopBrowserSessionStartAuthorityFixture.browserInstanceId,
+      agent_window_id: 42,
+    },
+  },
+} as const satisfies DesktopBrowserMessage;
 
 export const phaseFContractFixtures = [
   {
@@ -28,7 +95,7 @@ export const phaseFContractFixtures = [
       devicePublicKey: "ed25519:device-public-key-abc",
       brokerInstanceId: "broker-macbook-pro",
       brokerVersion: "0.1.0",
-      supportedProtocolVersions: [DESKTOP_BROWSER_PROTOCOL_VERSION],
+      supportedProtocolVersions: [...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS],
       supportedPolicyGrammarVersions: ["phase-f-1"],
       bskVersion: "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c",
       extensionVersion: "2.0.19",
@@ -62,25 +129,8 @@ export const phaseFContractFixtures = [
       signature: "base64:signature-1",
     },
   },
-  {
-    protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
-    kind: "relay.invoke",
-    payload: {
-      dispatchId: "dispatch-1",
-      operationId: "operation-1",
-      requestHash: "sha256:request-1",
-      argv: ["--json", "session", "start"],
-    },
-  },
-  {
-    protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
-    kind: "host.result",
-    payload: {
-      operationId: "operation-1",
-      outcome: "completed",
-      resultHash: "sha256:result-1",
-    },
-  },
+  desktopBrowserRelayInvocationFixture,
+  desktopBrowserSessionStartCompletedResultFixture,
   {
     protocolVersion: DESKTOP_BROWSER_PROTOCOL_VERSION,
     kind: "companion.status",

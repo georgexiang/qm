@@ -6,6 +6,7 @@ import {
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
 } from "../packages/desktop-browser-contracts/src/index.ts";
+import { desktopBrowserRelayInvocationFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import {
   DesktopBrowserRelayService,
   type DesktopBrowserRelayBinding,
@@ -696,18 +697,7 @@ test("relay rejects unexpected invocation frames from the host after registratio
     }),
   );
   await flushMessages();
-  socket.message(
-    JSON.stringify({
-      protocolVersion: "1.2",
-      kind: "relay.invoke",
-      payload: {
-        dispatchId: "dispatch-1",
-        operationId: "operation-1",
-        requestHash: "sha256:request-1",
-        argv: ["--json", "session", "start"],
-      },
-    }),
-  );
+  socket.message(JSON.stringify(desktopBrowserRelayInvocationFixture));
   await flushMessages();
 
   assert.equal(socket.closeCode, 1008);
