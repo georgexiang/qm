@@ -126,6 +126,14 @@ function capabilitySetRefusal(): string {
   return "Desktop Browser Relay connection capability set no longer matches the prepared task";
 }
 
+function protocolVersionRefusal(kind: "acceptance" | "result"): string {
+  return `Desktop Browser Host ${kind} protocol does not match the prepared task`;
+}
+
+function dispatchRefusal(kind: "acceptance" | "result"): string {
+  return `Desktop Browser Host ${kind} dispatch does not match the prepared task`;
+}
+
 function sameAccepted(left: HostAcceptedMessage, right: HostAcceptedMessage): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -373,6 +381,10 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Task has no prepared session start";
           return task;
         }
+        if (accepted.protocolVersion !== execution.operation.authority.capabilitySet.protocolVersion) {
+          refusal = protocolVersionRefusal("acceptance");
+          return task;
+        }
         if (accepted.payload.operationId !== execution.operation.authority.operationId) {
           refusal = "Desktop Browser Host acceptance operation does not match the prepared task";
           return task;
@@ -422,6 +434,7 @@ export function createDesktopBrowserTaskStore(
       const current = await backing.get(taskId);
       if (!current) return { status: "refused", reason: "Desktop Browser Task not found" };
       const needsCurrentAuthority =
+        !!current.execution?.hostAccepted &&
         !current.execution?.hostResult &&
         (result.payload.outcome === "completed" || result.payload.outcome === "unknown");
       let authorityState = currentAuthority;
@@ -458,6 +471,10 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Host result operation does not match the prepared task";
           return task;
         }
+        if (result.protocolVersion !== execution.operation.authority.capabilitySet.protocolVersion) {
+          refusal = protocolVersionRefusal("result");
+          return task;
+        }
         if (execution.hostResult) {
           if (sameResult(execution.hostResult, result)) {
             bound = task;
@@ -465,31 +482,6 @@ export function createDesktopBrowserTaskStore(
           }
           refusal = "Desktop Browser Task already recorded a Host result";
           return task;
-        }
-        if (result.payload.outcome !== "completed") {
-          if (result.payload.outcome === "unknown" && !execution.hostAccepted) {
-            refusal = "Desktop Browser Host result requires prior Host acceptance";
-            return task;
-          }
-          const at = now();
-          let attemptStatus: DesktopBrowserTaskExecution["attemptStatus"];
-          if (result.payload.outcome === "failed") {
-            attemptStatus = execution.hostAccepted ? "accepted_failed" : "pre_fence_failed";
-          } else {
-            attemptStatus = "accepted_unknown";
-          }
-          bound = {
-            ...task,
-            execution: {
-              ...execution,
-              attemptStatus,
-              ...(execution.hostAccepted ? { resultHash: result.payload.resultHash } : {}),
-              resultRecordedAt: at,
-              hostResult: structuredClone(result),
-            },
-            updatedAt: at,
-          };
-          return bound;
         }
         if (!execution.hostAccepted) {
           refusal = "Desktop Browser Host result requires prior Host acceptance";
@@ -499,9 +491,34 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Host result operation does not match the prepared task";
           return task;
         }
+        if (execution.hostAccepted.payload.dispatchId !== result.payload.dispatchId) {
+          refusal = dispatchRefusal("result");
+          return task;
+        }
         if (execution.hostAccepted.payload.requestHash !== execution.operation.requestHash) {
           refusal = capabilitySetRefusal();
           return task;
+        }
+        if (result.payload.outcome !== "completed") {
+          const at = now();
+          let attemptStatus: DesktopBrowserTaskExecution["attemptStatus"];
+          if (result.payload.outcome === "failed") {
+            attemptStatus = "accepted_failed";
+          } else {
+            attemptStatus = "accepted_unknown";
+          }
+          bound = {
+            ...task,
+            execution: {
+              ...execution,
+              attemptStatus,
+              resultHash: result.payload.resultHash,
+              resultRecordedAt: at,
+              hostResult: structuredClone(result),
+            },
+            updatedAt: at,
+          };
+          return bound;
         }
         if (authorityState) {
           const currentRefusal = currentAuthorityRefusal(task, execution, authorityState);

@@ -8,7 +8,7 @@ export interface DurableMap<T> {
   putIfAbsent(id: string, value: T): Promise<T>;
   insertIfAbsent?(id: string, value: T): Promise<boolean>;
   merge(id: string, patch: Partial<T>): Promise<T | null>;
-  update?(id: string, fn: (value: T) => T): Promise<T | null>;
+  update?(id: string, fn: (value: T) => T | Promise<T>): Promise<T | null>;
   deleteIf?(id: string, predicate: (value: T) => boolean): Promise<boolean>;
   delete(id: string): Promise<void>;
   take(id: string): Promise<T | null>;
@@ -58,12 +58,26 @@ function applyPatch<T>(value: T, patch: Partial<T>): T {
 
 export function createMemoryMap<T>(): DurableMap<T> {
   const m = new Map<string, T>();
+  let writeChain = Promise.resolve();
   const sortedEntries = () =>
     [...m.entries()].sort(([a], [b]) => {
       if (a < b) return -1;
       if (a > b) return 1;
       return 0;
     });
+  async function serializeWrite<R>(fn: () => R | Promise<R>): Promise<R> {
+    const previous = writeChain;
+    let release!: () => void;
+    writeChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
   return {
     async all() {
       return sortedEntries().map(([, v]) => v);
@@ -75,46 +89,62 @@ export function createMemoryMap<T>(): DurableMap<T> {
       return m.get(id) ?? null;
     },
     async put(id, value) {
-      m.set(id, value);
+      await serializeWrite(() => {
+        m.set(id, value);
+      });
     },
     async putIfAbsent(id, value) {
-      const existing = m.get(id);
-      if (existing !== undefined) return existing;
-      m.set(id, value);
-      return value;
+      return await serializeWrite(() => {
+        const existing = m.get(id);
+        if (existing !== undefined) return existing;
+        m.set(id, value);
+        return value;
+      });
     },
     async insertIfAbsent(id, value) {
-      if (m.has(id)) return false;
-      m.set(id, value);
-      return true;
+      return await serializeWrite(() => {
+        if (m.has(id)) return false;
+        m.set(id, value);
+        return true;
+      });
     },
     async merge(id, patch) {
-      const v = m.get(id);
-      if (v == null) return null;
-      const merged = applyPatch(v, patch);
-      m.set(id, merged);
-      return merged;
+      return await serializeWrite(() => {
+        const v = m.get(id);
+        if (v == null) return null;
+        const merged = applyPatch(v, patch);
+        m.set(id, merged);
+        return merged;
+      });
     },
     async update(id, fn) {
-      const v = m.get(id);
-      if (v == null) return null;
-      const next = fn(v);
-      m.set(id, next);
-      return next;
+      return await serializeWrite(async () => {
+        const v = m.get(id);
+        if (v == null) return null;
+        const next = await fn(v);
+        m.set(id, next);
+        return next;
+      });
     },
     async deleteIf(id, predicate) {
-      const value = m.get(id);
-      if (value === undefined || !predicate(value)) return false;
-      m.delete(id);
-      return true;
+      return await serializeWrite(() => {
+        const value = m.get(id);
+        if (value === undefined || !predicate(value)) return false;
+        m.delete(id);
+        return true;
+      });
     },
     async delete(id) {
-      m.delete(id);
+      await serializeWrite(() => {
+        m.delete(id);
+      });
     },
     async take(id) {
-      const v = m.get(id) ?? null;
-      m.delete(id);
-      return v;
+      return await serializeWrite(() => {
+        const v = m.get(id) ?? null;
+        m.delete(id);
+        return v;
+      });
     },
   };
 }
@@ -228,7 +258,7 @@ export function createPostgresMap<T>(pg: PgPool, table: string): DurableMap<T> {
       return withBump(async (client) => {
         const current = await client.query(`SELECT json FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
         if (!current.rows[0]) return null;
-        const next = fn(current.rows[0].json as T);
+        const next = await fn(current.rows[0].json as T);
         await client.query(`UPDATE ${table} SET json = $2 WHERE id = $1`, [id, jsonbStringify(next)]);
         return next;
       });

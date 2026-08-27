@@ -223,6 +223,7 @@ test("the application prepares the registered task from the current Relay projec
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-1",
       operationId: first.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-current",
@@ -307,6 +308,15 @@ test("a completed Host result atomically binds frozen browser ownership to its p
     (
       await store.consumeSessionStartAccepted(task.id, {
         ...accepted,
+        protocolVersion: "1.3",
+      })
+    ).status,
+    "refused",
+  );
+  assert.equal(
+    (
+      await store.consumeSessionStartAccepted(task.id, {
+        ...accepted,
         payload: { ...accepted.payload, operationId: "operation-2" },
       })
     ).status,
@@ -318,6 +328,7 @@ test("a completed Host result atomically binds frozen browser ownership to its p
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: accepted.payload.dispatchId,
       operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-1",
@@ -334,7 +345,25 @@ test("a completed Host result atomically binds frozen browser ownership to its p
     (
       await store.consumeSessionStartResult(task.id, {
         ...completed,
+        protocolVersion: "1.3",
+      })
+    ).status,
+    "refused",
+  );
+  assert.equal(
+    (
+      await store.consumeSessionStartResult(task.id, {
+        ...completed,
         payload: { ...completed.payload, operationId: "operation-2" },
+      })
+    ).status,
+    "refused",
+  );
+  assert.equal(
+    (
+      await store.consumeSessionStartResult(task.id, {
+        ...completed,
+        payload: { ...completed.payload, dispatchId: "dispatch-2" },
       })
     ).status,
     "refused",
@@ -375,7 +404,7 @@ test("a completed Host result atomically binds frozen browser ownership to its p
   );
 });
 
-test("Host pre-fence failure and accepted unknown remain distinct without creating another operation", async () => {
+test("Host result requires prior acceptance while accepted unknown remains distinct without creating another operation", async () => {
   async function preparedStore(taskId: string) {
     const issuedAt = Date.parse("2026-08-27T12:00:00.000Z");
     const generatedIds = [taskId, `${taskId}-attempt`, `${taskId}-lease`, `${taskId}-operation`, `${taskId}-nonce`];
@@ -436,16 +465,18 @@ test("Host pre-fence failure and accepted unknown remain distinct without creati
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-pre-fence",
       operationId: preFence.prepared.operation.authority.operationId,
       outcome: "failed",
       error: { code: "browser_cli_shape_changed", message: "CLI shape changed before acceptance" },
       resultHash: "sha256:failed-1",
     },
   });
-  assert.equal(preFenceResult.status, "ok");
-  if (preFenceResult.status !== "ok") return;
-  assert.equal(preFenceResult.task.execution?.attemptStatus, "pre_fence_failed");
-  assert.equal(preFenceResult.task.browserSkillSessionId, undefined);
+  assert.deepEqual(preFenceResult, {
+    status: "refused",
+    reason: "Desktop Browser Host result requires prior Host acceptance",
+  });
+  assert.equal((await preFence.store.get(preFence.task.id))?.execution?.hostResult, undefined);
   assert.deepEqual(await preFence.store.prepareSessionStart(preFence.task.id), preFence.prepared);
   assert.deepEqual(preFence.generatedIds, []);
 
@@ -464,6 +495,7 @@ test("Host pre-fence failure and accepted unknown remain distinct without creati
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-accepted-unknown",
       operationId: acceptedUnknown.prepared.operation.authority.operationId,
       outcome: "unknown",
       resultHash: "sha256:unknown-1",
@@ -546,6 +578,7 @@ test("an expired prepared task refuses its first Host result without binding bro
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-expired",
       operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-1",
@@ -659,6 +692,7 @@ test("the application refuses the first Host result after project membership dri
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-drift",
       operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-current",
@@ -1047,6 +1081,7 @@ test("the application refuses the first Host bind when the registered device rot
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-rotation",
       operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-rotation",
@@ -1145,6 +1180,7 @@ test("the task store refuses the first Host bind when the current capability set
     protocolVersion: "1.2",
     kind: "host.result",
     payload: {
+      dispatchId: "dispatch-drift",
       operationId: prepared.operation.authority.operationId,
       outcome: "completed",
       resultHash: "sha256:result-1",

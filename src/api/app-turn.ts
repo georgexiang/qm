@@ -23,6 +23,7 @@ import type {
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRelayConnectionProjection,
   HostAcceptedMessage,
+  HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import {
   projectDesktopBrowserActivityReply,
@@ -809,7 +810,27 @@ export function createTurnMethods(
       if (task.execution?.hostResult) {
         return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result);
       }
-      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
+      return withCurrentWaitingTask(taskId, task.authorityId, async (currentTask) => {
+        if (
+          currentTask.execution?.hostAccepted &&
+          !currentTask.execution.hostResult &&
+          result &&
+          typeof result === "object" &&
+          "kind" in result &&
+          result.kind === "host.result" &&
+          "payload" in result &&
+          result.payload &&
+          typeof result.payload === "object" &&
+          "outcome" in result.payload &&
+          result.payload.outcome === "completed"
+        ) {
+          return deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+            taskId,
+            currentTask.execution.operation,
+            async (currentAuthority) =>
+              deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
+          );
+        }
         const currentAuthority = await deps.desktopBrowserDeviceRegistry.sessionStartAuthorityState(taskId);
         return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority);
       });

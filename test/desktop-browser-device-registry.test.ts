@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { test } from "node:test";
+import { buildDesktopBrowserSessionStartArgv, computeDesktopBrowserRequestHash } from "qm-desktop-browser-contracts";
 import {
   createDesktopBrowserDeviceRegistry,
   type DesktopBrowserConfirmMutationPoint,
   type DesktopBrowserDeviceRegistry,
 } from "../src/desktop-browser/device-registry.ts";
+import type { DesktopBrowserPreparedSessionStartOperation } from "../src/desktop-browser/browser-task-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
 type Reserved = Awaited<ReturnType<DesktopBrowserDeviceRegistry["reserve"]>>;
@@ -573,6 +575,151 @@ test("offline fencing still marks the current device offline after authority exp
   assert.equal(offline.status, "ok");
   assert.equal(offline.device.device.status, "offline");
   assert.equal((await registry.get(reserved.reservation.registrationTuple.registrationId))?.status, "offline");
+});
+
+test("validated session-start authority refuses a bind after a stale pre-read loses the project head", async () => {
+  const { registry } = createRegistry(Date.parse("2026-08-27T12:00:00.000Z"));
+  const first = createKeyMaterial();
+  const second = createKeyMaterial();
+  const reserveOne = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-1",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 42,
+      authorityId: "authority-1",
+      authorityExpiresAt: Date.parse("2026-08-27T12:01:00.000Z"),
+      devicePublicKey: first.devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  assert.equal(
+    (
+      await registry.confirm({
+        registrationId: reserveOne.reservation.registrationTuple.registrationId,
+        authorityId: "authority-1",
+        browserRuntimeStatus: "ready",
+        envelope: confirmationEnvelope(reserveOne.reservation, first.signEnvelope),
+      })
+    ).status,
+    "ok",
+  );
+  await registry.publishRelayConnection({
+    connectionId: "connection-1",
+    publicDeviceFingerprint: reserveOne.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-1",
+    browserInstanceId: "browser-1",
+    connectionEpoch: 7,
+    registrationState: "registered",
+    protocolVersion: "1.2",
+    policyGrammarVersion: "1.0",
+    brokerVersion: "2.0.0",
+    bskVersion: "3.0.0",
+    extensionVersion: "4.0.0",
+    cliShapeHash: "sha256:cli-shape-1",
+    lastSeenAt: "2026-08-27T12:00:00.000Z",
+  });
+
+  const stale = await registry.sessionStartAuthorityState("task-1");
+  assert.equal(stale.status, "ok");
+  if (stale.status !== "ok") return;
+
+  const authority = {
+    authorityVersion: "1.0" as const,
+    audience: "qm-desktop-broker-relay" as const,
+    deploymentCanonicalId: stale.authority.registration.deploymentCanonicalId,
+    actorId: stale.authority.registration.actorId,
+    actorSnapshotHash: "sha256:actor-snapshot-1",
+    projectId: stale.authority.registration.projectId,
+    projectSnapshotHash: "sha256:project-snapshot-1",
+    membershipEpoch: stale.authority.registration.membershipEpoch,
+    taskId: stale.authority.registration.waitingTaskId,
+    attemptId: "attempt-1",
+    deviceId: stale.authority.registration.publicDeviceFingerprint,
+    browserInstanceId: stale.authority.registration.browserInstanceId,
+    leaseId: "lease-1",
+    leaseVersion: 1,
+    leaseExpiresAt: "2026-08-27T12:01:00.000Z",
+    operationId: "operation-1",
+    operationSequence: 1,
+    capabilitySet: {
+      protocolVersion: stale.authority.relayConnection.protocolVersion as `${number}.${number}`,
+      policyGrammarVersion: stale.authority.relayConnection.policyGrammarVersion as `${number}.${number}`,
+      bskVersion: stale.authority.relayConnection.bskVersion,
+      extensionVersion: stale.authority.relayConnection.extensionVersion,
+      cliShapeHash: stale.authority.relayConnection.cliShapeHash,
+    },
+    argv: buildDesktopBrowserSessionStartArgv(stale.authority.registration.browserInstanceId),
+    brokerOptions: { forceSharedRuntime: false },
+    effectClass: "local_effect" as const,
+    nonce: "nonce-1",
+    issuedAt: "2026-08-27T12:00:00.000Z",
+  };
+  const operation = {
+    authority,
+    requestHash: computeDesktopBrowserRequestHash(
+      authority,
+      stale.authority.relayConnection.protocolVersion,
+      stale.authority.relayConnection.policyGrammarVersion,
+    ),
+  } satisfies DesktopBrowserPreparedSessionStartOperation;
+
+  const reserveTwo = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-2",
+      actorId: "owner",
+      projectId: "project-1",
+      membershipEpoch: 43,
+      authorityId: "authority-2",
+      authorityExpiresAt: Date.parse("2026-08-27T12:01:00.000Z"),
+      devicePublicKey: second.devicePublicKey,
+      brokerInstanceId: "broker-2",
+      browserInstanceId: "browser-2",
+      connectionEpoch: 8,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  assert.equal(
+    (
+      await registry.confirm({
+        registrationId: reserveTwo.reservation.registrationTuple.registrationId,
+        authorityId: "authority-2",
+        browserRuntimeStatus: "ready",
+        envelope: confirmationEnvelope(reserveTwo.reservation, second.signEnvelope),
+      })
+    ).status,
+    "ok",
+  );
+  await registry.publishRelayConnection({
+    connectionId: "connection-2",
+    publicDeviceFingerprint: reserveTwo.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-2",
+    browserInstanceId: "browser-2",
+    connectionEpoch: 8,
+    registrationState: "registered",
+    protocolVersion: "1.2",
+    policyGrammarVersion: "1.0",
+    brokerVersion: "2.0.0",
+    bskVersion: "3.0.0",
+    extensionVersion: "4.0.0",
+    cliShapeHash: "sha256:cli-shape-1",
+    lastSeenAt: "2026-08-27T12:00:01.000Z",
+  });
+
+  let callbackCalls = 0;
+  const validated = await registry.withValidatedSessionStartAuthority("task-1", operation, async () => {
+    callbackCalls += 1;
+    return { status: "ok" as const };
+  });
+
+  assert.deepEqual(validated, {
+    status: "refused",
+    reason: "Desktop Browser Relay connection is no longer bound to the registered device",
+  });
+  assert.equal(callbackCalls, 0);
 });
 
 test("confirm faults at each former boundary roll back atomically so retry can still install the device", async () => {
