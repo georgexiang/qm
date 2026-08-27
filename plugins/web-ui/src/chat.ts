@@ -2076,9 +2076,7 @@ export function createChatSurface(
       <div class="desktop-browser-task-head">
         <span class="desktop-browser-task-icon">${icon(Monitor, 16)}</span>
         <span class="desktop-browser-task-title">Desktop browser</span>
-        <span class="desktop-browser-task-status ${statusClass}"
-          >${statusLabel}</span
-        >
+        <span class="desktop-browser-task-status ${statusClass}">${statusLabel}</span>
       </div>
       ${
         task.status !== "canceled"
@@ -2126,9 +2124,11 @@ export function createChatSurface(
                   ? html`<button
                       type="button"
                       class="desktop-browser-confirm"
-                      title=${task.registration?.confirmReady
-                        ? "Confirm the matching Host Broker fingerprint"
-                        : "Waiting for the Host-signed confirmation envelope"}
+                      title=${
+                        task.registration?.confirmReady
+                          ? "Confirm the matching Host Broker fingerprint"
+                          : "Waiting for the Host-signed confirmation envelope"
+                      }
                       ?disabled=${!task.registration?.confirmReady}
                       @click=${() => void confirm()}
                     >

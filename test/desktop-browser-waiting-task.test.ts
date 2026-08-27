@@ -135,7 +135,12 @@ test("waiting task activity replays reservation fingerprint and staged confirmat
 
   const afterReserve = await built.app.getSession(created.sessionId!);
   const reservedActivity = afterReserve?.entries.findLast((entry) => entry.type === "assistant")?.payload as
-    | { desktopBrowserActivity?: { status?: string; registration?: { confirmReady?: boolean; confirmationFingerprint?: string } } }
+    | {
+        desktopBrowserActivity?: {
+          status?: string;
+          registration?: { confirmReady?: boolean; confirmationFingerprint?: string };
+        };
+      }
     | undefined;
   assert.equal(reservedActivity?.desktopBrowserActivity?.status, "waiting_for_local_confirmation");
   assert.equal(reservedActivity?.desktopBrowserActivity?.registration?.confirmReady, false);
@@ -174,8 +179,7 @@ test("waiting task activity replays reservation fingerprint and staged confirmat
 
   const afterStage = await built.app.getSession(created.sessionId!);
   const stagedActivity = afterStage?.entries.findLast((entry) => entry.type === "assistant")?.payload as
-    | { desktopBrowserActivity?: { status?: string; registration?: { confirmReady?: boolean } } }
-    | undefined;
+    { desktopBrowserActivity?: { status?: string; registration?: { confirmReady?: boolean } } } | undefined;
   assert.equal(stagedActivity?.desktopBrowserActivity?.status, "waiting_for_local_confirmation");
   assert.equal(stagedActivity?.desktopBrowserActivity?.registration?.confirmReady, true);
 

@@ -285,7 +285,11 @@ export interface App {
       confirmationFingerprint: string;
     },
   ): Promise<
-    | { status: "ok"; device: DesktopBrowserSharedProfileProjection; desktopBrowserActivity: TurnResult["desktopBrowserActivity"] }
+    | {
+        status: "ok";
+        device: DesktopBrowserSharedProfileProjection;
+        desktopBrowserActivity: TurnResult["desktopBrowserActivity"];
+      }
     | { status: "refused"; reason: string }
   >;
   desktopBrowserStageRegistrationConfirmation(
@@ -295,8 +299,7 @@ export interface App {
       envelope: DesktopBrowserRegistrationConfirmationEnvelope;
     },
   ): Promise<
-    | { status: "ok"; registration: DesktopBrowserTaskRegistrationProjection }
-    | { status: "refused"; reason: string }
+    { status: "ok"; registration: DesktopBrowserTaskRegistrationProjection } | { status: "refused"; reason: string }
   >;
   desktopBrowserMarkRegistrationOffline(
     registrationId: string,

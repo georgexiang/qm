@@ -233,7 +233,13 @@ export function createAppHelpers(deps: AppDeps, app: App) {
       }),
     );
     const desktopBrowser = await deps.desktopBrowserDeviceRegistry.projectProjection(project.id);
-    return { ...project, memberIds, scopeId: projectScopeId(project.id), members, ...(desktopBrowser ? { desktopBrowser } : {}) };
+    return {
+      ...project,
+      memberIds,
+      scopeId: projectScopeId(project.id),
+      members,
+      ...(desktopBrowser ? { desktopBrowser } : {}),
+    };
   }
 
   async function projectsForViewer(principalId: string): Promise<ProjectView[]> {
