@@ -753,6 +753,48 @@ test("relay rejects a duplicate terminal result after resolving the correlated d
   assert.match(socket.closeReason ?? "", /without an in-flight invocation/i);
 });
 
+test("relay ignores a delayed terminal from settled dispatch A on the current socket while accepted dispatch B for the same operation and request hash stays active", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay();
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  const first = dispatch(desktopBrowserRelayInvocationFixture);
+  await flushMessages();
+  const firstAccepted = acceptedMessageFor();
+  const firstCompleted = completedResultFor();
+  socket.message(JSON.stringify(firstAccepted));
+  socket.message(JSON.stringify(firstCompleted));
+  assertCompletedResult(await first, firstAccepted, firstCompleted);
+
+  const secondInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId: "0198f3d2-1950-7000-8000-000000000003",
+    },
+  };
+  const second = dispatch(secondInvocation);
+  await flushMessages();
+  const secondAccepted = acceptedMessageFor(secondInvocation);
+  socket.message(JSON.stringify(secondAccepted));
+  await flushMessages();
+
+  socket.message(JSON.stringify(firstCompleted));
+  await flushMessages();
+  assert.equal(socket.closeCode, undefined);
+  assert.equal(socket.sent.length, 3);
+
+  const secondCompleted = completedResultFor(secondInvocation);
+  socket.message(JSON.stringify(secondCompleted));
+  assertCompletedResult(await second, secondAccepted, secondCompleted);
+  assert.equal(socket.closeCode, undefined);
+});
+
 test("relay allows sequential manual dispatch ids for the same operation and requestHash but rejects overlap, hash drift, and reused dispatch ids", async () => {
   const { identity, service, socket } = await createRegisteredTicket05Relay();
   const dispatch = (invocation: RelayInvocationMessage) =>
@@ -800,10 +842,7 @@ test("relay allows sequential manual dispatch ids for the same operation and req
       requestHash: computeDesktopBrowserRequestHash(conflictingAuthority),
     },
   };
-  await assert.rejects(
-    () => dispatch(conflictingDispatch),
-    /operationId .* different requestHash/i,
-  );
+  await assert.rejects(() => dispatch(conflictingDispatch), /operationId .* different requestHash/i);
   const newOperationAuthority = {
     ...desktopBrowserRelayInvocationFixture.payload.authority,
     operationId: "0198f3d2-1950-7000-8000-000000000004",
@@ -817,10 +856,7 @@ test("relay allows sequential manual dispatch ids for the same operation and req
       requestHash: computeDesktopBrowserRequestHash(newOperationAuthority),
     },
   };
-  await assert.rejects(
-    () => dispatch(reusedDispatchId),
-    /dispatchId .* already used/i,
-  );
+  await assert.rejects(() => dispatch(reusedDispatchId), /dispatchId .* already used/i);
   assert.equal(socket.sent.length, 3);
 });
 

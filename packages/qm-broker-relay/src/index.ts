@@ -119,6 +119,12 @@ interface RelayConnectionState {
   closeReason: string | null;
 }
 
+interface RelayDispatchHistoryEntry {
+  operationId: string;
+  requestHash: string;
+  state: "in_flight" | "accepted" | "terminal";
+}
+
 const DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024;
 const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const DEFAULT_CHALLENGE_TIMEOUT_MS = 5_000;
@@ -219,7 +225,7 @@ export class DesktopBrowserRelayService {
   private readonly connections = new Map<string, RelayConnectionState>();
   private readonly currentByIdentity = new Map<string, string>();
   private readonly operationRequestHashById = new Map<string, string>();
-  private readonly dispatchOperationById = new Map<string, string>();
+  private readonly dispatchHistoryById = new Map<string, RelayDispatchHistoryEntry>();
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -412,10 +418,10 @@ export class DesktopBrowserRelayService {
         );
       }
     }
-    const previousDispatchOperationId = this.dispatchOperationById.get(decoded.payload.dispatchId);
-    if (previousDispatchOperationId !== undefined) {
+    const previousDispatch = this.dispatchHistoryById.get(decoded.payload.dispatchId);
+    if (previousDispatch) {
       throw new Error(
-        `dispatchId ${JSON.stringify(decoded.payload.dispatchId)} already used for operationId ${JSON.stringify(previousDispatchOperationId)}`,
+        `dispatchId ${JSON.stringify(decoded.payload.dispatchId)} already used for operationId ${JSON.stringify(previousDispatch.operationId)}`,
       );
     }
     if (connection.pendingDispatch) {
@@ -426,7 +432,11 @@ export class DesktopBrowserRelayService {
       if (!hadOperationRequestHash) {
         this.operationRequestHashById.set(authority.operationId, canonicalRequestHash);
       }
-      this.dispatchOperationById.set(decoded.payload.dispatchId, authority.operationId);
+      this.dispatchHistoryById.set(decoded.payload.dispatchId, {
+        operationId: authority.operationId,
+        requestHash: canonicalRequestHash,
+        state: "in_flight",
+      });
       const timeout = this.options.clock.setTimeout(() => {
         if (connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId) return;
         void this.closeConnection(
@@ -453,7 +463,7 @@ export class DesktopBrowserRelayService {
         if (!hadOperationRequestHash) {
           this.operationRequestHashById.delete(authority.operationId);
         }
-        this.dispatchOperationById.delete(decoded.payload.dispatchId);
+        this.dispatchHistoryById.delete(decoded.payload.dispatchId);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -559,6 +569,20 @@ export class DesktopBrowserRelayService {
     };
   }
 
+  private isKnownStaleSequentialResult(
+    pending: NonNullable<RelayConnectionState["pendingDispatch"]>,
+    message: HostResultMessage,
+  ): boolean {
+    const history = this.dispatchHistoryById.get(message.payload.dispatchId);
+    if (!history) return false;
+    if (history.state !== "accepted" && history.state !== "terminal") return false;
+    return (
+      history.operationId === message.payload.operationId &&
+      history.operationId === pending.operationId &&
+      history.requestHash === pending.requestHash
+    );
+  }
+
   private async handleMessage(connection: RelayConnectionState, raw: string): Promise<void> {
     if (!this.connections.has(connection.connectionId) || connection.stage === "closing") return;
     if (byteLength(raw) > this.options.maxMessageBytes) {
@@ -604,23 +628,31 @@ export class DesktopBrowserRelayService {
       if (message.payload.requestHash !== pending.requestHash) {
         throw new Error("host.accepted requestHash does not match the in-flight invocation");
       }
+      const history = this.dispatchHistoryById.get(pending.dispatchId);
+      if (history) history.state = "accepted";
       pending.accepted = message;
       return;
     }
     if (message.kind === "host.result") {
       const pending = connection.pendingDispatch;
       if (!pending) throw new Error("unexpected host.result without an in-flight invocation");
+      if (message.payload.dispatchId !== pending.dispatchId) {
+        if (this.isKnownStaleSequentialResult(pending, message)) return;
+        if (!pending.accepted) {
+          throw new Error("host.result arrived before host.accepted");
+        }
+        throw new Error("host.result dispatch does not match the accepted invocation");
+      }
       if (!pending.accepted) {
         throw new Error("host.result arrived before host.accepted");
-      }
-      if (message.payload.dispatchId !== pending.accepted.payload.dispatchId) {
-        throw new Error("host.result dispatch does not match the accepted invocation");
       }
       if (message.payload.operationId !== pending.accepted.payload.operationId) {
         throw new Error("host.result operation does not match the accepted invocation");
       }
       connection.pendingDispatch = null;
       this.options.clock.clearTimeout(pending.timeout);
+      const history = this.dispatchHistoryById.get(pending.dispatchId);
+      if (history) history.state = "terminal";
       pending.resolve({
         kind: "host.result",
         accepted: pending.accepted,
