@@ -89,6 +89,8 @@ export interface DesktopBrowserRelayServiceOptions {
   heartbeatIntervalMs?: number;
   heartbeatGraceMs?: number;
   invocationTimeoutMs?: number;
+  maxSettledDispatchHistory?: number;
+  settledDispatchHistoryTtlMs?: number;
   createNonce?: () => string;
   createConnectionId?: () => string;
 }
@@ -122,7 +124,20 @@ interface RelayConnectionState {
 interface RelayDispatchHistoryEntry {
   operationId: string;
   requestHash: string;
-  state: "in_flight" | "accepted" | "terminal";
+  state: "in_flight" | "accepted" | "terminal" | "unknown";
+  settledAt: number | null;
+}
+
+interface RelayDispatchTombstone {
+  operationId: string;
+  requestHash: string;
+  state: "accepted" | "terminal" | "unknown";
+  expiresAt: number;
+}
+
+interface RelayOperationRequestHashEntry {
+  requestHash: string;
+  refCount: number;
 }
 
 const DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024;
@@ -131,6 +146,8 @@ const DEFAULT_CHALLENGE_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 const DEFAULT_HEARTBEAT_GRACE_MS = 5_000;
 const DEFAULT_INVOCATION_TIMEOUT_MS = 20_000;
+const DEFAULT_MAX_SETTLED_DISPATCH_HISTORY = 1_024;
+const DEFAULT_SETTLED_DISPATCH_HISTORY_TTL_MS = 300_000;
 
 const systemClock: DesktopBrowserRelayClock = {
   now: () => Date.now(),
@@ -216,6 +233,8 @@ export class DesktopBrowserRelayService {
       | "heartbeatIntervalMs"
       | "heartbeatGraceMs"
       | "invocationTimeoutMs"
+      | "maxSettledDispatchHistory"
+      | "settledDispatchHistoryTtlMs"
     >
   > & {
     clock: DesktopBrowserRelayClock;
@@ -224,8 +243,11 @@ export class DesktopBrowserRelayService {
   };
   private readonly connections = new Map<string, RelayConnectionState>();
   private readonly currentByIdentity = new Map<string, string>();
-  private readonly operationRequestHashById = new Map<string, string>();
+  private readonly operationRequestHashById = new Map<string, RelayOperationRequestHashEntry>();
   private readonly dispatchHistoryById = new Map<string, RelayDispatchHistoryEntry>();
+  private readonly settledDispatchOrder: string[] = [];
+  private readonly dispatchTombstonesById = new Map<string, RelayDispatchTombstone>();
+  private readonly dispatchTombstoneOrder: string[] = [];
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -241,6 +263,8 @@ export class DesktopBrowserRelayService {
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       heartbeatGraceMs: options.heartbeatGraceMs ?? DEFAULT_HEARTBEAT_GRACE_MS,
       invocationTimeoutMs: options.invocationTimeoutMs ?? DEFAULT_INVOCATION_TIMEOUT_MS,
+      maxSettledDispatchHistory: options.maxSettledDispatchHistory ?? DEFAULT_MAX_SETTLED_DISPATCH_HISTORY,
+      settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs ?? DEFAULT_SETTLED_DISPATCH_HISTORY_TTL_MS,
       clock: options.clock ?? systemClock,
       createNonce: options.createNonce ?? (() => randomUUID()),
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
@@ -250,6 +274,12 @@ export class DesktopBrowserRelayService {
     }
     if (this.options.supportedPolicyGrammarVersions.length === 0) {
       throw new Error("at least one supported policy grammar version is required");
+    }
+    if (!Number.isInteger(this.options.maxSettledDispatchHistory) || this.options.maxSettledDispatchHistory < 1) {
+      throw new Error("maxSettledDispatchHistory must be a positive integer");
+    }
+    if (!Number.isInteger(this.options.settledDispatchHistoryTtlMs) || this.options.settledDispatchHistoryTtlMs < 1) {
+      throw new Error("settledDispatchHistoryTtlMs must be a positive integer");
     }
   }
 
@@ -410,33 +440,14 @@ export class DesktopBrowserRelayService {
     ) {
       throw new Error("desktop browser invocation capability set does not match the registered host");
     }
-    const previousOperationRequestHash = this.operationRequestHashById.get(authority.operationId);
-    if (previousOperationRequestHash !== undefined) {
-      if (previousOperationRequestHash !== canonicalRequestHash) {
-        throw new Error(
-          `operationId ${JSON.stringify(authority.operationId)} already dispatched with different requestHash ${JSON.stringify(canonicalRequestHash)}`,
-        );
-      }
-    }
-    const previousDispatch = this.dispatchHistoryById.get(decoded.payload.dispatchId);
-    if (previousDispatch) {
-      throw new Error(
-        `dispatchId ${JSON.stringify(decoded.payload.dispatchId)} already used for operationId ${JSON.stringify(previousDispatch.operationId)}`,
-      );
-    }
+    this.pruneDispatchTracking(this.options.clock.now());
+    this.assertOperationRequestHash(authority.operationId, canonicalRequestHash);
+    this.assertDispatchIdAvailable(decoded.payload.dispatchId);
     if (connection.pendingDispatch) {
       throw new Error("desktop browser host already has an in-flight invocation");
     }
     return new Promise<RelayDispatchResult>((resolve, reject) => {
-      const hadOperationRequestHash = this.operationRequestHashById.has(authority.operationId);
-      if (!hadOperationRequestHash) {
-        this.operationRequestHashById.set(authority.operationId, canonicalRequestHash);
-      }
-      this.dispatchHistoryById.set(decoded.payload.dispatchId, {
-        operationId: authority.operationId,
-        requestHash: canonicalRequestHash,
-        state: "in_flight",
-      });
+      this.startDispatchTracking(decoded.payload.dispatchId, authority.operationId, canonicalRequestHash);
       const timeout = this.options.clock.setTimeout(() => {
         if (connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId) return;
         void this.closeConnection(
@@ -460,10 +471,7 @@ export class DesktopBrowserRelayService {
       } catch (error) {
         this.options.clock.clearTimeout(timeout);
         connection.pendingDispatch = null;
-        if (!hadOperationRequestHash) {
-          this.operationRequestHashById.delete(authority.operationId);
-        }
-        this.dispatchHistoryById.delete(decoded.payload.dispatchId);
+        this.dropDispatchTracking(decoded.payload.dispatchId);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -569,11 +577,122 @@ export class DesktopBrowserRelayService {
     };
   }
 
+  private assertOperationRequestHash(operationId: string, requestHash: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (!existing) return;
+    if (existing.requestHash !== requestHash) {
+      throw new Error(
+        `operationId ${JSON.stringify(operationId)} already dispatched with different requestHash ${JSON.stringify(requestHash)}`,
+      );
+    }
+  }
+
+  private assertDispatchIdAvailable(dispatchId: string): void {
+    const current = this.dispatchHistoryById.get(dispatchId) ?? this.dispatchTombstonesById.get(dispatchId);
+    if (!current) return;
+    throw new Error(
+      `dispatchId ${JSON.stringify(dispatchId)} already used for operationId ${JSON.stringify(current.operationId)}`,
+    );
+  }
+
+  private startDispatchTracking(dispatchId: string, operationId: string, requestHash: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (existing) {
+      existing.refCount += 1;
+    } else {
+      this.operationRequestHashById.set(operationId, { requestHash, refCount: 1 });
+    }
+    this.dispatchHistoryById.set(dispatchId, {
+      operationId,
+      requestHash,
+      state: "in_flight",
+      settledAt: null,
+    });
+  }
+
+  private settleDispatch(dispatchId: string, state: "accepted" | "terminal" | "unknown"): void {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (!history) return;
+    history.state = state;
+    if (history.settledAt !== null) return;
+    history.settledAt = this.options.clock.now();
+    this.settledDispatchOrder.push(dispatchId);
+    this.pruneDispatchTracking(history.settledAt);
+  }
+
+  private dropDispatchTracking(dispatchId: string): void {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (!history) return;
+    this.dispatchHistoryById.delete(dispatchId);
+    this.releaseOperationRequestHash(history.operationId);
+  }
+
+  private releaseOperationRequestHash(operationId: string): void {
+    const existing = this.operationRequestHashById.get(operationId);
+    if (!existing) return;
+    if (existing.refCount <= 1) {
+      this.operationRequestHashById.delete(operationId);
+      return;
+    }
+    existing.refCount -= 1;
+  }
+
+  private settledDispatch(dispatchId: string): RelayDispatchHistoryEntry | RelayDispatchTombstone | null {
+    const history = this.dispatchHistoryById.get(dispatchId);
+    if (history && history.settledAt !== null) return history;
+    return this.dispatchTombstonesById.get(dispatchId) ?? null;
+  }
+
+  private pruneDispatchTracking(now: number): void {
+    this.pruneSettledDispatchHistory(now);
+    this.pruneDispatchTombstones(now);
+  }
+
+  private pruneSettledDispatchHistory(now: number): void {
+    while (this.settledDispatchOrder.length > 0) {
+      const dispatchId = this.settledDispatchOrder[0]!;
+      const history = this.dispatchHistoryById.get(dispatchId);
+      if (!history || history.settledAt === null) {
+        this.settledDispatchOrder.shift();
+        continue;
+      }
+      const expired = history.settledAt + this.options.settledDispatchHistoryTtlMs <= now;
+      const overLimit = this.settledDispatchOrder.length > this.options.maxSettledDispatchHistory;
+      if (!expired && !overLimit) return;
+      this.settledDispatchOrder.shift();
+      this.dispatchHistoryById.delete(dispatchId);
+      this.dispatchTombstonesById.set(dispatchId, {
+        operationId: history.operationId,
+        requestHash: history.requestHash,
+        state: history.state === "terminal" || history.state === "accepted" ? history.state : "unknown",
+        expiresAt: now + this.options.settledDispatchHistoryTtlMs,
+      });
+      this.dispatchTombstoneOrder.push(dispatchId);
+    }
+  }
+
+  private pruneDispatchTombstones(now: number): void {
+    while (this.dispatchTombstoneOrder.length > 0) {
+      const dispatchId = this.dispatchTombstoneOrder[0]!;
+      const tombstone = this.dispatchTombstonesById.get(dispatchId);
+      if (!tombstone) {
+        this.dispatchTombstoneOrder.shift();
+        continue;
+      }
+      const expired = tombstone.expiresAt <= now;
+      const overLimit = this.dispatchTombstonesById.size > this.options.maxSettledDispatchHistory;
+      if (!expired && !overLimit) return;
+      this.dispatchTombstoneOrder.shift();
+      this.dispatchTombstonesById.delete(dispatchId);
+      this.releaseOperationRequestHash(tombstone.operationId);
+    }
+  }
+
   private isKnownStaleSequentialResult(
     pending: NonNullable<RelayConnectionState["pendingDispatch"]>,
     message: HostResultMessage,
   ): boolean {
-    const history = this.dispatchHistoryById.get(message.payload.dispatchId);
+    const history = this.settledDispatch(message.payload.dispatchId);
     if (!history) return false;
     if (history.state !== "accepted" && history.state !== "terminal") return false;
     return (
@@ -589,6 +708,7 @@ export class DesktopBrowserRelayService {
       throw new Error("desktop browser relay message exceeded the maximum allowed size");
     }
     connection.lastSeenAt = this.options.clock.now();
+    this.pruneDispatchTracking(connection.lastSeenAt);
     if (connection.stage === "awaiting_hello") {
       const message = decodeDesktopBrowserMessage(raw, this.options.supportedProtocolVersions[0]);
       if (message.kind !== "host.hello")
@@ -651,8 +771,7 @@ export class DesktopBrowserRelayService {
       }
       connection.pendingDispatch = null;
       this.options.clock.clearTimeout(pending.timeout);
-      const history = this.dispatchHistoryById.get(pending.dispatchId);
-      if (history) history.state = "terminal";
+      this.settleDispatch(pending.dispatchId, "terminal");
       pending.resolve({
         kind: "host.result",
         accepted: pending.accepted,
@@ -852,6 +971,7 @@ export class DesktopBrowserRelayService {
       const pending = connection.pendingDispatch;
       connection.pendingDispatch = null;
       this.options.clock.clearTimeout(pending.timeout);
+      this.settleDispatch(pending.dispatchId, pending.accepted ? "accepted" : "unknown");
       const error = this.relayDeliveryUnknown(
         connection.closeReason ??
           (pending.accepted

@@ -29,6 +29,8 @@ export interface DesktopBrowserRelayRuntimeConfig {
   sourceAuthSecret: string;
   supportedProtocolVersions: string[];
   supportedPolicyGrammarVersions: string[];
+  maxSettledDispatchHistory: number;
+  settledDispatchHistoryTtlMs: number;
   shutdownDrainMs: number;
 }
 
@@ -80,6 +82,16 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
     supportedPolicyGrammarVersions: parseList(env.QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS, [
       ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
     ]),
+    maxSettledDispatchHistory: parseInteger(
+      "QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY",
+      env.QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY,
+      1_024,
+    ),
+    settledDispatchHistoryTtlMs: parseInteger(
+      "QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS",
+      env.QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS,
+      300_000,
+    ),
     shutdownDrainMs: parseInteger("QM_RELAY_SHUTDOWN_DRAIN_MS", env.QM_RELAY_SHUTDOWN_DRAIN_MS, 10_000),
   };
 }
@@ -176,6 +188,8 @@ export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRunt
     deploymentCanonicalId: config.deploymentCanonicalId,
     supportedProtocolVersions: config.supportedProtocolVersions,
     supportedPolicyGrammarVersions: config.supportedPolicyGrammarVersions,
+    maxSettledDispatchHistory: config.maxSettledDispatchHistory,
+    settledDispatchHistoryTtlMs: config.settledDispatchHistoryTtlMs,
     registry,
   });
   const server = createDesktopBrowserRelayServer({

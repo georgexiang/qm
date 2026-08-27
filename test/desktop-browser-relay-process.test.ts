@@ -415,6 +415,25 @@ test("relay process config defaults to the shared Phase F protocol and policy gr
   assert.deepEqual(config.supportedPolicyGrammarVersions, [
     ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   ]);
+  assert.equal(config.maxSettledDispatchHistory, 1_024);
+  assert.equal(config.settledDispatchHistoryTtlMs, 300_000);
+});
+
+test("relay process config accepts explicit settled dispatch history bounds", () => {
+  const sourceAuthSecret = "relay-source-auth-secret-for-tests-0001";
+  const config = loadDesktopBrowserRelayConfig({
+    QM_RELAY_HOST: "127.0.0.1",
+    QM_RELAY_PORT: "0",
+    QM_RELAY_INSTANCE_ID: "relay-a",
+    QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
+    QM_RELAY_CORE_API_URL: "http://127.0.0.1:8080",
+    QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
+    QM_RELAY_MAX_SETTLED_DISPATCH_HISTORY: "64",
+    QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS: "90000",
+  });
+
+  assert.equal(config.maxSettledDispatchHistory, 64);
+  assert.equal(config.settledDispatchHistoryTtlMs, 90_000);
 });
 
 test("relay process runtime preserves an explicit websocket path override", async () => {

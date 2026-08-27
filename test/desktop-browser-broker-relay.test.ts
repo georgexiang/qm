@@ -277,6 +277,16 @@ function completedResultFor(
   };
 }
 
+function invocationWithDispatchId(dispatchId: string): RelayInvocationMessage {
+  return {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      ...desktopBrowserRelayInvocationFixture.payload,
+      dispatchId,
+    },
+  };
+}
+
 function hostChallengeResponse(
   challenge: RelayChallengeMessage,
   input: {
@@ -313,7 +323,12 @@ function hostChallengeResponse(
 }
 
 async function createRegisteredTicket05Relay(
-  options: { invocationTimeoutMs?: number; protocolVersion?: `${number}.${number}` } = {},
+  options: {
+    invocationTimeoutMs?: number;
+    protocolVersion?: `${number}.${number}`;
+    maxSettledDispatchHistory?: number;
+    settledDispatchHistoryTtlMs?: number;
+  } = {},
 ) {
   const protocolVersion = options.protocolVersion ?? "1.2";
   const clock = new ManualClock();
@@ -339,6 +354,8 @@ async function createRegisteredTicket05Relay(
       return () => `connection-${++current}`;
     })(),
     invocationTimeoutMs: options.invocationTimeoutMs,
+    maxSettledDispatchHistory: options.maxSettledDispatchHistory,
+    settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs,
   });
   const socket = new FakeSocket();
   service.acceptSocket(socket);
@@ -990,6 +1007,84 @@ test("relay ignores a delayed terminal from settled dispatch A and still resolve
   const secondCompleted = completedResultFor(secondInvocation);
   currentSocket.message(JSON.stringify(secondCompleted));
   assertCompletedResult(await second, secondAccepted, secondCompleted);
+});
+
+test("relay keeps recent settled dispatch tombstones bounded and still ignores delayed stale terminals after thousands of completed dispatches", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({
+    maxSettledDispatchHistory: 8,
+    settledDispatchHistoryTtlMs: 60_000,
+  });
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  for (let current = 1; current <= 2_000; current += 1) {
+    const invocation = invocationWithDispatchId(`0198f3d2-1950-7000-8000-${String(current).padStart(12, "0")}`);
+    const result = dispatch(invocation);
+    await flushMessages();
+    socket.message(JSON.stringify(acceptedMessageFor(invocation)));
+    socket.message(JSON.stringify(completedResultFor(invocation)));
+    assertCompletedResult(await result, acceptedMessageFor(invocation), completedResultFor(invocation));
+  }
+
+  const activeInvocation = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000009999");
+  const activeResult = dispatch(activeInvocation);
+  await flushMessages();
+  const activeAccepted = acceptedMessageFor(activeInvocation);
+  socket.message(JSON.stringify(activeAccepted));
+  await flushMessages();
+
+  const delayedRecent = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000001992");
+  socket.message(JSON.stringify(completedResultFor(delayedRecent)));
+  await flushMessages();
+  assert.equal(socket.closeCode, undefined);
+
+  const activeCompleted = completedResultFor(activeInvocation);
+  socket.message(JSON.stringify(activeCompleted));
+  assertCompletedResult(await activeResult, activeAccepted, activeCompleted);
+  assert.equal(socket.closeCode, undefined);
+});
+
+test("relay fences an ancient evicted terminal instead of resolving the current accepted dispatch", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({
+    maxSettledDispatchHistory: 8,
+    settledDispatchHistoryTtlMs: 60_000,
+  });
+  const dispatch = (invocation: RelayInvocationMessage) =>
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation,
+    });
+
+  for (let current = 1; current <= 2_000; current += 1) {
+    const invocation = invocationWithDispatchId(`0198f3d2-1950-7000-8000-${String(current).padStart(12, "0")}`);
+    const result = dispatch(invocation);
+    await flushMessages();
+    socket.message(JSON.stringify(acceptedMessageFor(invocation)));
+    socket.message(JSON.stringify(completedResultFor(invocation)));
+    assertCompletedResult(await result, acceptedMessageFor(invocation), completedResultFor(invocation));
+  }
+
+  const activeInvocation = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000009999");
+  const activeResult = dispatch(activeInvocation);
+  await flushMessages();
+  const activeAccepted = acceptedMessageFor(activeInvocation);
+  socket.message(JSON.stringify(activeAccepted));
+  await flushMessages();
+
+  const ancientDelayed = invocationWithDispatchId("0198f3d2-1950-7000-8000-000000000001");
+  socket.message(JSON.stringify(completedResultFor(ancientDelayed)));
+  await flushMessages();
+
+  assertAcceptedUnknown(await activeResult, activeAccepted, /dispatch does not match the accepted invocation/i);
+  assert.equal(socket.closeCode, 1008);
+  assert.match(socket.closeReason ?? "", /dispatch does not match the accepted invocation/i);
 });
 
 test("relay negotiates the highest exact shared protocol version during hello", async () => {
