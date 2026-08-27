@@ -7,14 +7,34 @@ import {
   computeDesktopBrowserRequestHash,
   decodeDesktopBrowserMessage,
   parseDesktopBrowserSessionStartAuthorityEnvelope,
+  type DesktopBrowserRelayConnectionProjection,
   type DesktopBrowserSessionStartAuthorityEnvelope,
   type HostAcceptedMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import type { DurableMap } from "../persistence/durable-map.ts";
-import type { DesktopBrowserSessionStartAuthoritySnapshot } from "./device-registry.ts";
 
 type DesktopBrowserTaskStatus = "waiting_for_broker" | "canceled";
+
+export interface DesktopBrowserSessionStartRegistrationSnapshot {
+  deploymentCanonicalId: string;
+  registrationId: string;
+  waitingTaskId: string;
+  actorId: string;
+  projectId: string;
+  membershipEpoch: number;
+  authorityId: string;
+  authorityExpiresAt: number;
+  publicDeviceFingerprint: string;
+  browserInstanceId: string;
+  status: "online" | "offline";
+  browserRuntimeStatus: "ready" | "offline";
+}
+
+export interface DesktopBrowserSessionStartAuthoritySnapshot {
+  registration: DesktopBrowserSessionStartRegistrationSnapshot;
+  relayConnection: DesktopBrowserRelayConnectionProjection;
+}
 
 export interface DesktopBrowserPreparedSessionStartOperation {
   authority: DesktopBrowserSessionStartAuthorityEnvelope;
@@ -23,17 +43,26 @@ export interface DesktopBrowserPreparedSessionStartOperation {
 
 export interface DesktopBrowserTaskExecution {
   attemptId: string;
-  attemptStatus: "prepared" | "accepted" | "pre_fence_failed" | "accepted_failed" | "accepted_unknown" | "completed";
+  attemptStatus:
+    | "prepared"
+    | "pre_fence_failed"
+    | "accepted_failed"
+    | "accepted_unknown"
+    | "accepted_completed_unbound"
+    | "completed";
   leaseId: string;
   leaseVersion: number;
   operation: DesktopBrowserPreparedSessionStartOperation;
   createdAt: number;
-  acceptedAt?: number;
+  hostAccepted?: HostAcceptedMessage;
   resultHash?: string;
   completedAt?: number;
   resultRecordedAt?: number;
   hostResult?: HostResultMessage;
 }
+
+type DesktopBrowserCurrentSessionStartAuthority =
+  { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string };
 
 export interface DesktopBrowserTask {
   id: string;
@@ -87,6 +116,7 @@ export interface DesktopBrowserTaskStore {
   consumeSessionStartResult(
     id: string,
     result: HostResultMessage,
+    currentAuthority?: DesktopBrowserCurrentSessionStartAuthority,
   ): Promise<{ status: "ok"; task: DesktopBrowserTask } | { status: "refused"; reason: string }>;
 }
 
@@ -94,13 +124,37 @@ function snapshotHash(snapshot: object): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")}`;
 }
 
-function currentAuthorityReason(
+function relayBindingRefusal(): string {
+  return "Desktop Browser Relay connection is no longer bound to the registered device";
+}
+
+function capabilitySetRefusal(): string {
+  return "Desktop Browser Relay connection capability set no longer matches the prepared task";
+}
+
+function protocolVersionRefusal(kind: "acceptance" | "result"): string {
+  return `Desktop Browser Host ${kind} protocol does not match the prepared task`;
+}
+
+function dispatchRefusal(kind: "acceptance" | "result"): string {
+  return `Desktop Browser Host ${kind} dispatch does not match the prepared task`;
+}
+
+function sameAccepted(left: HostAcceptedMessage, right: HostAcceptedMessage): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameResult(left: HostResultMessage, right: HostResultMessage): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function currentAuthorityRefusal(
   task: DesktopBrowserTask,
-  source: DesktopBrowserSessionStartAuthoritySnapshot | null,
-): string {
-  if (!source) return "Desktop Browser Task authorization is no longer current";
-  const registration = source.registration;
-  const relayConnection = source.relayConnection;
+  execution: DesktopBrowserTaskExecution,
+  currentAuthority: DesktopBrowserCurrentSessionStartAuthority,
+): string | null {
+  if (currentAuthority.status === "refused") return currentAuthority.reason;
+  const { registration, relayConnection } = currentAuthority.authority;
   if (
     registration.waitingTaskId !== task.id ||
     registration.actorId !== task.actorSnapshot.id ||
@@ -115,30 +169,22 @@ function currentAuthorityReason(
     return "Desktop Browser device is not online";
   }
   if (
+    registration.publicDeviceFingerprint !== execution.operation.authority.deviceId ||
+    registration.browserInstanceId !== execution.operation.authority.browserInstanceId ||
     relayConnection.registrationState !== "registered" ||
     relayConnection.publicDeviceFingerprint !== registration.publicDeviceFingerprint ||
     relayConnection.browserInstanceId !== registration.browserInstanceId
   ) {
-    return "Desktop Browser Relay connection is no longer bound to the registered device";
+    return relayBindingRefusal();
   }
-  return "ok";
-}
-
-function capabilityDriftReason(
-  operation: DesktopBrowserPreparedSessionStartOperation,
-  source: DesktopBrowserSessionStartAuthoritySnapshot | null,
-): string | null {
-  if (!source) return null;
-  const relayConnection = source.relayConnection;
-  const capabilitySet = operation.authority.capabilitySet;
   if (
-    relayConnection.protocolVersion !== capabilitySet.protocolVersion ||
-    relayConnection.policyGrammarVersion !== capabilitySet.policyGrammarVersion ||
-    relayConnection.bskVersion !== capabilitySet.bskVersion ||
-    relayConnection.extensionVersion !== capabilitySet.extensionVersion ||
-    relayConnection.cliShapeHash !== capabilitySet.cliShapeHash
+    relayConnection.protocolVersion !== execution.operation.authority.capabilitySet.protocolVersion ||
+    relayConnection.policyGrammarVersion !== execution.operation.authority.capabilitySet.policyGrammarVersion ||
+    relayConnection.bskVersion !== execution.operation.authority.capabilitySet.bskVersion ||
+    relayConnection.extensionVersion !== execution.operation.authority.capabilitySet.extensionVersion ||
+    relayConnection.cliShapeHash !== execution.operation.authority.capabilitySet.cliShapeHash
   ) {
-    return "Desktop Browser Relay connection capability set no longer matches the prepared task";
+    return capabilitySetRefusal();
   }
   return null;
 }
@@ -178,9 +224,8 @@ export function createDesktopBrowserTaskStore(
         updatedAt: at,
       };
       if (backing.insertIfAbsent) {
-        if (!(await backing.insertIfAbsent(taskId, task))) {
+        if (!(await backing.insertIfAbsent(taskId, task)))
           throw new Error(`desktop browser task ${taskId} already exists`);
-        }
       } else {
         const stored = await backing.putIfAbsent(taskId, task);
         if (stored.id !== taskId) throw new Error(`desktop browser task ${taskId} already exists`);
@@ -219,8 +264,7 @@ export function createDesktopBrowserTaskStore(
         return { status: "refused", reason: "Desktop Browser session-start authority is unavailable" };
       }
       const source = await options.sessionStartAuthority(taskId);
-      const sourceReason = currentAuthorityReason(current, source);
-      if (sourceReason !== "ok") return { status: "refused", reason: sourceReason };
+      if (!source) return { status: "refused", reason: "Desktop Browser device is not online" };
       if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
       let prepared: DesktopBrowserPreparedSessionStartOperation | null = null;
       let refusal: string | null = null;
@@ -230,16 +274,39 @@ export function createDesktopBrowserTaskStore(
           return task;
         }
         const at = now();
+        const registration = source.registration;
+        const relayConnection = source.relayConnection;
         if (task.status !== "waiting_for_broker") {
           refusal = "Desktop Browser Task is no longer waiting";
           return task;
         }
-        if (task.authorityExpiresAt <= at) {
+        if (task.authorityExpiresAt <= at || registration.authorityExpiresAt <= at) {
           refusal = "Desktop Browser Turn authority expired; start a new Turn";
           return task;
         }
-        const registration = source!.registration;
-        const relayConnection = source!.relayConnection;
+        if (
+          registration.waitingTaskId !== task.id ||
+          registration.actorId !== task.actorSnapshot.id ||
+          registration.projectId !== task.projectSnapshot.id ||
+          registration.membershipEpoch !== Number(task.projectMembershipVersion) ||
+          registration.authorityId !== task.authorityId ||
+          registration.authorityExpiresAt !== task.authorityExpiresAt
+        ) {
+          refusal = "Desktop Browser Task authorization is no longer current";
+          return task;
+        }
+        if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
+          refusal = "Desktop Browser device is not online";
+          return task;
+        }
+        if (
+          relayConnection.registrationState !== "registered" ||
+          relayConnection.publicDeviceFingerprint !== registration.publicDeviceFingerprint ||
+          relayConnection.browserInstanceId !== registration.browserInstanceId
+        ) {
+          refusal = "Desktop Browser Relay connection is no longer bound to the registered device";
+          return task;
+        }
         const attemptId = id();
         const leaseId = id();
         const operationId = id();
@@ -312,7 +379,7 @@ export function createDesktopBrowserTaskStore(
         return { status: "refused", reason: "Desktop Browser Host acceptance is invalid" };
       }
       if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
-      let bound: DesktopBrowserTask | null = null;
+      let recorded: DesktopBrowserTask | null = null;
       let refusal: string | null = null;
       await backing.update(taskId, (task) => {
         const execution = task.execution;
@@ -320,43 +387,46 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Task has no prepared session start";
           return task;
         }
-        if (task.status !== "waiting_for_broker") {
-          refusal = "Desktop Browser Task is no longer waiting";
-          return task;
-        }
-        if (task.authorityExpiresAt <= now()) {
-          refusal = "Desktop Browser Turn authority expired; start a new Turn";
+        if (accepted.protocolVersion !== execution.operation.authority.capabilitySet.protocolVersion) {
+          refusal = protocolVersionRefusal("acceptance");
           return task;
         }
         if (accepted.payload.operationId !== execution.operation.authority.operationId) {
-          refusal = "Desktop Browser Host acceptance does not match the prepared task";
+          refusal = "Desktop Browser Host acceptance operation does not match the prepared task";
           return task;
         }
         if (accepted.payload.requestHash !== execution.operation.requestHash) {
-          refusal = "Desktop Browser Host acceptance does not match the prepared task";
+          refusal = capabilitySetRefusal();
           return task;
         }
-        if (execution.acceptedAt !== undefined || execution.hostResult) {
-          bound = task;
+        if (execution.hostResult) {
+          refusal = "Desktop Browser Task already recorded a Host result";
+          return task;
+        }
+        if (execution.hostAccepted) {
+          if (sameAccepted(execution.hostAccepted, accepted)) {
+            recorded = task;
+            return task;
+          }
+          refusal = "Desktop Browser Task already recorded Host acceptance";
           return task;
         }
         const at = now();
-        bound = {
+        recorded = {
           ...task,
           execution: {
             ...execution,
-            attemptStatus: "accepted",
-            acceptedAt: at,
+            hostAccepted: structuredClone(accepted),
           },
           updatedAt: at,
         };
-        return bound;
+        return recorded;
       });
       if (refusal) return { status: "refused", reason: refusal };
-      if (!bound) return { status: "refused", reason: "Desktop Browser Task not found" };
-      return { status: "ok", task: copy(bound) };
+      if (!recorded) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return { status: "ok", task: copy(recorded) };
     },
-    async consumeSessionStartResult(taskId, input) {
+    async consumeSessionStartResult(taskId, input, currentAuthority) {
       let result: HostResultMessage;
       try {
         const decoded = decodeDesktopBrowserMessage(JSON.stringify(input), input.protocolVersion);
@@ -367,8 +437,22 @@ export function createDesktopBrowserTaskStore(
       } catch {
         return { status: "refused", reason: "Desktop Browser Host result is invalid" };
       }
+      const current = await backing.get(taskId);
+      if (!current) return { status: "refused", reason: "Desktop Browser Task not found" };
+      const needsCurrentAuthority =
+        !!current.execution?.hostAccepted && !current.execution?.hostResult && result.payload.outcome === "completed";
+      let authorityState = currentAuthority;
+      if (needsCurrentAuthority && !authorityState) {
+        if (!options.sessionStartAuthority) {
+          authorityState = { status: "refused", reason: "Desktop Browser session-start authority is unavailable" };
+        } else {
+          const latestAuthority = await options.sessionStartAuthority(taskId);
+          authorityState = latestAuthority
+            ? { status: "ok", authority: latestAuthority }
+            : { status: "refused", reason: "Desktop Browser device is not online" };
+        }
+      }
       if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
-      const currentAuthority = options.sessionStartAuthority ? await options.sessionStartAuthority(taskId) : null;
       let bound: DesktopBrowserTask | null = null;
       let refusal: string | null = null;
       await backing.update(taskId, (task) => {
@@ -381,70 +465,48 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Host result operation does not match the prepared task";
           return task;
         }
+        if (result.protocolVersion !== execution.operation.authority.capabilitySet.protocolVersion) {
+          refusal = protocolVersionRefusal("result");
+          return task;
+        }
         if (execution.hostResult) {
-          if (JSON.stringify(execution.hostResult) === JSON.stringify(result)) {
+          if (sameResult(execution.hostResult, result)) {
             bound = task;
             return task;
           }
           refusal = "Desktop Browser Task already recorded a Host result";
           return task;
         }
-        if (result.payload.outcome === "completed") {
-          if (execution.acceptedAt === undefined) {
-            refusal = "Desktop Browser Host result arrived before acceptance";
-            return task;
+        if (!execution.hostAccepted) {
+          refusal = "Desktop Browser Host result requires prior Host acceptance";
+          return task;
+        }
+        if (execution.hostAccepted.payload.operationId !== result.payload.operationId) {
+          refusal = "Desktop Browser Host result operation does not match the prepared task";
+          return task;
+        }
+        if (execution.hostAccepted.payload.dispatchId !== result.payload.dispatchId) {
+          refusal = dispatchRefusal("result");
+          return task;
+        }
+        if (execution.hostAccepted.payload.requestHash !== execution.operation.requestHash) {
+          refusal = capabilitySetRefusal();
+          return task;
+        }
+        const at = now();
+        if (result.payload.outcome !== "completed") {
+          let attemptStatus: DesktopBrowserTaskExecution["attemptStatus"];
+          if (result.payload.outcome === "failed") {
+            attemptStatus = "accepted_failed";
+          } else {
+            attemptStatus = "accepted_unknown";
           }
-          if (task.status !== "waiting_for_broker") {
-            refusal = "Desktop Browser Task is no longer waiting";
-            return task;
-          }
-          if (task.authorityExpiresAt <= now()) {
-            refusal = "Desktop Browser Turn authority expired; start a new Turn";
-            return task;
-          }
-          const authorityReason = currentAuthorityReason(task, currentAuthority);
-          if (authorityReason !== "ok") {
-            refusal = authorityReason;
-            return task;
-          }
-          const capabilityReason = capabilityDriftReason(execution.operation, currentAuthority);
-          if (capabilityReason) {
-            refusal = capabilityReason;
-            return task;
-          }
-          if (result.payload.result.browser_instance_id !== execution.operation.authority.browserInstanceId) {
-            refusal = "Desktop Browser Host result browser does not match the prepared task";
-            return task;
-          }
-          if (
-            task.browserSkillSessionId !== undefined ||
-            task.browserInstanceId !== undefined ||
-            task.agentWindowId !== undefined
-          ) {
-            if (
-              task.browserSkillSessionId === result.payload.result.session_id &&
-              task.browserInstanceId === result.payload.result.browser_instance_id &&
-              task.agentWindowId === result.payload.result.agent_window_id &&
-              execution.attemptStatus === "completed" &&
-              execution.resultHash === result.payload.resultHash
-            ) {
-              bound = task;
-              return task;
-            }
-            refusal = "Desktop Browser Task browser ownership is already bound";
-            return task;
-          }
-          const at = now();
           bound = {
             ...task,
-            browserSkillSessionId: result.payload.result.session_id,
-            browserInstanceId: result.payload.result.browser_instance_id,
-            agentWindowId: result.payload.result.agent_window_id,
             execution: {
               ...execution,
-              attemptStatus: "completed",
+              attemptStatus,
               resultHash: result.payload.resultHash,
-              completedAt: at,
               resultRecordedAt: at,
               hostResult: structuredClone(result),
             },
@@ -452,23 +514,60 @@ export function createDesktopBrowserTaskStore(
           };
           return bound;
         }
-        if (result.payload.outcome === "unknown" && execution.acceptedAt === undefined) {
-          refusal = "Desktop Browser Host result arrived before acceptance";
+        if (result.payload.result.browser_instance_id !== execution.operation.authority.browserInstanceId) {
+          refusal = "Desktop Browser Host result browser does not match the prepared task";
           return task;
         }
-        const at = now();
-        let attemptStatus: DesktopBrowserTaskExecution["attemptStatus"];
-        if (result.payload.outcome === "failed") {
-          attemptStatus = execution.acceptedAt === undefined ? "pre_fence_failed" : "accepted_failed";
-        } else {
-          attemptStatus = "accepted_unknown";
+        let currentRefusal: string | null = null;
+        if (task.status !== "waiting_for_broker") {
+          currentRefusal = "Desktop Browser Task is no longer waiting";
+        } else if (task.authorityExpiresAt <= at) {
+          currentRefusal = "Desktop Browser Turn authority expired; start a new Turn";
+        } else if (authorityState) {
+          currentRefusal = currentAuthorityRefusal(task, execution, authorityState);
+        }
+        if (currentRefusal) {
+          bound = {
+            ...task,
+            execution: {
+              ...execution,
+              attemptStatus: "accepted_completed_unbound",
+              resultHash: result.payload.resultHash,
+              resultRecordedAt: at,
+              hostResult: structuredClone(result),
+            },
+            updatedAt: at,
+          };
+          return bound;
+        }
+        if (
+          task.browserSkillSessionId !== undefined ||
+          task.browserInstanceId !== undefined ||
+          task.agentWindowId !== undefined
+        ) {
+          if (
+            task.browserSkillSessionId === result.payload.result.session_id &&
+            task.browserInstanceId === result.payload.result.browser_instance_id &&
+            task.agentWindowId === result.payload.result.agent_window_id &&
+            execution.attemptStatus === "completed" &&
+            execution.resultHash === result.payload.resultHash
+          ) {
+            bound = task;
+            return task;
+          }
+          refusal = "Desktop Browser Task browser ownership is already bound";
+          return task;
         }
         bound = {
           ...task,
+          browserSkillSessionId: result.payload.result.session_id,
+          browserInstanceId: result.payload.result.browser_instance_id,
+          agentWindowId: result.payload.result.agent_window_id,
           execution: {
             ...execution,
-            attemptStatus,
+            attemptStatus: "completed",
             resultHash: result.payload.resultHash,
+            completedAt: at,
             resultRecordedAt: at,
             hostResult: structuredClone(result),
           },

@@ -20,10 +20,10 @@ import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
 import type {
-  HostAcceptedMessage,
-  HostResultMessage,
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRelayConnectionProjection,
+  HostAcceptedMessage,
+  HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import {
   projectDesktopBrowserActivityReply,
@@ -115,13 +115,13 @@ export function createTurnMethods(
         await onDrift?.();
         return { status: "refused", reason: "Desktop Browser Task not found" } as const;
       }
-      await deps.identity.refresh();
-      const actor = deps.identity.classify(currentTask.actorId);
-      const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
       if (currentTask.status !== "waiting_for_broker") {
         await onDrift?.();
         return { status: "refused", reason: "Desktop Browser Task is no longer waiting" } as const;
       }
+      await deps.identity.refresh();
+      const actor = deps.identity.classify(currentTask.actorId);
+      const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
       if (
         project.orgId !== orgIdOf() ||
         String(project.updatedAt) !== currentTask.projectMembershipVersion ||
@@ -796,23 +796,45 @@ export function createTurnMethods(
     async desktopBrowserConsumeSessionStartAccepted(taskId, accepted) {
       const task = await deps.desktopBrowserTasks.get(taskId);
       if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
-      if (task.execution?.hostResult) {
-        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
-      }
-      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
-        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
-      });
+      return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
     },
 
     async desktopBrowserConsumeSessionStartResult(taskId, result) {
       const task = await deps.desktopBrowserTasks.get(taskId);
       if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
       if (task.execution?.hostResult) {
-        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
+        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result);
       }
-      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
-        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
-      });
+      if (
+        task.execution?.hostAccepted &&
+        !task.execution.hostResult &&
+        result &&
+        typeof result === "object" &&
+        "kind" in result &&
+        result.kind === "host.result" &&
+        "payload" in result &&
+        result.payload &&
+        typeof result.payload === "object" &&
+        "outcome" in result.payload &&
+        result.payload.outcome === "completed"
+      ) {
+        const validated = await withCurrentWaitingTask(
+          taskId,
+          task.authorityId,
+          async (currentTask) =>
+            deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+              taskId,
+              currentTask.execution!.operation,
+              async (currentAuthority) =>
+                deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, currentAuthority),
+            ),
+        );
+        if (validated && typeof validated === "object" && "status" in validated && validated.status === "refused") {
+          return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage, validated);
+        }
+        return validated;
+      }
+      return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
     },
 
     subscribeSessionStates(cb) {

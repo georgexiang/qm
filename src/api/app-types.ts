@@ -32,13 +32,13 @@ import type {
   DesktopBrowserSharedProfileProjection,
 } from "../desktop-browser/device-registry.ts";
 import type {
-  HostAcceptedMessage,
-  HostResultMessage,
   DesktopBrowserRelayConnectionProjection,
   DesktopBrowserRelayRegistryBinding,
   DesktopBrowserPublicIdentity,
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRegistrationReservationTuple,
+  HostAcceptedMessage,
+  HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import type { ModelGateway } from "../model/model-gateway.ts";
 import type { ModelCredentialStore } from "../model/model-credential-store.ts";

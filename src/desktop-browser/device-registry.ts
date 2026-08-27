@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, verify } from "node:crypto";
 import {
   DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
+  computeDesktopBrowserRequestHash,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   encodeDesktopBrowserRegistrationConfirmationVerificationBytes,
@@ -15,30 +16,14 @@ import {
 } from "qm-desktop-browser-contracts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
+import type {
+  DesktopBrowserPreparedSessionStartOperation,
+  DesktopBrowserSessionStartAuthoritySnapshot,
+} from "./browser-task-store.ts";
 
 export interface DesktopBrowserSharedProfileProjection {
   sharedProfileMode: "deployment_shared_browser_principal";
   device: DesktopBrowserOnlineDeviceProjection;
-}
-
-export interface DesktopBrowserSessionStartRegistrationSnapshot {
-  deploymentCanonicalId: string;
-  registrationId: string;
-  waitingTaskId: string;
-  actorId: string;
-  projectId: string;
-  membershipEpoch: number;
-  authorityId: string;
-  authorityExpiresAt: number;
-  publicDeviceFingerprint: string;
-  browserInstanceId: string;
-  status: "online" | "offline";
-  browserRuntimeStatus: "ready" | "offline";
-}
-
-export interface DesktopBrowserSessionStartAuthoritySnapshot {
-  registration: DesktopBrowserSessionStartRegistrationSnapshot;
-  relayConnection: DesktopBrowserRelayConnectionProjection;
 }
 
 interface DesktopBrowserChallengeBinding {
@@ -185,6 +170,19 @@ export interface DesktopBrowserDeviceRegistry {
   ): Promise<
     { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string }
   >;
+  withValidatedSessionStartAuthority<T>(
+    waitingTaskId: string,
+    operation: DesktopBrowserPreparedSessionStartOperation,
+    fn: (currentAuthority: { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot }) => Promise<T>,
+  ): Promise<T | { status: "refused"; reason: string }>;
+}
+
+function relayBindingRefusal(): string {
+  return "Desktop Browser Relay connection is no longer bound to the registered device";
+}
+
+function capabilitySetRefusal(): string {
+  return "Desktop Browser Relay connection capability set no longer matches the prepared task";
 }
 
 function iso(at: number): string {
@@ -466,6 +464,102 @@ function currentRelayRegistration(
   return registrations[0] ?? null;
 }
 
+function currentProjectHeadRecord(
+  state: DesktopBrowserDeviceRegistryState,
+  projectId: string,
+): DesktopBrowserRegistrationRecord | null {
+  const head = state.projectHeads[projectId];
+  if (!head) return null;
+  return state.registrations[head.registrationId] ?? null;
+}
+
+function sessionStartAuthorityStateFromState(
+  state: DesktopBrowserDeviceRegistryState,
+  waitingTaskId: string,
+): { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string } {
+  const claim = state.taskClaims[waitingTaskId] ?? null;
+  if (!claim) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+  const registration = state.registrations[claim.registrationId];
+  if (!registration) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+  if (currentProjectHeadRecord(state, registration.projectId)?.registrationId !== registration.registrationId) {
+    return { status: "refused", reason: relayBindingRefusal() };
+  }
+  if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
+    return { status: "refused", reason: "Desktop Browser device is not online" };
+  }
+  const relayConnection = Object.values(state.relayConnections)
+    .filter(
+      (connection) =>
+        connection.registrationState === "registered" &&
+        connection.publicDeviceFingerprint === registration.publicDeviceFingerprint &&
+        connection.brokerInstanceId === registration.registrationTuple.brokerInstanceId &&
+        connection.browserInstanceId === registration.registrationTuple.browserInstanceId &&
+        connection.connectionEpoch === registration.registrationTuple.connectionEpoch,
+    )
+    .sort(
+      (left, right) =>
+        Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt) ||
+        left.connectionId.localeCompare(right.connectionId),
+    )[0];
+  if (!relayConnection) {
+    return { status: "refused", reason: relayBindingRefusal() };
+  }
+  return {
+    status: "ok",
+    authority: {
+      registration: {
+        deploymentCanonicalId: registration.registrationTuple.deploymentCanonicalId,
+        registrationId: registration.registrationId,
+        waitingTaskId: registration.waitingTaskId,
+        actorId: registration.actorId,
+        projectId: registration.projectId,
+        membershipEpoch: registration.membershipEpoch,
+        authorityId: registration.authorityId,
+        authorityExpiresAt: registration.authorityExpiresAt,
+        publicDeviceFingerprint: registration.publicDeviceFingerprint,
+        browserInstanceId: registration.registrationTuple.browserInstanceId,
+        status: "online",
+        browserRuntimeStatus: "ready",
+      },
+      relayConnection: { ...relayConnection },
+    },
+  };
+}
+
+function validatedSessionStartAuthorityStateFromState(
+  state: DesktopBrowserDeviceRegistryState,
+  waitingTaskId: string,
+  operation: DesktopBrowserPreparedSessionStartOperation,
+): { status: "ok"; authority: DesktopBrowserSessionStartAuthoritySnapshot } | { status: "refused"; reason: string } {
+  const currentAuthority = sessionStartAuthorityStateFromState(state, waitingTaskId);
+  if (currentAuthority.status === "refused") return currentAuthority;
+  const { registration, relayConnection } = currentAuthority.authority;
+  if (
+    registration.publicDeviceFingerprint !== operation.authority.deviceId ||
+    registration.browserInstanceId !== operation.authority.browserInstanceId ||
+    relayConnection.registrationState !== "registered" ||
+    relayConnection.publicDeviceFingerprint !== registration.publicDeviceFingerprint ||
+    relayConnection.browserInstanceId !== registration.browserInstanceId
+  ) {
+    return { status: "refused", reason: relayBindingRefusal() };
+  }
+  if (
+    relayConnection.protocolVersion !== operation.authority.capabilitySet.protocolVersion ||
+    relayConnection.policyGrammarVersion !== operation.authority.capabilitySet.policyGrammarVersion ||
+    relayConnection.bskVersion !== operation.authority.capabilitySet.bskVersion ||
+    relayConnection.extensionVersion !== operation.authority.capabilitySet.extensionVersion ||
+    relayConnection.cliShapeHash !== operation.authority.capabilitySet.cliShapeHash ||
+    computeDesktopBrowserRequestHash(
+      operation.authority,
+      relayConnection.protocolVersion,
+      relayConnection.policyGrammarVersion,
+    ) !== operation.requestHash
+  ) {
+    return { status: "refused", reason: capabilitySetRefusal() };
+  }
+  return currentAuthority;
+}
+
 export function createDesktopBrowserDeviceRegistry(
   backing: DesktopBrowserDeviceRegistryBacking,
   options: {
@@ -485,13 +579,13 @@ export function createDesktopBrowserDeviceRegistry(
     return await backing.state.putIfAbsent(REGISTRY_STATE_ID, emptyRegistryState());
   }
 
-  async function updateState<T>(mutate: (state: DesktopBrowserDeviceRegistryState) => T): Promise<T> {
+  async function updateState<T>(mutate: (state: DesktopBrowserDeviceRegistryState) => T | Promise<T>): Promise<T> {
     await readState();
     let settled = false;
     let result: T | undefined;
-    const next = await update(REGISTRY_STATE_ID, (current) => {
+    const next = await update(REGISTRY_STATE_ID, async (current) => {
       const state = cloneRegistryState(current);
-      result = mutate(state);
+      result = await mutate(state);
       settled = true;
       return state;
     });
@@ -510,9 +604,7 @@ export function createDesktopBrowserDeviceRegistry(
     state: DesktopBrowserDeviceRegistryState,
     projectId: string,
   ): DesktopBrowserRegistrationRecord | null {
-    const head = state.projectHeads[projectId];
-    if (!head) return null;
-    return state.registrations[head.registrationId] ?? null;
+    return currentProjectHeadRecord(state, projectId);
   }
 
   async function invalidate(registrationId: string): Promise<void> {
@@ -860,62 +952,15 @@ export function createDesktopBrowserDeviceRegistry(
     },
 
     async sessionStartAuthorityState(waitingTaskId) {
-      const state = await readState();
-      const claim = claimForTask(state, waitingTaskId);
-      if (!claim) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
-      const registration = state.registrations[claim.registrationId];
-      if (!registration) {
-        return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
-      }
-      if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
-        return { status: "refused", reason: "Desktop Browser device is not online" };
-      }
-      if (currentProjectHead(state, registration.projectId)?.registrationId !== registration.registrationId) {
-        return {
-          status: "refused",
-          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
-        };
-      }
-      const relayConnection = Object.values(state.relayConnections)
-        .filter(
-          (connection) =>
-            connection.registrationState === "registered" &&
-            connection.publicDeviceFingerprint === registration.publicDeviceFingerprint &&
-            connection.brokerInstanceId === registration.registrationTuple.brokerInstanceId &&
-            connection.browserInstanceId === registration.registrationTuple.browserInstanceId &&
-            connection.connectionEpoch === registration.registrationTuple.connectionEpoch,
-        )
-        .sort(
-          (left, right) =>
-            Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt) ||
-            left.connectionId.localeCompare(right.connectionId),
-        )[0];
-      if (!relayConnection) {
-        return {
-          status: "refused",
-          reason: "Desktop Browser Relay connection is no longer bound to the registered device",
-        };
-      }
-      return {
-        status: "ok",
-        authority: {
-          registration: {
-            deploymentCanonicalId: registration.registrationTuple.deploymentCanonicalId,
-            registrationId: registration.registrationId,
-            waitingTaskId: registration.waitingTaskId,
-            actorId: registration.actorId,
-            projectId: registration.projectId,
-            membershipEpoch: registration.membershipEpoch,
-            authorityId: registration.authorityId,
-            authorityExpiresAt: registration.authorityExpiresAt,
-            publicDeviceFingerprint: registration.publicDeviceFingerprint,
-            browserInstanceId: registration.registrationTuple.browserInstanceId,
-            status: "online",
-            browserRuntimeStatus: "ready",
-          },
-          relayConnection: { ...relayConnection },
-        },
-      };
+      return sessionStartAuthorityStateFromState(await readState(), waitingTaskId);
+    },
+
+    async withValidatedSessionStartAuthority(waitingTaskId, operation, fn) {
+      return await updateState(async (state) => {
+        const currentAuthority = validatedSessionStartAuthorityStateFromState(state, waitingTaskId, operation);
+        if (currentAuthority.status === "refused") return currentAuthority;
+        return await fn(currentAuthority);
+      });
     },
   };
 }
