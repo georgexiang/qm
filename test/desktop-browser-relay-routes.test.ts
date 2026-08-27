@@ -12,6 +12,7 @@ import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
 import { projectGroupRef } from "../src/projects/project-store.ts";
 import { testConfig } from "./support/test-config.ts";
+import { desktopBrowserRelayConnectionProjectionFixture } from "qm-desktop-browser-contracts/fixtures";
 
 const SECRET = "desktop-browser-relay-route-secret".repeat(2);
 
@@ -133,5 +134,100 @@ test("relay registry routes resolve pending bindings and accept low-sensitivity 
     assert.equal(clearResponse.status, 204);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await built.runtime.stop();
+  }
+});
+
+test("relay connection publish rejects malformed projections before the durable publish path and accepts a valid strict projection", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-relay-routes-")),
+      publicWebUrl: "https://qm.example.test",
+      signingSecret: SECRET,
+    }),
+  );
+  const seen: unknown[] = [];
+  built.app.desktopBrowserPublishRelayConnection = async (projection) => {
+    seen.push(projection);
+  };
+
+  const server = createServer(built.app, { signingSecret: SECRET });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const path = "/v1/desktop-browser/relay/connections/connection-1";
+
+  try {
+    for (const body of [
+      {
+        projection: {
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionId: "connection-1",
+          connectionEpoch: 7.5,
+        },
+      },
+      {
+        projection: {
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionId: "connection-1",
+          lastSeenAt: "2026-02-30T11:59:00.000Z",
+        },
+      },
+      {
+        projection: {
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionId: " connection-1",
+        },
+      },
+      {
+        projection: {
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionId: "connection-1",
+          unexpectedField: true,
+        },
+      },
+      {
+        projection: {
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionId: "connection-1",
+        },
+        unexpectedRootField: true,
+      },
+    ]) {
+      const encoded = JSON.stringify(body);
+      const response = await fetch(`${base}${path}`, {
+        method: "PUT",
+        headers: signed("PUT", path, encoded),
+        body: encoded,
+      });
+      assert.equal(response.status, 400);
+    }
+
+    assert.equal(seen.length, 0);
+
+    const validBody = JSON.stringify({
+      projection: {
+        ...desktopBrowserRelayConnectionProjectionFixture,
+        connectionId: "connection-1",
+        protocolVersion: "1.2",
+        policyGrammarVersion: "1.1",
+      },
+    });
+    const validResponse = await fetch(`${base}${path}`, {
+      method: "PUT",
+      headers: signed("PUT", path, validBody),
+      body: validBody,
+    });
+    assert.equal(validResponse.status, 204);
+    assert.deepEqual(seen, [
+      {
+        ...desktopBrowserRelayConnectionProjectionFixture,
+        connectionId: "connection-1",
+        protocolVersion: "1.2",
+        policyGrammarVersion: "1.1",
+      },
+    ]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await built.runtime.stop();
   }
 });

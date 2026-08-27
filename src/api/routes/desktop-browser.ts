@@ -1,9 +1,10 @@
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
 import { type ApiCtx, type Route } from "./route.ts";
-import type {
-  DesktopBrowserRegistrationConfirmationEnvelope,
-  DesktopBrowserRelayConnectionProjection,
+import {
+  parseDesktopBrowserRelayConnectionPublishRequest,
+  type DesktopBrowserRegistrationConfirmationEnvelope,
+  type DesktopBrowserRelayConnectionProjection,
 } from "qm-desktop-browser-contracts";
 
 async function taskAction(ctx: ApiCtx): Promise<void> {
@@ -144,27 +145,11 @@ async function relayReady(ctx: ApiCtx): Promise<void> {
 }
 
 function parseRelayProjection(body: unknown): DesktopBrowserRelayConnectionProjection | null {
-  if (!isObj(body)) return null;
-  const projection = isObj(body.projection) ? body.projection : null;
-  if (!projection) return null;
-  if (
-    typeof projection.connectionId !== "string" ||
-    typeof projection.publicDeviceFingerprint !== "string" ||
-    typeof projection.brokerInstanceId !== "string" ||
-    typeof projection.browserInstanceId !== "string" ||
-    typeof projection.connectionEpoch !== "number" ||
-    (projection.registrationState !== "pending" && projection.registrationState !== "registered") ||
-    typeof projection.protocolVersion !== "string" ||
-    typeof projection.policyGrammarVersion !== "string" ||
-    typeof projection.brokerVersion !== "string" ||
-    typeof projection.bskVersion !== "string" ||
-    typeof projection.extensionVersion !== "string" ||
-    typeof projection.cliShapeHash !== "string" ||
-    typeof projection.lastSeenAt !== "string"
-  ) {
+  try {
+    return parseDesktopBrowserRelayConnectionPublishRequest(body).projection;
+  } catch {
     return null;
   }
-  return projection as unknown as DesktopBrowserRelayConnectionProjection;
 }
 
 async function publishRelayConnection(ctx: ApiCtx): Promise<void> {
@@ -201,7 +186,12 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
     auth: "source",
     handle: stageRegistrationConfirmation,
   },
-  { method: "POST", path: "/v1/desktop-browser/registrations/:id/confirm", auth: "source", handle: confirmRegistration },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/registrations/:id/confirm",
+    auth: "source",
+    handle: confirmRegistration,
+  },
   {
     method: "POST",
     path: "/v1/desktop-browser/registrations/:id/offline",

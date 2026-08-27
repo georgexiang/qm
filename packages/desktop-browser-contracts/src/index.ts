@@ -356,6 +356,43 @@ export const desktopBrowserOnlineDeviceProjectionSchema = strictObjectSchema(
   },
 );
 
+export const desktopBrowserRelayConnectionProjectionSchema = strictObjectSchema(
+  [
+    "connectionId",
+    "publicDeviceFingerprint",
+    "brokerInstanceId",
+    "browserInstanceId",
+    "connectionEpoch",
+    "registrationState",
+    "protocolVersion",
+    "policyGrammarVersion",
+    "brokerVersion",
+    "bskVersion",
+    "extensionVersion",
+    "cliShapeHash",
+    "lastSeenAt",
+  ],
+  {
+    connectionId: canonicalLexicalStringSchema,
+    publicDeviceFingerprint: { type: "string", pattern: "^[0-9a-f]{16}$" },
+    brokerInstanceId: canonicalLexicalStringSchema,
+    browserInstanceId: canonicalLexicalStringSchema,
+    connectionEpoch: positiveIntegerSchema,
+    registrationState: { enum: ["pending", "registered"] },
+    protocolVersion: canonicalProtocolVersionSchema,
+    policyGrammarVersion: canonicalProtocolVersionSchema,
+    brokerVersion: nonEmptyStringSchema,
+    bskVersion: nonEmptyStringSchema,
+    extensionVersion: nonEmptyStringSchema,
+    cliShapeHash: nonEmptyStringSchema,
+    lastSeenAt: canonicalUtcMillisecondInstantSchema,
+  },
+);
+
+export const desktopBrowserRelayConnectionPublishRequestSchema = strictObjectSchema(["projection"], {
+  projection: desktopBrowserRelayConnectionProjectionSchema,
+});
+
 const desktopBrowserOnlineDeviceProjectionAdditiveSchema = objectSchema(
   ["publicDeviceFingerprint", "browserInstanceId", "operatingSystem", "status", "browserRuntimeStatus", "lastSeenAt"],
   {
@@ -523,6 +560,12 @@ const registrationConfirmationEnvelopeAdditiveParser = fromJSONSchema(
 );
 const onlineDeviceProjectionAdditiveParser = fromJSONSchema(
   desktopBrowserOnlineDeviceProjectionAdditiveSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const relayConnectionProjectionParser = fromJSONSchema(
+  desktopBrowserRelayConnectionProjectionSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const relayConnectionPublishRequestParser = fromJSONSchema(
+  desktopBrowserRelayConnectionPublishRequestSchema as unknown as Parameters<typeof fromJSONSchema>[0],
 );
 
 export function encodeDesktopBrowserMessage(message: DesktopBrowserMessage): string {
@@ -727,6 +770,41 @@ export function parseDesktopBrowserOnlineDeviceProjection(raw: unknown): Desktop
   };
 }
 
+export function parseDesktopBrowserRelayConnectionProjection(raw: unknown): DesktopBrowserRelayConnectionProjection {
+  const projection = parseDesktopBrowserRecord<DesktopBrowserRelayConnectionProjection>(
+    relayConnectionProjectionParser,
+    "desktop browser relay connection projection",
+    raw,
+  );
+  if (!isDesktopBrowserProtocolCompatible(projection.protocolVersion, DESKTOP_BROWSER_PROTOCOL_VERSION)) {
+    throw new Error(
+      `relay connection protocol major ${protocolMajor(projection.protocolVersion)} is incompatible with supported major ${protocolMajor(DESKTOP_BROWSER_PROTOCOL_VERSION)}`,
+    );
+  }
+  if (!isDesktopBrowserProtocolCompatible(projection.policyGrammarVersion, DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION)) {
+    throw new Error(
+      `relay connection policy grammar major ${protocolMajor(projection.policyGrammarVersion)} is incompatible with supported major ${protocolMajor(DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION)}`,
+    );
+  }
+  assertCanonicalProtocolVersion(projection.protocolVersion, "protocolVersion");
+  assertCanonicalProtocolVersion(projection.policyGrammarVersion, "policyGrammarVersion");
+  assertCanonicalUtcMillisecondInstant(projection.lastSeenAt, "lastSeenAt");
+  return canonicalizeDesktopBrowserRelayConnectionProjection(projection);
+}
+
+export function parseDesktopBrowserRelayConnectionPublishRequest(
+  raw: unknown,
+): DesktopBrowserRelayConnectionPublishRequest {
+  const request = parseDesktopBrowserRecord<DesktopBrowserRelayConnectionPublishRequest>(
+    relayConnectionPublishRequestParser,
+    "desktop browser relay connection publish request",
+    raw,
+  );
+  return {
+    projection: parseDesktopBrowserRelayConnectionProjection(request.projection),
+  };
+}
+
 function canonicalizeDesktopBrowserRegistrationReservationTuple(
   tuple: DesktopBrowserRegistrationReservationTuple,
 ): DesktopBrowserRegistrationReservationTuple {
@@ -754,6 +832,26 @@ function canonicalizeDesktopBrowserPublicIdentity(
     devicePublicKey: identity.devicePublicKey,
     brokerInstanceId: identity.brokerInstanceId,
     browserInstanceId: identity.browserInstanceId,
+  };
+}
+
+function canonicalizeDesktopBrowserRelayConnectionProjection(
+  projection: DesktopBrowserRelayConnectionProjection,
+): DesktopBrowserRelayConnectionProjection {
+  return {
+    connectionId: projection.connectionId,
+    publicDeviceFingerprint: projection.publicDeviceFingerprint,
+    brokerInstanceId: projection.brokerInstanceId,
+    browserInstanceId: projection.browserInstanceId,
+    connectionEpoch: projection.connectionEpoch,
+    registrationState: projection.registrationState,
+    protocolVersion: projection.protocolVersion,
+    policyGrammarVersion: projection.policyGrammarVersion,
+    brokerVersion: projection.brokerVersion,
+    bskVersion: projection.bskVersion,
+    extensionVersion: projection.extensionVersion,
+    cliShapeHash: projection.cliShapeHash,
+    lastSeenAt: projection.lastSeenAt,
   };
 }
 

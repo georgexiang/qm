@@ -9,6 +9,7 @@ import {
   encodeDesktopBrowserRegistrationReservationTupleBytes,
   parseDesktopBrowserOnlineDeviceProjection,
   parseDesktopBrowserPublicIdentity,
+  parseDesktopBrowserRelayConnectionProjection,
   parseDesktopBrowserRegistrationConfirmationEnvelope,
   parseDesktopBrowserRegistrationReservationTuple,
   projectDesktopBrowserPublicIdentity,
@@ -16,6 +17,7 @@ import {
 import {
   desktopBrowserOnlineDeviceProjectionFixture,
   desktopBrowserPublicIdentityFixture,
+  desktopBrowserRelayConnectionProjectionFixture,
   desktopBrowserRegistrationConfirmationEnvelopeFixture,
   desktopBrowserRegistrationReservationTupleFixture,
 } from "qm-desktop-browser-contracts/fixtures";
@@ -44,7 +46,10 @@ test("registration fixtures validate through the public contract seam", () => {
     parseDesktopBrowserRegistrationConfirmationEnvelope(desktopBrowserRegistrationConfirmationEnvelopeFixture),
     desktopBrowserRegistrationConfirmationEnvelopeFixture,
   );
-  assert.deepEqual(parseDesktopBrowserPublicIdentity(desktopBrowserPublicIdentityFixture), desktopBrowserPublicIdentityFixture);
+  assert.deepEqual(
+    parseDesktopBrowserPublicIdentity(desktopBrowserPublicIdentityFixture),
+    desktopBrowserPublicIdentityFixture,
+  );
   assert.deepEqual(
     parseDesktopBrowserOnlineDeviceProjection(desktopBrowserOnlineDeviceProjectionFixture),
     desktopBrowserOnlineDeviceProjectionFixture,
@@ -132,7 +137,63 @@ test("same-major 1.x additive fields are accepted but ignored by the canonical r
       confirmationFingerprint: computeDesktopBrowserRegistrationConfirmationFingerprint(additiveTuple),
     },
   );
-  assert.deepEqual(parseDesktopBrowserOnlineDeviceProjection(additiveProjection), desktopBrowserOnlineDeviceProjectionFixture);
+  assert.deepEqual(
+    parseDesktopBrowserOnlineDeviceProjection(additiveProjection),
+    desktopBrowserOnlineDeviceProjectionFixture,
+  );
+});
+
+test("relay connection projection accepts compatible canonical protocol versions but fails closed on malformed fields", () => {
+  assert.deepEqual(
+    parseDesktopBrowserRelayConnectionProjection({
+      ...desktopBrowserRelayConnectionProjectionFixture,
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.1",
+    }),
+    {
+      ...desktopBrowserRelayConnectionProjectionFixture,
+      protocolVersion: "1.2",
+      policyGrammarVersion: "1.1",
+    },
+  );
+
+  for (const connectionEpoch of [Number.NaN, 7.5, 0]) {
+    assert.throws(
+      () =>
+        parseDesktopBrowserRelayConnectionProjection({
+          ...desktopBrowserRelayConnectionProjectionFixture,
+          connectionEpoch,
+        }),
+      /does not match its schema/,
+    );
+  }
+
+  assertCanonicalInstantContractError(
+    () =>
+      parseDesktopBrowserRelayConnectionProjection({
+        ...desktopBrowserRelayConnectionProjectionFixture,
+        lastSeenAt: "2026-02-30T11:59:00.000Z",
+      }),
+    "lastSeenAt",
+  );
+
+  assert.throws(
+    () =>
+      parseDesktopBrowserRelayConnectionProjection({
+        ...desktopBrowserRelayConnectionProjectionFixture,
+        connectionId: " connection-1",
+      }),
+    /does not match its schema/,
+  );
+
+  assert.throws(
+    () =>
+      parseDesktopBrowserRelayConnectionProjection({
+        ...desktopBrowserRelayConnectionProjectionFixture,
+        unexpectedField: true,
+      }),
+    /does not match its schema/,
+  );
 });
 
 test("exact 1.0 tuple and public identity records still fail closed on unknown fields", () => {
