@@ -37,6 +37,7 @@ import {
   type DesktopBrowserSessionStartResult,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRegistrationReservationTuple,
+  type HostAcceptedMessage,
   type HostResultMessage,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
@@ -138,6 +139,21 @@ export interface HostBrokerConnectionOptions {
   scheduler?: HostBrokerScheduler;
   processEpoch?: number | null;
   onStateChange?: (state: HostBrokerStateSnapshot) => void;
+  writeObserver?: HostBrokerWriteObserver;
+}
+
+export interface HostBrokerWriteObserver {
+  onFenceCreated?(fence: HostOperationFence): void;
+  onFenceSaved?(fence: HostOperationFence): void;
+  onSessionOwnershipSaved(record: {
+    taskId: string;
+    attemptId: string;
+    operationId: string;
+    requestHash: string;
+    sessionId: string;
+    browserInstanceId: string;
+    agentWindowId: number;
+  }): void;
 }
 
 export interface HostBrokerCliDeps {
@@ -809,44 +825,49 @@ function assertSessionStartRequestHash(
   }
 }
 
-function readInvocationOperationId(raw: string): string | null {
-  try {
-    const message = JSON.parse(raw) as { payload?: { authority?: { operationId?: unknown } } };
-    const operationId = message.payload?.authority?.operationId;
-    return typeof operationId === "string" && operationId.length > 0 ? operationId : null;
-  } catch {
-    return null;
-  }
+function accepted(
+  protocolVersion: `${number}.${number}`,
+  dispatchId: string,
+  operationId: string,
+  requestHash: string,
+): HostAcceptedMessage {
+  return {
+    protocolVersion,
+    kind: "host.accepted",
+    payload: {
+      dispatchId,
+      operationId,
+      requestHash,
+    },
+  };
 }
 
-function preFenceFailure(protocolVersion: `${number}.${number}`, operationId: string, error: Error): HostResultMessage {
+function completedResult(
+  protocolVersion: `${number}.${number}`,
+  operationId: string,
+  result: DesktopBrowserSessionStartResult,
+): HostResultMessage {
   return {
     protocolVersion,
     kind: "host.result",
     payload: {
       operationId,
-      accepted: false,
-      outcome: "failed",
-      error: { code: "host_precondition_failed", message: error.message },
+      outcome: "completed",
+      resultHash: computeHostResultHash({ operationId, outcome: "completed", result }),
+      result,
     },
   };
 }
 
-function acceptedUnknown(
-  protocolVersion: `${number}.${number}`,
-  operationId: string,
-  requestHash: string,
-  error?: Error,
-): HostResultMessage {
+function unknownResult(protocolVersion: `${number}.${number}`, operationId: string, error?: Error): HostResultMessage {
   const errorPayload = error ? { code: "host_operation_unknown", message: error.message } : undefined;
   return {
     protocolVersion,
     kind: "host.result",
     payload: {
       operationId,
-      accepted: true,
       outcome: "unknown",
-      resultHash: computeHostResultHash({ operationId, requestHash, outcome: "unknown", error: errorPayload }),
+      resultHash: computeHostResultHash({ operationId, outcome: "unknown", error: errorPayload }),
       ...(errorPayload ? { error: errorPayload } : {}),
     },
   };
@@ -1050,6 +1071,7 @@ export class HostBrokerConnection {
   private readonly sessionRunner: HostBrokerSessionRunner;
   private readonly maxBrowserSkillOutputBytes: number;
   private readonly browserSkillTimeoutMs: number;
+  private readonly writeObserver: HostBrokerWriteObserver | null;
 
   constructor(options: HostBrokerConnectionOptions) {
     this.options = options;
@@ -1059,6 +1081,7 @@ export class HostBrokerConnection {
     this.sessionRunner = options.sessionRunner ?? DEFAULT_SESSION_RUNNER;
     this.maxBrowserSkillOutputBytes = options.maxBrowserSkillOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
     this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
+    this.writeObserver = options.writeObserver ?? null;
     this.snapshotState = createInitialState({
       qmUrl: options.qmUrl,
       relayUrl: options.relayUrl,
@@ -1090,47 +1113,38 @@ export class HostBrokerConnection {
     now: () => number;
     isActive: () => boolean;
   }): Promise<void> {
-    const operationId = readInvocationOperationId(input.raw);
-    let message: Extract<ReturnType<typeof decodeDesktopBrowserMessage>, { kind: "relay.invoke" }>;
-    try {
-      const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
-      if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
-      if (!this.dataDir) throw new Error("host operation state directory is not configured");
-      assertSessionStartAuthorityBindings(
-        decoded.payload.authority,
-        this.deviceId,
-        this.options.runtime,
-        this.snapshotState,
-        input.protocolVersion,
-        input.policyGrammarVersion,
-        input.now(),
-      );
-      assertSessionStartRequestHash(
-        decoded.payload.authority,
-        decoded.payload.requestHash,
-        input.protocolVersion,
-        input.policyGrammarVersion,
-      );
-      message = decoded;
-    } catch (error) {
-      if (!operationId) throw error;
-      input.socket.send(
-        encodeDesktopBrowserMessage(
-          preFenceFailure(
-            input.protocolVersion,
-            operationId,
-            error instanceof Error ? error : new Error(String(error)),
-          ),
-        ),
-      );
-      return;
-    }
+    const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
+    if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
+    if (!this.dataDir) throw new Error("host operation state directory is not configured");
+    assertSessionStartAuthorityBindings(
+      decoded.payload.authority,
+      this.deviceId,
+      this.options.runtime,
+      this.snapshotState,
+      input.protocolVersion,
+      input.policyGrammarVersion,
+      input.now(),
+    );
+    assertSessionStartRequestHash(
+      decoded.payload.authority,
+      decoded.payload.requestHash,
+      input.protocolVersion,
+      input.policyGrammarVersion,
+    );
+    const message = decoded;
 
     const dataDir = this.dataDir!;
     const authority = message.payload.authority;
+    const acceptedMessage = accepted(
+      input.protocolVersion,
+      message.payload.dispatchId,
+      authority.operationId,
+      message.payload.requestHash,
+    );
     let existingFence = loadOperationFence(dataDir, authority.operationId);
     if (existingFence) {
       if (existingFence.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
           encodeDesktopBrowserMessage({
             protocolVersion: input.protocolVersion,
@@ -1141,18 +1155,10 @@ export class HostBrokerConnection {
         return;
       }
       if (existingFence.requestHash !== message.payload.requestHash) {
-        input.socket.send(
-          encodeDesktopBrowserMessage(
-            preFenceFailure(
-              input.protocolVersion,
-              authority.operationId,
-              new Error("operationId is already bound to a different request hash"),
-            ),
-          ),
-        );
-        return;
+        throw new Error("operationId is already bound to a different request hash");
       }
-      const unknown = acceptedUnknown(input.protocolVersion, authority.operationId, existingFence.requestHash);
+      input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
+      const unknown = unknownResult(input.protocolVersion, authority.operationId);
       input.socket.send(encodeDesktopBrowserMessage(unknown));
       return;
     }
@@ -1167,6 +1173,7 @@ export class HostBrokerConnection {
     if (!createOperationFence(dataDir, fence)) {
       existingFence = loadOperationFence(dataDir, authority.operationId);
       if (existingFence?.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
           encodeDesktopBrowserMessage({
             protocolVersion: input.protocolVersion,
@@ -1177,31 +1184,24 @@ export class HostBrokerConnection {
         return;
       }
       if (existingFence && existingFence.requestHash !== message.payload.requestHash) {
-        input.socket.send(
-          encodeDesktopBrowserMessage(
-            preFenceFailure(
-              input.protocolVersion,
-              authority.operationId,
-              new Error("operationId is already bound to a different request hash"),
-            ),
-          ),
-        );
-        return;
+        throw new Error("operationId is already bound to a different request hash");
       }
+      input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
       input.socket.send(
         encodeDesktopBrowserMessage(
-          acceptedUnknown(
+          unknownResult(
             input.protocolVersion,
             authority.operationId,
-            existingFence?.requestHash ?? message.payload.requestHash,
             new Error("operation was fenced concurrently and cannot be spawned again"),
           ),
         ),
       );
       return;
     }
+    this.writeObserver?.onFenceCreated?.(fence);
     this.snapshotState.currentTaskPresent = true;
     this.emitState();
+    input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
     try {
       const runResult = await Promise.race([
         this.sessionRunner.run(this.browserSkillExecutable, authority.argv, {
@@ -1217,41 +1217,36 @@ export class HostBrokerConnection {
       if (result.browser_instance_id !== authority.browserInstanceId) {
         throw new Error("BrowserSkill returned a browser outside the authority binding");
       }
-      const completed: HostResultMessage = {
-        protocolVersion: input.protocolVersion,
-        kind: "host.result",
-        payload: {
-          operationId: authority.operationId,
-          accepted: true,
-          outcome: "completed",
-          resultHash: computeHostResultHash(result),
-          result,
-        },
+      const completed = completedResult(input.protocolVersion, authority.operationId, result);
+      const sessionOwnership = {
+        taskId: authority.taskId,
+        attemptId: authority.attemptId,
+        operationId: authority.operationId,
+        requestHash: message.payload.requestHash,
+        sessionId: result.session_id,
+        browserInstanceId: result.browser_instance_id,
+        agentWindowId: result.agent_window_id,
       };
       atomicWriteText(
         sessionOwnershipPath(dataDir, authority.taskId),
-        `${JSON.stringify({
-          taskId: authority.taskId,
-          attemptId: authority.attemptId,
-          operationId: authority.operationId,
-          requestHash: message.payload.requestHash,
-          sessionId: result.session_id,
-          browserInstanceId: result.browser_instance_id,
-          agentWindowId: result.agent_window_id,
-        })}\n`,
+        `${JSON.stringify(sessionOwnership)}\n`,
         SAFE_FILE_MODE,
       );
-      saveOperationFence(dataDir, { ...fence, state: "completed", terminalPayload: completed.payload });
+      this.writeObserver?.onSessionOwnershipSaved(sessionOwnership);
+      const completedFence = { ...fence, state: "completed" as const, terminalPayload: completed.payload };
+      saveOperationFence(dataDir, completedFence);
+      this.writeObserver?.onFenceSaved?.(completedFence);
       if (!input.isActive()) throw new Error("relay disconnected after operation acceptance");
       input.socket.send(encodeDesktopBrowserMessage(completed));
     } catch (error) {
-      const unknown = acceptedUnknown(
+      const unknown = unknownResult(
         input.protocolVersion,
         authority.operationId,
-        message.payload.requestHash,
         error instanceof Error ? error : new Error(String(error)),
       );
-      saveOperationFence(dataDir, { ...fence, state: "unknown", terminalPayload: unknown.payload });
+      const unknownFence = { ...fence, state: "unknown" as const, terminalPayload: unknown.payload };
+      saveOperationFence(dataDir, unknownFence);
+      this.writeObserver?.onFenceSaved?.(unknownFence);
       if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(unknown));
     } finally {
       this.snapshotState.currentTaskPresent = false;
@@ -1325,18 +1320,7 @@ export class HostBrokerConnection {
                 throw new Error("relay invoke arrived without an exact negotiated protocol version");
               }
               if (!negotiatedPolicyGrammarVersion) {
-                const operationId = readInvocationOperationId(raw);
-                if (!operationId) throw new Error("relay invoke arrived without an exact negotiated policy grammar");
-                socket.send(
-                  encodeDesktopBrowserMessage(
-                    preFenceFailure(
-                      negotiatedProtocolVersion,
-                      operationId,
-                      new Error("relay connection does not identify one exact negotiated policy grammar"),
-                    ),
-                  ),
-                );
-                return;
+                throw new Error("relay connection does not identify one exact negotiated policy grammar");
               }
               void this.handleRelayInvocation({
                 raw,

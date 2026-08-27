@@ -32,6 +32,8 @@ import type {
   DesktopBrowserSharedProfileProjection,
 } from "../desktop-browser/device-registry.ts";
 import type {
+  HostAcceptedMessage,
+  HostResultMessage,
   DesktopBrowserRelayConnectionProjection,
   DesktopBrowserRelayRegistryBinding,
   DesktopBrowserPublicIdentity,
@@ -315,6 +317,18 @@ export interface App {
   }): Promise<{ status: "ok"; binding: DesktopBrowserRelayRegistryBinding } | { status: "refused"; reason: string }>;
   desktopBrowserPublishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
   desktopBrowserClearRelayConnection(connectionId: string): Promise<void>;
+  desktopBrowserPrepareSessionStart(
+    taskId: string,
+    authorityId: string,
+  ): ReturnType<DesktopBrowserTaskStore["prepareSessionStart"]>;
+  desktopBrowserConsumeSessionStartAccepted(
+    taskId: string,
+    accepted: HostAcceptedMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeSessionStartAccepted"]>;
+  desktopBrowserConsumeSessionStartResult(
+    taskId: string,
+    result: HostResultMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeSessionStartResult"]>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
   subscribeSessionStates(cb: (event: SessionStateEvent) => void): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;

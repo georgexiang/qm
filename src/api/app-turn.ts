@@ -20,6 +20,8 @@ import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { errMessage } from "../util/errors.ts";
 import { constantTimeEqual } from "../util/crypto.ts";
 import type {
+  HostAcceptedMessage,
+  HostResultMessage,
   DesktopBrowserRegistrationConfirmationEnvelope,
   DesktopBrowserRelayConnectionProjection,
 } from "qm-desktop-browser-contracts";
@@ -54,6 +56,9 @@ export function createTurnMethods(
   | "desktopBrowserResolveRelayBinding"
   | "desktopBrowserPublishRelayConnection"
   | "desktopBrowserClearRelayConnection"
+  | "desktopBrowserPrepareSessionStart"
+  | "desktopBrowserConsumeSessionStartAccepted"
+  | "desktopBrowserConsumeSessionStartResult"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -105,23 +110,31 @@ export function createTurnMethods(
       return { status: "refused", reason: "Desktop Browser Task not found" };
     }
     const locked = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+      const currentTask = await deps.desktopBrowserTasks.get(taskId);
+      if (!currentTask) {
+        await onDrift?.();
+        return { status: "refused", reason: "Desktop Browser Task not found" } as const;
+      }
       await deps.identity.refresh();
-      const actor = deps.identity.classify(task.actorId);
+      const actor = deps.identity.classify(currentTask.actorId);
       const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+      if (currentTask.status !== "waiting_for_broker") {
+        await onDrift?.();
+        return { status: "refused", reason: "Desktop Browser Task is no longer waiting" } as const;
+      }
       if (
-        task.status !== "waiting_for_broker" ||
         project.orgId !== orgIdOf() ||
-        String(project.updatedAt) !== task.projectMembershipVersion ||
+        String(project.updatedAt) !== currentTask.projectMembershipVersion ||
         !currentMembers.has(actor.id) ||
         !deps.identity.isInternal(actor) ||
         !deps.identity.isInternal(deps.identity.classify(project.ownerId)) ||
-        !constantTimeEqual(task.authorityId, authorityId) ||
-        task.authorityExpiresAt <= Date.now()
+        !constantTimeEqual(currentTask.authorityId, authorityId) ||
+        currentTask.authorityExpiresAt <= Date.now()
       ) {
         await onDrift?.();
         return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
       }
-      return fn(task);
+      return fn(currentTask);
     });
     return locked ?? { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
   }
@@ -772,6 +785,34 @@ export function createTurnMethods(
 
     async desktopBrowserClearRelayConnection(connectionId) {
       await deps.desktopBrowserDeviceRegistry.clearRelayConnection(connectionId);
+    },
+
+    async desktopBrowserPrepareSessionStart(taskId, authorityId) {
+      return withCurrentWaitingTask(taskId, authorityId, async () => {
+        return deps.desktopBrowserTasks.prepareSessionStart(taskId);
+      });
+    },
+
+    async desktopBrowserConsumeSessionStartAccepted(taskId, accepted) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      if (task.execution?.hostResult) {
+        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
+      }
+      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
+        return deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted as HostAcceptedMessage);
+      });
+    },
+
+    async desktopBrowserConsumeSessionStartResult(taskId, result) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      if (task.execution?.hostResult) {
+        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
+      }
+      return withCurrentWaitingTask(taskId, task.authorityId, async () => {
+        return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
+      });
     },
 
     subscribeSessionStates(cb) {

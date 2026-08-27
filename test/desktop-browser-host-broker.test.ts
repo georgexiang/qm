@@ -26,6 +26,7 @@ import {
   decodeDesktopBrowserMessage,
   projectDesktopBrowserPublicIdentity,
   type DesktopBrowserSessionStartAuthorityEnvelope,
+  type HostAcceptedMessage,
   type HostChallengeResponseMessage,
   type HostResultMessage,
 } from "../packages/desktop-browser-contracts/src/index.ts";
@@ -53,6 +54,7 @@ import {
   type HostBrokerSessionRunner,
   type HostBrokerSocket,
   type HostBrokerTransport,
+  type HostBrokerWriteObserver,
 } from "../packages/qm-host-broker/src/index.ts";
 import WebSocket from "ws";
 
@@ -633,11 +635,18 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
     createNonce: () => "nonce-session-start-1",
     createConnectionId: () => "connection-session-start-1",
   });
+  let hostAccepted: HostAcceptedMessage | undefined;
   let hostResult: HostResultMessage | undefined;
+  const eventLog: string[] = [];
   const sockets = createLinkedSocketPair({
     hostToRelay(data) {
       const raw = JSON.parse(data) as { kind?: string };
+      if (raw.kind === "host.accepted") {
+        eventLog.push("send:host.accepted");
+        hostAccepted = decodeDesktopBrowserMessage(data, "1.2", "1.0") as HostAcceptedMessage;
+      }
       if (raw.kind === "host.result") {
+        eventLog.push("send:host.result");
         hostResult = decodeDesktopBrowserMessage(data, "1.2", "1.0") as HostResultMessage;
       }
       return data;
@@ -654,6 +663,7 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
       };
       assert.equal(fence.operationId, "0198f3d2-1950-7000-8000-000000000011");
       assert.equal(fence.requestHash, authorityRequestHash);
+      eventLog.push("spawn:bsk");
       spawnCalls.push({ executable, argv, options });
       return {
         exitCode: 0,
@@ -665,6 +675,17 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
         }),
         stderr: "",
       };
+    },
+  };
+  const writeObserver: HostBrokerWriteObserver = {
+    onFenceCreated() {
+      eventLog.push("durable:fence-created");
+    },
+    onSessionOwnershipSaved() {
+      eventLog.push("durable:session-owned");
+    },
+    onFenceSaved(fence) {
+      eventLog.push(`durable:fence-${fence.state}`);
     },
   };
   service.acceptSocket(sockets.relay);
@@ -682,6 +703,7 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
     dataDir: dir,
     browserSkillExecutable: "bsk",
     sessionRunner,
+    writeObserver,
     transport: {
       connect(url: string): HostBrokerSocket {
         assert.equal(url, `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`);
@@ -739,19 +761,33 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
     }),
   );
 
+  const accepted = await waitFor(() => hostAccepted, "accepted host result");
   const completed = await waitFor(() => hostResult, "completed host result");
+  assert.equal(accepted.protocolVersion, "1.2");
+  assert.deepEqual(accepted.payload, {
+    dispatchId: "0198f3d2-1950-7000-8000-000000000012",
+    operationId: authority.operationId,
+    requestHash: authorityRequestHash,
+  });
   assert.equal(completed.protocolVersion, "1.2");
   assert.deepEqual(completed.payload, {
     operationId: authority.operationId,
-    accepted: true,
     outcome: "completed",
-    resultHash: completed.payload.accepted ? completed.payload.resultHash : "",
+    resultHash: completed.payload.resultHash,
     result: {
       session_id: "session-1",
       browser_instance_id: "browser-primary",
       agent_window_id: 42,
     },
   });
+  assert.deepEqual(eventLog, [
+    "durable:fence-created",
+    "send:host.accepted",
+    "spawn:bsk",
+    "durable:session-owned",
+    "durable:fence-completed",
+    "send:host.result",
+  ]);
   assert.deepEqual(spawnCalls, [
     {
       executable: "bsk",
@@ -779,17 +815,6 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
 });
 
 test("relay.invoke rejects every authority mismatch before fencing or spawning", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "host-broker-pre-fence-rejection-"));
-  let spawnCalls = 0;
-  const { socket, running } = await connectOperationHost({
-    dataDir: dir,
-    sessionRunner: {
-      async run() {
-        spawnCalls += 1;
-        return { exitCode: 0, stdout: "{}", stderr: "" };
-      },
-    },
-  });
   const base = sessionStartAuthority("0198f3d2-1950-7000-8000-000000000021");
   const futureIssuedAt = new Date(Date.now() + 30_000).toISOString();
   const cases: Array<{ name: string; authority: unknown; requestHash?: string }> = [
@@ -842,7 +867,17 @@ test("relay.invoke rejects every authority mismatch before fencing or spawning",
   ];
 
   for (const entry of cases) {
-    const sentBefore = socket.sent.length;
+    const dir = mkdtempSync(join(tmpdir(), `host-broker-pre-fence-${entry.name.replaceAll(" ", "-")}-`));
+    let spawnCalls = 0;
+    const { socket, running } = await connectOperationHost({
+      dataDir: dir,
+      sessionRunner: {
+        async run() {
+          spawnCalls += 1;
+          return { exitCode: 0, stdout: "{}", stderr: "" };
+        },
+      },
+    });
     let requestHash = entry.requestHash;
     if (!requestHash) {
       try {
@@ -862,20 +897,12 @@ test("relay.invoke rejects every authority mismatch before fencing or spawning",
         },
       }),
     );
-    const encodedResult = await waitFor(
-      () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
-      `${entry.name} rejection`,
-    );
-    const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
-    assert.equal(result.kind, "host.result", entry.name);
-    assert.equal(result.payload.accepted, false, entry.name);
-    assert.equal(result.payload.outcome, "failed", entry.name);
+    await assert.rejects(running, () => true, entry.name);
+    assert.equal(socket.sent.length, 2, entry.name);
+    assert.equal(socket.closeCode, 1000, entry.name);
+    assert.equal(spawnCalls, 0, entry.name);
+    assert.equal(existsSync(join(dir, "operations")), false, entry.name);
   }
-
-  assert.equal(spawnCalls, 0);
-  assert.equal(existsSync(join(dir, "operations")), false);
-  socket.close(1000, "done");
-  await running;
 });
 
 test("relay.invoke retains the authoritative policy grammar instead of supported list order", async () => {
@@ -917,11 +944,21 @@ test("relay.invoke retains the authoritative policy grammar instead of supported
     }),
   );
 
+  const accepted = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[2], "policy grammar accepted result"),
+    "1.2",
+    "1.1",
+  ) as HostAcceptedMessage;
   const result = decodeDesktopBrowserMessage(
-    await waitFor(() => socket.sent[2], "policy grammar completed result"),
+    await waitFor(() => socket.sent[3], "policy grammar completed result"),
     "1.2",
     "1.1",
   ) as HostResultMessage;
+  assert.deepEqual(accepted.payload, {
+    dispatchId: "dispatch-policy-grammar",
+    operationId: authority.operationId,
+    requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.1"),
+  });
   assert.equal(result.payload.outcome, "completed");
   assert.equal(spawnCalls, 1);
   socket.close(1000, "done");
@@ -954,22 +991,34 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
   };
   const first = await connectOperationHost({ dataDir: dir, sessionRunner });
   first.socket.message(JSON.stringify(invocation));
+  const firstAccepted = decodeDesktopBrowserMessage(
+    await waitFor(() => first.socket.sent[2], "first accepted result"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
   const firstResult = decodeDesktopBrowserMessage(
-    await waitFor(() => first.socket.sent[2], "first completed result"),
+    await waitFor(() => first.socket.sent[3], "first completed result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
+  assert.equal(firstAccepted.payload.dispatchId, "dispatch-first");
   assert.equal(firstResult.payload.outcome, "completed");
   first.socket.close(1000, "restart");
   await first.running;
 
   const second = await connectOperationHost({ dataDir: dir, sessionRunner });
   second.socket.message(JSON.stringify(invocation));
+  const duplicateAccepted = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[2], "duplicate accepted result"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
   const duplicateResult = decodeDesktopBrowserMessage(
-    await waitFor(() => second.socket.sent[2], "duplicate completed result"),
+    await waitFor(() => second.socket.sent[3], "duplicate completed result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
+  assert.equal(duplicateAccepted.payload.dispatchId, "dispatch-first");
   assert.deepEqual(duplicateResult.payload, firstResult.payload);
   assert.equal(spawnCalls, 1);
 
@@ -984,26 +1033,27 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
       },
     }),
   );
-  const mismatchResult = decodeDesktopBrowserMessage(
-    await waitFor(() => second.socket.sent[3], "mismatched fenced result"),
-    "1.2",
-    "1.0",
-  ) as HostResultMessage;
-  assert.equal(mismatchResult.payload.accepted, false);
-  assert.equal(mismatchResult.payload.outcome, "failed");
+  await assert.rejects(second.running, /different request hash/);
   assert.equal(spawnCalls, 1);
 
-  second.socket.message(JSON.stringify(invocation));
+  const third = await connectOperationHost({ dataDir: dir, sessionRunner });
+  third.socket.message(JSON.stringify(invocation));
+  const preservedAccepted = decodeDesktopBrowserMessage(
+    await waitFor(() => third.socket.sent[2], "preserved accepted result"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
   const preservedResult = decodeDesktopBrowserMessage(
-    await waitFor(() => second.socket.sent[4], "preserved completed result"),
+    await waitFor(() => third.socket.sent[3], "preserved completed result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
+  assert.equal(preservedAccepted.payload.dispatchId, "dispatch-first");
   assert.deepEqual(preservedResult.payload, firstResult.payload);
   assert.equal(spawnCalls, 1);
 
-  second.socket.close(1000, "done");
-  await second.running;
+  third.socket.close(1000, "done");
+  await third.running;
 });
 
 test("post-fence BrowserSkill output failures persist unknown without task ownership or retry", async () => {
@@ -1051,12 +1101,23 @@ test("post-fence BrowserSkill output failures persist unknown without task owner
         },
       }),
     );
-    const encodedResult = await waitFor(
-      () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
-      `output failure ${index}`,
-    );
-    const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
-    assert.equal(result.payload.accepted, true);
+    const accepted = decodeDesktopBrowserMessage(
+      await waitFor(
+        () => (socket.sent.length > sentBefore ? socket.sent[sentBefore] : undefined),
+        `output accepted ${index}`,
+      ),
+      "1.2",
+      "1.0",
+    ) as HostAcceptedMessage;
+    const result = decodeDesktopBrowserMessage(
+      await waitFor(
+        () => (socket.sent.length > sentBefore + 1 ? socket.sent[sentBefore + 1] : undefined),
+        `output failure ${index}`,
+      ),
+      "1.2",
+      "1.0",
+    ) as HostResultMessage;
+    assert.equal(accepted.payload.operationId, authority.operationId);
     assert.equal(result.payload.outcome, "unknown");
   }
 
@@ -1096,12 +1157,20 @@ test("post-fence BrowserSkill timeout persists unknown without task ownership or
       },
     }),
   );
-  const encodedResult = await waitFor(
-    () => (socket.sent.length > sentBefore ? socket.sent.at(-1) : undefined),
-    "timeout failure",
-  );
-  const result = decodeDesktopBrowserMessage(encodedResult, "1.2", "1.0") as HostResultMessage;
-  assert.equal(result.payload.accepted, true);
+  const accepted = decodeDesktopBrowserMessage(
+    await waitFor(() => (socket.sent.length > sentBefore ? socket.sent[sentBefore] : undefined), "timeout accepted"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
+  const result = decodeDesktopBrowserMessage(
+    await waitFor(
+      () => (socket.sent.length > sentBefore + 1 ? socket.sent[sentBefore + 1] : undefined),
+      "timeout failure",
+    ),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(accepted.payload.operationId, authority.operationId);
   assert.equal(result.payload.outcome, "unknown");
   assert.equal(spawnCalls, 1);
   assert.equal(existsSync(join(dir, "sessions")), false);
@@ -1154,12 +1223,17 @@ test("disconnect after fencing persists unknown and a restarted host never retri
 
   const second = await connectOperationHost({ dataDir: dir, sessionRunner });
   second.socket.message(JSON.stringify(invocation));
+  const accepted = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[2], "unknown replay accepted"),
+    "1.2",
+    "1.0",
+  ) as HostAcceptedMessage;
   const replay = decodeDesktopBrowserMessage(
-    await waitFor(() => second.socket.sent[2], "unknown replay result"),
+    await waitFor(() => second.socket.sent[3], "unknown replay result"),
     "1.2",
     "1.0",
   ) as HostResultMessage;
-  assert.equal(replay.payload.accepted, true);
+  assert.equal(accepted.payload.operationId, authority.operationId);
   assert.equal(replay.payload.outcome, "unknown");
   assert.equal(spawnCalls, 1);
   second.socket.close(1000, "done");
