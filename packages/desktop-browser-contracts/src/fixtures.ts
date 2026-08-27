@@ -77,6 +77,7 @@ export const desktopBrowserSessionStartCompletedResultFixture = {
   protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   kind: "host.result",
   payload: {
+    dispatchId: desktopBrowserRelayInvocationFixture.payload.dispatchId,
     operationId: desktopBrowserSessionStartAuthorityFixture.operationId,
     outcome: "completed",
     resultHash: "sha256:result-1",
