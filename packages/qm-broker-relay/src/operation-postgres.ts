@@ -1,9 +1,16 @@
 import pg, { type PoolClient } from "pg";
 import { createHash } from "node:crypto";
-import type { HostAcceptedMessage, HostResultMessage, RelayInvocationMessage } from "qm-desktop-browser-contracts";
+import type {
+  HostAcceptedMessage,
+  HostLocalStopReceiptMessage,
+  HostResultMessage,
+  RelayInvocationMessage,
+} from "qm-desktop-browser-contracts";
 import type {
   DesktopBrowserRelayAcceptedEvidence,
   DesktopBrowserRelayCallbackOutboxEntry,
+  DesktopBrowserRelayLocalStopCallbackEntry,
+  DesktopBrowserRelayLocalStopEvidence,
   DesktopBrowserRelayOperationCheckpoint,
   DesktopBrowserRelayOperationStore,
   DesktopBrowserRelayTerminalEvidence,
@@ -49,6 +56,13 @@ function callback(row: Record<string, unknown>): DesktopBrowserRelayCallbackOutb
   };
 }
 
+function localStopCategory(effectClass: unknown): HostLocalStopReceiptMessage["payload"]["operationCategory"] {
+  if (effectClass === "observation") return "observation";
+  if (effectClass === "cleanup") return "session_cleanup";
+  if (effectClass === "local_effect") return "session_start";
+  return "browser_effect";
+}
+
 async function transaction<T>(pool: pg.Pool, run: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
@@ -83,8 +97,26 @@ function schemaStatements(schema: string): string[] {
       operation_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, task_id TEXT NOT NULL,
       protocol_version TEXT NOT NULL, operation_sequence BIGINT NOT NULL, lease_version BIGINT NOT NULL,
       lease_id TEXT NOT NULL, request_hash TEXT NOT NULL, dispatch_id TEXT, state TEXT NOT NULL,
-      result_hash TEXT, terminal_result JSONB, revoked_at BIGINT
+      result_hash TEXT, terminal_result JSONB, revoked_at BIGINT,
+      device_id TEXT, browser_instance_id TEXT, effect_class TEXT
     )`,
+    `ALTER TABLE ${schema}.operations ADD COLUMN IF NOT EXISTS device_id TEXT`,
+    `ALTER TABLE ${schema}.operations ADD COLUMN IF NOT EXISTS browser_instance_id TEXT`,
+    `ALTER TABLE ${schema}.operations ADD COLUMN IF NOT EXISTS effect_class TEXT`,
+    `UPDATE ${schema}.operations o SET
+       device_id=COALESCE(o.device_id, c.invocation->'payload'->'authority'->>'deviceId'),
+       browser_instance_id=COALESCE(o.browser_instance_id, c.invocation->'payload'->'authority'->>'browserInstanceId'),
+       effect_class=COALESCE(o.effect_class, c.invocation->'payload'->'authority'->>'effectClass')
+     FROM ${schema}.operation_checkpoints c WHERE c.operation_id=o.operation_id
+       AND (o.device_id IS NULL OR o.browser_instance_id IS NULL OR o.effect_class IS NULL)`,
+     `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM ${schema}.operations WHERE device_id IS NULL OR browser_instance_id IS NULL OR effect_class IS NULL)
+       THEN RAISE EXCEPTION 'Relay operation authority migration requires draining or archiving legacy terminal operations';
+       END IF;
+      END $$`,
+     `ALTER TABLE ${schema}.operations ALTER COLUMN device_id SET NOT NULL`,
+     `ALTER TABLE ${schema}.operations ALTER COLUMN browser_instance_id SET NOT NULL`,
+     `ALTER TABLE ${schema}.operations ALTER COLUMN effect_class SET NOT NULL`,
     `CREATE TABLE IF NOT EXISTS ${schema}.accepted_evidence(
       operation_id TEXT NOT NULL, dispatch_id TEXT NOT NULL, protocol_version TEXT NOT NULL,
       request_hash TEXT NOT NULL, accepted_at BIGINT NOT NULL, PRIMARY KEY(operation_id, dispatch_id)
@@ -103,6 +135,18 @@ function schemaStatements(schema: string): string[] {
     `CREATE TABLE IF NOT EXISTS ${schema}.core_request_nonces(
       nonce TEXT PRIMARY KEY, expires_at BIGINT NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS ${schema}.local_stop_evidence(
+      receipt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+      operation_id TEXT NOT NULL, message JSONB NOT NULL, received_at BIGINT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS ${schema}.local_stop_callback_outbox(
+      receipt_id TEXT PRIMARY KEY, message JSONB NOT NULL, created_at BIGINT NOT NULL, delivered_at BIGINT,
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at BIGINT NOT NULL, claim_owner TEXT,
+      claim_expires_at BIGINT, dead_lettered_at BIGINT
+    )`,
+    `CREATE INDEX IF NOT EXISTS local_stop_callback_outbox_ready
+      ON ${schema}.local_stop_callback_outbox(next_attempt_at, created_at)
+      WHERE delivered_at IS NULL AND dead_lettered_at IS NULL`,
     `CREATE INDEX IF NOT EXISTS callback_outbox_ready ON ${schema}.callback_outbox(next_attempt_at, created_at)
       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL`,
   ];
@@ -186,8 +230,9 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
           }
         }
         await client.query(
-          `INSERT INTO ${schema}.operations(operation_id, attempt_id, task_id, protocol_version, operation_sequence, lease_version, lease_id, request_hash, state)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared')`,
+          `INSERT INTO ${schema}.operations(operation_id, attempt_id, task_id, protocol_version, operation_sequence,
+             lease_version, lease_id, request_hash, state, device_id, browser_instance_id, effect_class)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9,$10,$11)`,
           [
             authority.operationId,
             authority.attemptId,
@@ -197,6 +242,9 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
             authority.leaseVersion,
             authority.leaseId,
             invocation.payload.requestHash,
+            authority.deviceId,
+            authority.browserInstanceId,
+            authority.effectClass,
           ],
         );
         const at = now();
@@ -379,6 +427,151 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         return "revoked" as const;
       });
     },
+    async recordLocalStopReceipt(message, host) {
+      await ready;
+      return transaction(pool, async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [message.payload.receiptId]);
+        const operation = await getOperation(client, message.payload.operationId);
+        const expectedCategory = localStopCategory(operation.effect_class);
+        if (
+          operation.task_id !== message.payload.taskId ||
+          operation.attempt_id !== message.payload.attemptId ||
+          operation.device_id !== host.publicDeviceFingerprint ||
+          operation.browser_instance_id !== host.browserInstanceId ||
+          message.payload.operationCategory !== expectedCategory
+        ) {
+          throw new Error("desktop browser Local Stop Receipt does not match Relay operation authority");
+        }
+        const existing = await client.query(
+          `SELECT message FROM ${schema}.local_stop_evidence WHERE receipt_id=$1 FOR UPDATE`,
+          [message.payload.receiptId],
+        );
+        if (existing.rows[0]) {
+          const existingMessage = existing.rows[0].message as HostLocalStopReceiptMessage;
+          if (
+            existingMessage.payload.status === "requested" &&
+            message.payload.status === "canceled" &&
+            canonicalRelayJson({ ...existingMessage, payload: { ...existingMessage.payload, status: "canceled" } }) ===
+              canonicalRelayJson(message)
+          ) {
+            await client.query(`UPDATE ${schema}.local_stop_evidence SET message=$2::jsonb WHERE receipt_id=$1`, [
+              message.payload.receiptId,
+              JSON.stringify(message),
+            ]);
+            await client.query(
+              `UPDATE ${schema}.local_stop_callback_outbox SET message=$2::jsonb, delivered_at=NULL,
+                 claim_owner=NULL, claim_expires_at=NULL, next_attempt_at=$3, dead_lettered_at=NULL WHERE receipt_id=$1`,
+              [message.payload.receiptId, JSON.stringify(message), now()],
+            );
+            return "recorded" as const;
+          }
+          if (canonicalRelayJson(existing.rows[0].message) !== canonicalRelayJson(message)) {
+            throw new Error("desktop browser Local Stop Receipt identity already has different evidence");
+          }
+          return "existing" as const;
+        }
+        const at = now();
+        await client.query(
+          `INSERT INTO ${schema}.local_stop_evidence(receipt_id, task_id, attempt_id, operation_id, message, received_at)
+           VALUES($1,$2,$3,$4,$5::jsonb,$6)`,
+          [
+            message.payload.receiptId,
+            message.payload.taskId,
+            message.payload.attemptId,
+            message.payload.operationId,
+            JSON.stringify(message),
+            at,
+          ],
+        );
+        await client.query(
+          `INSERT INTO ${schema}.local_stop_callback_outbox(receipt_id, message, created_at, next_attempt_at)
+           VALUES($1,$2::jsonb,$3,$3)`,
+          [message.payload.receiptId, JSON.stringify(message), at],
+        );
+        return "recorded" as const;
+      });
+    },
+    async localStopReceipts() {
+      await ready;
+      const selected = await pool.query(
+        `SELECT message, received_at FROM ${schema}.local_stop_evidence ORDER BY received_at, receipt_id`,
+      );
+      return selected.rows.map(
+        (row): DesktopBrowserRelayLocalStopEvidence => ({
+          message: structuredClone(row.message),
+          receivedAt: Number(row.received_at),
+        }),
+      );
+    },
+    async pendingLocalStopCallbacks() {
+      await ready;
+      const selected = await pool.query(
+        `SELECT * FROM ${schema}.local_stop_callback_outbox
+         WHERE delivered_at IS NULL AND dead_lettered_at IS NULL ORDER BY created_at, receipt_id`,
+      );
+      return selected.rows.map(
+        (row): DesktopBrowserRelayLocalStopCallbackEntry => ({
+          receiptId: String(row.receipt_id),
+          message: structuredClone(row.message),
+          createdAt: Number(row.created_at),
+          deliveredAt: row.delivered_at == null ? null : Number(row.delivered_at),
+          attempts: Number(row.attempts),
+          nextAttemptAt: Number(row.next_attempt_at),
+          claimOwner: row.claim_owner == null ? null : String(row.claim_owner),
+          claimExpiresAt: row.claim_expires_at == null ? null : Number(row.claim_expires_at),
+          deadLetteredAt: row.dead_lettered_at == null ? null : Number(row.dead_lettered_at),
+        }),
+      );
+    },
+    async claimLocalStopCallbacks(owner, limit, leaseMs) {
+      await ready;
+      if (!owner || !Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+        throw new Error("desktop browser Local Stop callback claim bounds are invalid");
+      }
+      return transaction(pool, async (client) => {
+        const at = now();
+        const selected = await client.query(
+          `WITH candidates AS (
+             SELECT receipt_id FROM ${schema}.local_stop_callback_outbox
+             WHERE delivered_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= $1
+               AND (claim_expires_at IS NULL OR claim_expires_at <= $1)
+             ORDER BY created_at, receipt_id FOR UPDATE SKIP LOCKED LIMIT $2
+           )
+           UPDATE ${schema}.local_stop_callback_outbox o
+           SET claim_owner=$3, claim_expires_at=$4, attempts=o.attempts+1
+           FROM candidates c WHERE o.receipt_id=c.receipt_id RETURNING o.*`,
+          [at, limit, owner, at + leaseMs],
+        );
+        return selected.rows.map(
+          (row): DesktopBrowserRelayLocalStopCallbackEntry => ({
+            receiptId: String(row.receipt_id), message: structuredClone(row.message), createdAt: Number(row.created_at),
+            deliveredAt: row.delivered_at == null ? null : Number(row.delivered_at), attempts: Number(row.attempts),
+            nextAttemptAt: Number(row.next_attempt_at), claimOwner: row.claim_owner == null ? null : String(row.claim_owner),
+            claimExpiresAt: row.claim_expires_at == null ? null : Number(row.claim_expires_at),
+            deadLetteredAt: row.dead_lettered_at == null ? null : Number(row.dead_lettered_at),
+          }),
+        );
+      });
+    },
+    async releaseLocalStopCallback(receiptId, owner, status, retryAt, deadLetter) {
+      await ready;
+      const updated = await pool.query(
+        `UPDATE ${schema}.local_stop_callback_outbox SET claim_owner=NULL, claim_expires_at=NULL, next_attempt_at=$4,
+         dead_lettered_at=CASE WHEN $5 THEN $6 ELSE dead_lettered_at END
+         WHERE receipt_id=$1 AND claim_owner=$2 AND message->'payload'->>'status'=$3`,
+        [receiptId, owner, status, retryAt, deadLetter, now()],
+      );
+      return (updated.rowCount ?? 0) === 1;
+    },
+    async markLocalStopCallbackDelivered(receiptId, owner, status) {
+      await ready;
+      const updated = await pool.query(
+        `UPDATE ${schema}.local_stop_callback_outbox SET delivered_at=$4, claim_owner=NULL, claim_expires_at=NULL
+         WHERE receipt_id=$1 AND claim_owner=$2 AND delivered_at IS NULL AND message->'payload'->>'status'=$3`,
+        [receiptId, owner, status, now()],
+      );
+      return (updated.rowCount ?? 0) === 1;
+    },
     async recordTerminal(message) {
       await ready;
       return transaction(pool, async (client) => {
@@ -456,6 +649,37 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         attemptId,
       ]);
       return selected.rows[0] ? checkpoint(selected.rows[0] as Record<string, unknown>) : null;
+    },
+    async attemptStatus(attemptId) {
+      await ready;
+      const selected = await pool.query(
+        `SELECT c.*, o.protocol_version, o.terminal_result,
+          a.dispatch_id AS accepted_dispatch_id, a.request_hash AS accepted_request_hash
+         FROM ${schema}.operation_checkpoints c
+         JOIN ${schema}.operations o ON o.operation_id=c.operation_id
+         LEFT JOIN ${schema}.accepted_evidence a ON a.operation_id=c.operation_id
+         WHERE c.attempt_id=$1 ORDER BY a.accepted_at DESC LIMIT 1`,
+        [attemptId],
+      );
+      const row = selected.rows[0] as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return {
+        checkpoint: checkpoint(row),
+        ...(row.accepted_dispatch_id == null
+          ? {}
+          : {
+              accepted: {
+                protocolVersion: String(row.protocol_version) as `${number}.${number}`,
+                kind: "host.accepted" as const,
+                payload: {
+                  operationId: String(row.operation_id),
+                  dispatchId: String(row.accepted_dispatch_id),
+                  requestHash: String(row.accepted_request_hash),
+                },
+              },
+            }),
+        ...(row.terminal_result == null ? {} : { result: structuredClone(row.terminal_result) as HostResultMessage }),
+      };
     },
     async acceptedEvidence() {
       await ready;

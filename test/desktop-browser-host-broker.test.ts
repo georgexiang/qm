@@ -416,7 +416,7 @@ async function connectOperationHost(input: {
       },
     }),
   );
-  await waitFor(() => (socket.sent.length === 2 ? true : undefined), "host challenge response");
+  await waitFor(() => (socket.sent.length >= 2 ? true : undefined), "host challenge response");
   return { socket, running };
 }
 
@@ -473,6 +473,55 @@ test("Ticket 10 local Companion Stop cancels the real Host operation and persist
 
   socket.close(1000, "done");
   await running;
+});
+
+test("Ticket 11 Host replays a Local Stop Receipt after reconnect until Relay acknowledgement", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-local-stop-replay-"));
+  const control = createHostBrokerLocalControl({
+    dataDir: dir,
+    processEpoch: 101,
+    now: () => 35_000,
+    createNonce: () => "receipt-replay-nonce",
+  });
+  control.beginOperation({
+    taskId: "task-receipt-replay",
+    attemptId: "attempt-receipt-replay",
+    operationId: "operation-receipt-replay",
+    category: "browser_effect",
+    startedAt: 34_000,
+    cancel: async () => {
+      throw new Error("Host crashed before cancellation confirmation");
+    },
+  });
+  const nonce = control.status(HOST_BROKER_COMPANION_ORIGIN).stopNonce!;
+  await assert.rejects(control.stop(HOST_BROKER_COMPANION_ORIGIN, nonce), /crashed/);
+  const receipt = listHostBrokerLocalStopReceipts(dir)[0]!;
+  assert.equal(receipt.status, "requested");
+  const sessionRunner: HostBrokerSessionRunner = { run: async () => ({ exitCode: 0, stdout: "{}", stderr: "" }) };
+
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner, protocolVersion: "1.3" });
+  const firstReceipt = decodeDesktopBrowserMessage(
+    await waitFor(() => first.socket.sent[2], "Local Stop Receipt first replay"),
+    "1.3",
+    "1.0",
+  );
+  assert.equal(firstReceipt.kind, "host.local-stop-receipt");
+  first.socket.close(1000, "reconnect");
+  await first.running;
+  assert.equal(listHostBrokerLocalStopReceipts(dir).length, 1);
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner, protocolVersion: "1.3" });
+  await waitFor(() => second.socket.sent[2], "Local Stop Receipt second replay");
+  second.socket.message(
+    JSON.stringify({
+      protocolVersion: "1.3",
+      kind: "relay.local-stop-ack",
+      payload: { receiptId: receipt.receiptId },
+    }),
+  );
+  await waitFor(() => (listHostBrokerLocalStopReceipts(dir).length === 0 ? true : undefined), "receipt acknowledgement");
+  second.socket.close(1000, "done");
+  await second.running;
 });
 
 test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered output", async () => {

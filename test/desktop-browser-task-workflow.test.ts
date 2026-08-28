@@ -9,6 +9,7 @@ import {
   computeDesktopBrowserRequestHash,
   type DesktopBrowserSessionStartAuthorityEnvelope,
   type HostAcceptedMessage,
+  type HostLocalStopReceiptMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import { createTurnMethods } from "../src/api/app-turn.ts";
@@ -16,6 +17,7 @@ import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/d
 import { createDesktopBrowserOperationCoordinator } from "../src/desktop-browser/operation-coordinator.ts";
 import { reconcileDesktopBrowserFinalizationAudits } from "../src/desktop-browser/finalization-audit.ts";
 import { reconcileDesktopBrowserStops } from "../src/desktop-browser/stop-delivery.ts";
+import { reconcileDesktopBrowserAttempts } from "../src/desktop-browser/attempt-reconciliation.ts";
 import { projectDesktopBrowserTaskActivity } from "../src/desktop-browser/task-activity.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
@@ -859,6 +861,195 @@ test("Ticket 08 persists Stop and Lease revoke before late result evidence witho
   assert.equal(recorded.status, "ok");
   assert.equal(recorded.task.status, "canceled_with_unknown_effects");
   assert.equal(recorded.task.operations?.at(-1)?.hostResult?.payload.resultHash, "sha256:late-stop-result");
+});
+
+test("Ticket 11 Local Stop Receipt terminalizes active work once and never rewrites an earlier outcome", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const active = readyTask("task-local-receipt-active", "operation-local-receipt-active");
+  active.execution!.hostAccepted = acceptedFor(active.execution!.operation, "dispatch-local-receipt-active");
+  const completed = readyTask("task-local-receipt-completed", "operation-local-receipt-completed");
+  completed.status = "completed";
+  completed.outcome = { outcome: "completed", summary: "Already complete", finalizedAt: 19_000 };
+  await backing.put(active.id, active);
+  await backing.put(completed.id, completed);
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 20_000 });
+  const receiptFor = (task: DesktopBrowserTask): HostLocalStopReceiptMessage => ({
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: `local-stop-42-${task.id}-20000`,
+      processEpoch: 42,
+      taskId: task.id,
+      attemptId: task.execution!.attemptId,
+      operationId: task.execution!.operation.authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  });
+
+  const activeReceipt = receiptFor(active);
+  activeReceipt.payload.status = "requested";
+  assert.equal((await store.consumeLocalStopReceipt(activeReceipt)).status, "ok");
+  const canceledReceipt = structuredClone(activeReceipt);
+  canceledReceipt.payload.status = "canceled";
+  assert.equal((await store.consumeLocalStopReceipt(canceledReceipt)).status, "ok");
+  const stopped = await store.get(active.id);
+  assert.equal(stopped?.status, "canceled_with_unknown_effects");
+  assert.equal(stopped?.localStopReceipts?.length, 1);
+  const lateResult: HostResultMessage = {
+    protocolVersion: "1.3",
+    kind: "host.result",
+    payload: {
+      dispatchId: "dispatch-local-receipt-active",
+      operationId: active.execution!.operation.authority.operationId,
+      outcome: "completed",
+      resultHash: "sha256:late-local-receipt-result",
+      result: {
+        session_id: "late-session",
+        browser_instance_id: "browser-primary",
+        agent_window_id: 99,
+      },
+    },
+  };
+  assert.equal((await store.consumeSessionStartResult(active.id, lateResult)).status, "ok");
+  const afterLateResult = await store.get(active.id);
+  assert.equal(afterLateResult?.status, "canceled_with_unknown_effects");
+  assert.match(afterLateResult?.auditWarnings?.at(-1) ?? "", /Late Host result recorded after terminal Task outcome/);
+
+  const completedReceipt = receiptFor(completed);
+  assert.equal((await store.consumeLocalStopReceipt(completedReceipt)).status, "ok");
+  const unchanged = await store.get(completed.id);
+  assert.equal(unchanged?.status, "completed");
+  assert.equal(unchanged?.outcome?.summary, "Already complete");
+  assert.deepEqual(unchanged?.auditWarnings, ["Local Stop arrived after terminal Task outcome"]);
+});
+
+test("Ticket 11 Core restart queries Relay for each nonterminal Attempt without rerunning work", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const first = readyTask("task-recovery-first", "operation-recovery-first");
+  const second = readyTask("task-recovery-second", "operation-recovery-second");
+  first.execution!.attemptStatus = "prepared";
+  first.execution!.hostResult = undefined;
+  second.execution!.attemptStatus = "prepared";
+  second.execution!.hostResult = undefined;
+  await backing.put(first.id, first);
+  await backing.put(second.id, second);
+  const restarted = createDesktopBrowserTaskStore(backing);
+  const queried: string[] = [];
+  const consumed: string[] = [];
+
+  await assert.rejects(
+    reconcileDesktopBrowserAttempts(
+      restarted,
+      {
+        async attemptStatus(attemptId) {
+          queried.push(attemptId);
+          if (attemptId === first.execution!.attemptId) throw new Error("Relay temporarily unavailable");
+          return {
+            checkpoint: { attemptId, operationId: second.execution!.operation.authority.operationId, state: "terminal" },
+            accepted: acceptedFor(second.execution!.operation, "dispatch-recovered"),
+            result: {
+              protocolVersion: "1.3",
+              kind: "host.result",
+              payload: {
+                dispatchId: "dispatch-recovered",
+                operationId: second.execution!.operation.authority.operationId,
+                outcome: "unknown",
+                resultHash: "sha256:recovered-unknown",
+              },
+            },
+          };
+        },
+      },
+      {
+        desktopBrowserConsumeSessionStartAccepted: async () => ({ status: "ok", task: second }),
+        desktopBrowserConsumeOperationAccepted: async () => ({ status: "ok", task: second }),
+        desktopBrowserConsumeRelayTerminalCallback: async (taskId) => {
+          consumed.push(taskId);
+          return { status: "ok" };
+        },
+      },
+    ),
+    /Attempt reconciliation failed/,
+  );
+
+  assert.deepEqual(queried.sort(), [first.execution!.attemptId, second.execution!.attemptId].sort());
+  assert.deepEqual(consumed, [second.id]);
+});
+
+test("Ticket 11 recovery queries a later operation after session start completed", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-recovery-operation", "operation-recovery-session-start");
+  const store = createDesktopBrowserTaskStore(backing, {
+    id: (() => {
+      const ids = ["operation-recovery-navigate", "nonce-recovery-navigate"];
+      return () => ids.shift()!;
+    })(),
+    now: () => 21_000,
+  });
+  await backing.put(task.id, task);
+  const prepared = await store.prepareOperation(
+    task.id,
+    buildDesktopBrowserNavigateArgv("https://example.test", task.browserSkillSessionId!),
+  );
+  assert.equal(prepared.status, "ok");
+  let operationAcceptances = 0;
+
+  await reconcileDesktopBrowserAttempts(
+    store,
+    {
+      async attemptStatus(attemptId) {
+        return {
+          checkpoint: { attemptId, operationId: prepared.operation.authority.operationId, state: "accepted" },
+          accepted: acceptedFor(prepared.operation, "dispatch-recovered-operation"),
+        };
+      },
+    },
+    {
+      desktopBrowserConsumeSessionStartAccepted: async () => assert.fail("must not use session-start acceptance"),
+      desktopBrowserConsumeOperationAccepted: async () => {
+        operationAcceptances += 1;
+        return { status: "ok", task };
+      },
+      desktopBrowserConsumeRelayTerminalCallback: async () => assert.fail("result is not terminal"),
+    },
+  );
+
+  assert.equal(operationAcceptances, 1);
+});
+
+test("Ticket 11 concurrent Local Stop Receipt and Core finalization preserve one terminal outcome", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-local-stop-cas", "operation-local-stop-cas");
+  task.browserSkillSessionStoppedAt = 19_000;
+  await backing.put(task.id, task);
+  const first = createDesktopBrowserTaskStore(backing, { now: () => 20_000 });
+  const second = createDesktopBrowserTaskStore(backing, { now: () => 20_001 });
+  const receipt: HostLocalStopReceiptMessage = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-concurrent-cas",
+      processEpoch: 42,
+      taskId: task.id,
+      attemptId: task.execution!.attemptId,
+      operationId: task.execution!.operation.authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  };
+
+  await Promise.all([
+    first.consumeLocalStopReceipt(receipt),
+    second.finalize(task.id, { outcome: "completed", summary: "Concurrent completion" }),
+  ]);
+
+  const settled = await first.get(task.id);
+  assert.ok(settled?.status === "completed" || settled?.status === "canceled_with_unknown_effects");
+  assert.equal(settled?.localStopReceipts?.length, 1);
+  if (settled?.status === "completed") assert.equal(settled.outcome?.summary, "Concurrent completion");
 });
 
 test("Ticket 08 Stop during initial Host acceptance records unknown effects", async () => {

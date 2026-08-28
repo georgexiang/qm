@@ -37,6 +37,7 @@ export interface DesktopBrowserRelayRuntimeConfig {
   supportedPolicyGrammarVersions: string[];
   maxSettledDispatchHistory: number;
   settledDispatchHistoryTtlMs: number;
+  callbackDeadLetterMs: number;
   shutdownDrainMs: number;
 }
 
@@ -119,6 +120,11 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
       env.QM_RELAY_SETTLED_DISPATCH_HISTORY_TTL_MS,
       300_000,
     ),
+    callbackDeadLetterMs: parsePositiveSafeInteger(
+      "QM_RELAY_CALLBACK_DEAD_LETTER_MS",
+      env.QM_RELAY_CALLBACK_DEAD_LETTER_MS,
+      24 * 60 * 60_000,
+    ),
     shutdownDrainMs: parseInteger("QM_RELAY_SHUTDOWN_DRAIN_MS", env.QM_RELAY_SHUTDOWN_DRAIN_MS, 10_000),
   };
 }
@@ -135,7 +141,8 @@ async function requireOk(response: Response): Promise<void> {
 
 export async function deliverDesktopBrowserRelayCallbacks(
   store: DesktopBrowserRelayOperationStore,
-  config: Pick<DesktopBrowserRelayRuntimeConfig, "coreApiUrl" | "sourceAuthSecret">,
+  config: Pick<DesktopBrowserRelayRuntimeConfig, "coreApiUrl" | "sourceAuthSecret"> &
+    Partial<Pick<DesktopBrowserRelayRuntimeConfig, "callbackDeadLetterMs">>,
   fetchImpl: typeof fetch = fetch,
   options: { now?: () => number; owner?: string; signal?: AbortSignal } = {},
 ): Promise<void> {
@@ -159,7 +166,7 @@ export async function deliverDesktopBrowserRelayCallbacks(
       await store.markCallbackDelivered(entry.operationId, entry.callbackType, owner);
     } catch {
       const at = now();
-      const deadLetter = at >= entry.createdAt + 24 * 60 * 60_000;
+      const deadLetter = at >= entry.createdAt + (config.callbackDeadLetterMs ?? 24 * 60 * 60_000);
       const retryDelay = Math.min(5 * 60_000, 1_000 * 2 ** Math.min(entry.attempts - 1, 8));
       await store.releaseCallback(entry.operationId, entry.callbackType, owner, at + retryDelay, deadLetter);
       if (deadLetter) {
@@ -167,6 +174,38 @@ export async function deliverDesktopBrowserRelayCallbacks(
           `[qm-broker-relay] terminal callback dead-lettered operationId=${entry.operationId} attempts=${entry.attempts}`,
         );
       }
+    }
+  }
+}
+
+export async function deliverDesktopBrowserLocalStopCallbacks(
+  store: DesktopBrowserRelayOperationStore,
+  config: Pick<DesktopBrowserRelayRuntimeConfig, "coreApiUrl" | "sourceAuthSecret">,
+  fetchImpl: typeof fetch = fetch,
+  options: { now?: () => number; owner?: string; signal?: AbortSignal } = {},
+): Promise<void> {
+  const owner = options.owner ?? randomUUID();
+  const now = options.now ?? Date.now;
+  for (const entry of await store.claimLocalStopCallbacks(owner, 25, 30_000)) {
+    try {
+      const path = signedPath("/v1/desktop-browser/relay/callbacks/local-stop", config.sourceAuthSecret);
+      const body = JSON.stringify({ receipt: entry.message });
+      const response = await fetchImpl(`${config.coreApiUrl}${path}`, {
+        method: "POST",
+        headers: signedRequestHeaders(config.sourceAuthSecret, "POST", path, body, {
+          "content-type": "application/json",
+        }),
+        body,
+        signal: options.signal
+          ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)])
+          : AbortSignal.timeout(20_000),
+      });
+      await requireOk(response);
+      await store.markLocalStopCallbackDelivered(entry.receiptId, owner, entry.message.payload.status);
+    } catch {
+      const at = now();
+      const retryDelay = Math.min(5 * 60_000, 1_000 * 2 ** Math.min(entry.attempts - 1, 8));
+      await store.releaseLocalStopCallback(entry.receiptId, owner, entry.message.payload.status, at + retryDelay, false);
     }
   }
 }
@@ -298,7 +337,10 @@ export function createDesktopBrowserRelayRuntime(
   const callbackAbort = new AbortController();
   const deliverCallbacks = () => {
     callbackDelivery = callbackDelivery
-      .then(() => deliverDesktopBrowserRelayCallbacks(operationStore, config, fetch, { signal: callbackAbort.signal }))
+      .then(async () => {
+        await deliverDesktopBrowserRelayCallbacks(operationStore, config, fetch, { signal: callbackAbort.signal });
+        await deliverDesktopBrowserLocalStopCallbacks(operationStore, config, fetch, { signal: callbackAbort.signal });
+      })
       .catch(() => undefined);
   };
 

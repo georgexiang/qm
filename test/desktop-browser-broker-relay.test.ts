@@ -799,6 +799,58 @@ test("Ticket 08 retries Host closure after revocation persisted while the Device
   );
 });
 
+test("Ticket 11 Relay persists a Local Stop Receipt before acknowledging the Host", async () => {
+  const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => 25_000,
+  });
+  const { service, socket } = await createRegisteredTicket05Relay({
+    protocolVersion: "1.3",
+    operationStore,
+  });
+  const authority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    deviceId: service.snapshots()[0]!.publicDeviceFingerprint,
+    capabilitySet: {
+      ...desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet,
+      protocolVersion: "1.3" as const,
+    },
+  };
+  await operationStore.prepare({
+    protocolVersion: "1.3",
+    kind: "relay.invoke",
+    payload: {
+      dispatchId: desktopBrowserRelayInvocationFixture.payload.dispatchId,
+      requestHash: computeDesktopBrowserRequestHash(authority, "1.3", "1.0"),
+      authority,
+    },
+  });
+  const receipt = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-42-operation-1-20000",
+      processEpoch: 42,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  } as const;
+
+  socket.message(JSON.stringify(receipt));
+  await flushMessages();
+
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+    protocolVersion: "1.3",
+    kind: "relay.local-stop-ack",
+    payload: { receiptId: receipt.payload.receiptId },
+  });
+  assert.deepEqual(await operationStore.localStopReceipts(), [{ message: receipt, receivedAt: 25_000 }]);
+  await service.drain();
+});
+
 test("Ticket 08 busy cross-Task dispatch cannot replace the active revoke Lease", async () => {
   const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
   const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });

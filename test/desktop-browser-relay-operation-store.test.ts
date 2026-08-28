@@ -11,6 +11,7 @@ import {
   desktopBrowserSessionStartAcceptedFixture,
   desktopBrowserSessionStartCompletedResultFixture,
 } from "../packages/desktop-browser-contracts/src/fixtures.ts";
+import type { HostLocalStopReceiptMessage } from "qm-desktop-browser-contracts";
 
 test("Ticket 08 consumes Core request nonces atomically across Relay replicas", async () => {
   const backing = createMemoryDesktopBrowserRelayOperationBacking();
@@ -23,6 +24,80 @@ test("Ticket 08 consumes Core request nonces atomically across Relay replicas", 
   ]);
   assert.deepEqual(consumed.sort(), [false, true]);
   assert.equal(await second.consumeCoreNonce("shared-nonce", 602_000, 302_000), true);
+});
+
+test("Ticket 11 persists Local Stop Receipt evidence and callback exactly once", async () => {
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => 22_000,
+  });
+  await store.prepare(desktopBrowserRelayInvocationFixture);
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const receipt: HostLocalStopReceiptMessage = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-42-operation-1-20000",
+      processEpoch: 42,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  };
+
+  const host = { publicDeviceFingerprint: authority.deviceId, browserInstanceId: authority.browserInstanceId };
+  assert.equal(await store.recordLocalStopReceipt(receipt, host), "recorded");
+  assert.equal(await store.recordLocalStopReceipt(receipt, host), "existing");
+  assert.deepEqual(await store.localStopReceipts(), [{ message: receipt, receivedAt: 22_000 }]);
+  assert.deepEqual(await store.pendingLocalStopCallbacks(), [
+    {
+      receiptId: receipt.payload.receiptId,
+      message: receipt,
+      createdAt: 22_000,
+      deliveredAt: null,
+      attempts: 0,
+      nextAttemptAt: 22_000,
+      claimOwner: null,
+      claimExpiresAt: null,
+      deadLetteredAt: null,
+    },
+  ]);
+});
+
+test("Ticket 11 canceled receipt supersedes a claimed requested callback without being lost", async () => {
+  let now = 23_000;
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => now,
+  });
+  await store.prepare(desktopBrowserRelayInvocationFixture);
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const host = { publicDeviceFingerprint: authority.deviceId, browserInstanceId: authority.browserInstanceId };
+  const requested = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-monotonic",
+      processEpoch: 42,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "requested",
+    },
+  } as const;
+  await store.recordLocalStopReceipt(requested, host);
+  const [claimed] = await store.claimLocalStopCallbacks("old-worker", 1, 30_000);
+  assert.equal(claimed?.message.payload.status, "requested");
+  now += 1;
+  const canceled = { ...requested, payload: { ...requested.payload, status: "canceled" as const } };
+  assert.equal(await store.recordLocalStopReceipt(canceled, host), "recorded");
+  assert.equal(await store.markLocalStopCallbackDelivered(requested.payload.receiptId, "old-worker", "requested"), false);
+  const [pending] = await store.pendingLocalStopCallbacks();
+  assert.equal(pending?.message.payload.status, "canceled");
+  assert.equal(pending?.claimOwner, null);
 });
 
 test("Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal state, and callback outbox", async () => {

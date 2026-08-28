@@ -24,6 +24,7 @@ import {
   CoreHttpDesktopBrowserRelayRegistryAdapter,
   createDesktopBrowserRelayRuntime,
   deliverDesktopBrowserRelayCallbacks,
+  deliverDesktopBrowserLocalStopCallbacks,
   loadDesktopBrowserRelayConfig,
   waitForDesktopBrowserRelayShutdown,
 } from "../packages/qm-broker-relay/src/process.ts";
@@ -357,6 +358,14 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
     async revokeProjectedLease(input: unknown) {
       seen.push({ revoke: input });
     },
+    async projectedAttemptStatus(attemptId: string) {
+      seen.push({ attemptStatus: attemptId });
+      return {
+        checkpoint: { attemptId, operationId: desktopBrowserRelayInvocationFixture.payload.authority.operationId, state: "terminal" },
+        accepted: desktopBrowserSessionStartAcceptedFixture,
+        result: desktopBrowserSessionStartCompletedResultFixture,
+      };
+    },
     async drain() {},
   } as unknown as DesktopBrowserRelayService;
   const runtime = createDesktopBrowserRelayServer({
@@ -410,6 +419,11 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
       invocation: desktopBrowserRelayInvocationFixture,
     });
     assert.equal(result.kind, "not_accepted_or_unknown");
+    const attemptStatus = await dispatcher.attemptStatus(
+      desktopBrowserRelayInvocationFixture.payload.authority.attemptId,
+    );
+    assert.equal(attemptStatus?.checkpoint.state, "terminal");
+    assert.equal(attemptStatus?.result?.payload.resultHash, desktopBrowserSessionStartCompletedResultFixture.payload.resultHash);
     await dispatcher.revoke({
       publicDeviceFingerprint: "0123456789abcdef",
       browserInstanceId: "browser-primary",
@@ -428,6 +442,9 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
         publicDeviceFingerprint: "0123456789abcdef",
         browserInstanceId: "browser-primary",
         invocation: desktopBrowserRelayInvocationFixture,
+      },
+      {
+        attemptStatus: desktopBrowserRelayInvocationFixture.payload.authority.attemptId,
       },
       {
         revoke: {
@@ -544,6 +561,92 @@ test("Relay callback worker retains failures and acknowledges one signed termina
   );
   assert.equal(deliveries, 1);
   assert.deepEqual(await store.pendingCallbacks(), []);
+});
+
+test("Ticket 11 Relay retries and delivers one signed Local Stop callback", async () => {
+  let now = 30_000;
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => now,
+  });
+  await store.prepare(desktopBrowserRelayInvocationFixture);
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const receipt = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-42-operation-1-20000",
+      processEpoch: 42,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  } as const;
+  await store.recordLocalStopReceipt(receipt, {
+    publicDeviceFingerprint: authority.deviceId,
+    browserInstanceId: authority.browserInstanceId,
+  });
+  const config = { coreApiUrl: "https://core.example.test", sourceAuthSecret: "relay-source-auth-secret-for-tests-0001" };
+  await deliverDesktopBrowserLocalStopCallbacks(
+    store,
+    config,
+    async () => new Response("unavailable", { status: 503 }),
+    { now: () => now, owner: "local-stop-worker-1" },
+  );
+  assert.equal((await store.pendingLocalStopCallbacks()).length, 1);
+
+  now += 1_000;
+  await deliverDesktopBrowserLocalStopCallbacks(
+    store,
+    config,
+    async (url, init) => {
+      assert.equal(new URL(String(url)).pathname, "/v1/desktop-browser/relay/callbacks/local-stop");
+      assert.deepEqual(JSON.parse(String(init?.body)), { receipt });
+      return new Response(null, { status: 204 });
+    },
+    { now: () => now, owner: "local-stop-worker-2" },
+  );
+  assert.deepEqual(await store.pendingLocalStopCallbacks(), []);
+  assert.equal((await store.localStopReceipts()).length, 1);
+});
+
+test("Ticket 11 Local Stop callback remains replayable after a prolonged Core outage", async () => {
+  let now = 1;
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => now,
+  });
+  await store.prepare(desktopBrowserRelayInvocationFixture);
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  await store.recordLocalStopReceipt({
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-dead-letter",
+      processEpoch: 42,
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      operationCategory: "session_start",
+      requestedAt: 1,
+      status: "canceled",
+    },
+  }, {
+    publicDeviceFingerprint: authority.deviceId,
+    browserInstanceId: authority.browserInstanceId,
+  });
+  now += 24 * 60 * 60_000;
+
+  await deliverDesktopBrowserLocalStopCallbacks(
+    store,
+    { coreApiUrl: "https://core.example.test", sourceAuthSecret: "relay-source-auth-secret-for-tests-0001" },
+    async () => new Response("unavailable", { status: 503 }),
+    { now: () => now, owner: "local-stop-dead-letter-worker" },
+  );
+
+  assert.equal((await store.pendingLocalStopCallbacks()).length, 1);
+  assert.equal((await store.localStopReceipts()).length, 1);
 });
 
 test("Relay callback worker continues past poison entries and dead-letters after 24 hours", async () => {

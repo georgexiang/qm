@@ -190,6 +190,7 @@ import { reconcileDesktopBrowserFinalizationAudits } from "./desktop-browser/fin
 import { createDesktopBrowserOperationCoordinator } from "./desktop-browser/operation-coordinator.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "./desktop-browser/relay-dispatcher.ts";
 import { reconcileDesktopBrowserStops } from "./desktop-browser/stop-delivery.ts";
+import { reconcileDesktopBrowserAttempts } from "./desktop-browser/attempt-reconciliation.ts";
 import {
   createDesktopBrowserDeviceRegistry,
   type DesktopBrowserDeviceRegistry,
@@ -333,6 +334,7 @@ export interface BuiltApp {
   desktopBrowserTasks: DesktopBrowserTaskStore;
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   desktopBrowserStopReconciliation?: Sweeper;
+  desktopBrowserAttemptReconciliation?: Sweeper;
   sessionStateBus: SessionStateBus;
   runtime: Runtime;
   config: ScopedConfigStore;
@@ -1272,6 +1274,13 @@ export function buildApp(
     modelProviders: modelProviderAvailabilityFor(config.harness, providerKeys),
     runWaitMs: config.runWaitMs,
   });
+  const desktopBrowserAttemptReconciliation = desktopBrowserRelayControl
+    ? createSweeper(
+        () => reconcileDesktopBrowserAttempts(desktopBrowserTasks, desktopBrowserRelayControl, app),
+        30_000,
+        { label: "desktop browser Attempt reconciliation", immediate: true },
+      )
+    : undefined;
   const slackCore = createSlackCoreClient({
     app,
     config: configStore,
@@ -1518,6 +1527,7 @@ export function buildApp(
       reachDeniedNotifier?.start(config.insightsIntervalMs);
       wakeSweep.start();
       orphanedSignalSweeper.start();
+      desktopBrowserAttemptReconciliation?.start();
       drain.start();
     },
     async releaseInFlightRuns() {
@@ -1539,6 +1549,7 @@ export function buildApp(
       );
       await Promise.all(workers.map((w) => w.releaseInFlight()));
       desktopBrowserStopReconciliation?.stop();
+      desktopBrowserAttemptReconciliation?.stop();
       drain.stop();
       runs.close?.();
       void runSignals.close?.();
@@ -1563,6 +1574,7 @@ export function buildApp(
     desktopBrowserTasks,
     desktopBrowserDeviceRegistry,
     ...(desktopBrowserStopReconciliation ? { desktopBrowserStopReconciliation } : {}),
+    ...(desktopBrowserAttemptReconciliation ? { desktopBrowserAttemptReconciliation } : {}),
     sessionStateBus,
     runtime,
     config: configStore,

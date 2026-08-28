@@ -17,6 +17,7 @@ import {
   type DesktopBrowserSanitizedObservationResult,
   type DesktopBrowserSessionStartAuthorityEnvelope,
   type HostAcceptedMessage,
+  type HostLocalStopReceiptMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
 import type { DurableMap } from "../persistence/durable-map.ts";
@@ -135,6 +136,7 @@ export interface DesktopBrowserTask {
   stopIntent?: DesktopBrowserStopIntent;
   leaseRevocation?: DesktopBrowserLeaseRevocation;
   auditWarnings?: string[];
+  localStopReceipts?: HostLocalStopReceiptMessage[];
   browserSkillSessionId?: string;
   browserSkillSessionStoppedAt?: number;
   browserInstanceId?: string;
@@ -169,6 +171,9 @@ export interface DesktopBrowserTaskStore {
   markStopAudited(id: string): Promise<DesktopBrowserTask>;
   markStopRevocationDelivered(id: string): Promise<DesktopBrowserTask>;
   markContinuationRun(id: string, runId: string): Promise<DesktopBrowserTask>;
+  consumeLocalStopReceipt(
+    message: HostLocalStopReceiptMessage,
+  ): Promise<{ status: "ok"; task: DesktopBrowserTask } | { status: "refused"; reason: string }>;
   prepareSessionStart(
     id: string,
   ): Promise<
@@ -239,6 +244,12 @@ function sameAccepted(left: HostAcceptedMessage, right: HostAcceptedMessage): bo
 
 function sameResult(left: HostResultMessage, right: HostResultMessage): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function lateResultWarnings(task: DesktopBrowserTask, operationId: string): string[] | undefined {
+  if (task.status === "waiting_for_broker" && task.outcome === undefined) return task.auditWarnings;
+  const warning = `Late Host result recorded after terminal Task outcome for operation ${operationId}`;
+  return task.auditWarnings?.includes(warning) ? task.auditWarnings : [...(task.auditWarnings ?? []), warning];
 }
 
 function operationEffectClass(argv: DesktopBrowserPhaseFArgv): DesktopBrowserEffectClass {
@@ -457,6 +468,64 @@ export function createDesktopBrowserTaskStore(
         throw new Error("Desktop Browser Task Continue Run could not be recorded");
       }
       return copy(task);
+    },
+    async consumeLocalStopReceipt(message) {
+      if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
+      let recorded: DesktopBrowserTask | null = null;
+      let refusal: string | null = null;
+      await backing.update(message.payload.taskId, (task) => {
+        const operation =
+          task.execution?.operation.authority.operationId === message.payload.operationId
+            ? task.execution.operation.authority
+            : task.operations?.find(
+                (entry) => entry.operation.authority.operationId === message.payload.operationId,
+              )?.operation.authority;
+        if (
+          !operation ||
+          operation.attemptId !== message.payload.attemptId ||
+          operation.taskId !== message.payload.taskId
+        ) {
+          refusal = "Desktop Browser Local Stop Receipt does not match Task authority";
+          return task;
+        }
+        const existing = task.localStopReceipts?.find(
+          (entry) => entry.payload.receiptId === message.payload.receiptId,
+        );
+        if (existing) {
+          if (
+            existing.payload.status === "requested" &&
+            message.payload.status === "canceled" &&
+            JSON.stringify({ ...existing, payload: { ...existing.payload, status: "canceled" } }) ===
+              JSON.stringify(message)
+          ) {
+            const localStopReceipts = [...task.localStopReceipts!];
+            localStopReceipts[localStopReceipts.indexOf(existing)] = structuredClone(message);
+            recorded = { ...task, localStopReceipts, updatedAt: now() };
+            return recorded;
+          }
+          if (JSON.stringify(existing) !== JSON.stringify(message)) {
+            refusal = "Desktop Browser Local Stop Receipt identity already has different evidence";
+            return task;
+          }
+          recorded = task;
+          return task;
+        }
+        const terminal = task.status !== "waiting_for_broker" || task.outcome !== undefined;
+        const next: DesktopBrowserTask = {
+          ...task,
+          ...(!terminal ? { status: "canceled_with_unknown_effects" as const } : {}),
+          localStopReceipts: [...(task.localStopReceipts ?? []), structuredClone(message)],
+          ...(terminal
+            ? { auditWarnings: [...(task.auditWarnings ?? []), "Local Stop arrived after terminal Task outcome"] }
+            : {}),
+          updatedAt: now(),
+        };
+        recorded = next;
+        return next;
+      });
+      if (refusal) return { status: "refused", reason: refusal };
+      if (!recorded) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return { status: "ok", task: copy(recorded) };
     },
     async prepareSessionStart(taskId) {
       const current = await backing.get(taskId);
@@ -716,6 +785,7 @@ export function createDesktopBrowserTaskStore(
               resultRecordedAt: at,
               hostResult: structuredClone(result),
             },
+            auditWarnings: lateResultWarnings(task, result.payload.operationId),
             updatedAt: at,
           };
           return bound;
@@ -747,6 +817,7 @@ export function createDesktopBrowserTaskStore(
               resultRecordedAt: at,
               hostResult: structuredClone(result),
             },
+            auditWarnings: lateResultWarnings(task, result.payload.operationId),
             updatedAt: at,
           };
           return bound;
@@ -1039,14 +1110,7 @@ export function createDesktopBrowserTaskStore(
           operations,
           ...(observation ? { latestObservation: structuredClone(observation) } : {}),
           ...(stopped ? { browserSkillSessionStoppedAt: at } : {}),
-          ...(task.stopIntent
-            ? {
-                auditWarnings: [
-                  ...(task.auditWarnings ?? []),
-                  `Late Host result recorded after Stop for operation ${resultPayload.operationId}`,
-                ],
-              }
-            : {}),
+          auditWarnings: lateResultWarnings(task, resultPayload.operationId),
           updatedAt: at,
         };
         return recorded;

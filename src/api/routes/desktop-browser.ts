@@ -3,9 +3,11 @@ import { isObj } from "./shared.ts";
 import { type ApiCtx, type Route } from "./route.ts";
 import {
   parseDesktopBrowserRelayConnectionPublishRequest,
+  decodeDesktopBrowserMessage,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRelayConnectionProjection,
   type HostAcceptedMessage,
+  type HostLocalStopReceiptMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
 
@@ -199,6 +201,25 @@ async function consumeRelayTerminalCallback(ctx: ApiCtx): Promise<void> {
   ctx.res.end();
 }
 
+async function consumeLocalStopCallback(ctx: ApiCtx): Promise<void> {
+  const body = isObj(ctx.body) ? ctx.body : {};
+  if (!isObj(body.receipt)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "receipt required" });
+  }
+  let receipt: HostLocalStopReceiptMessage;
+  try {
+    const decoded = decodeDesktopBrowserMessage(JSON.stringify(body.receipt), String(body.receipt.protocolVersion));
+    if (decoded.kind !== "host.local-stop-receipt") throw new Error("unexpected receipt kind");
+    receipt = decoded;
+  } catch {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "valid receipt required" });
+  }
+  const result = await ctx.app.desktopBrowserConsumeLocalStopReceipt(receipt);
+  if (result.status === "refused") return sendJson(ctx.res, 409, { error: "conflict", message: result.reason });
+  ctx.res.statusCode = 204;
+  ctx.res.end();
+}
+
 export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "source", handle: relayReady },
   {
@@ -206,6 +227,12 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/desktop-browser/relay/callbacks/terminal",
     auth: "source",
     handle: consumeRelayTerminalCallback,
+  },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/relay/callbacks/local-stop",
+    auth: "source",
+    handle: consumeLocalStopCallback,
   },
   { method: "POST", path: "/v1/desktop-browser/tasks/:id/actions", auth: "source", handle: taskAction },
   {

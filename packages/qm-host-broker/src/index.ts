@@ -1,6 +1,8 @@
 import {
   createHostBrokerCompanionServer,
   createHostBrokerLocalControl,
+  deleteHostBrokerLocalStopReceipt,
+  listHostBrokerLocalStopReceipts,
   type HostBrokerLocalControl,
   type HostBrokerOperationCategory,
 } from "./companion-control.ts";
@@ -1868,6 +1870,7 @@ export class HostBrokerConnection {
     return new Promise<HostBrokerConnectionRunResult>((resolve, reject) => {
       let settled = false;
       let challenged = false;
+      const outstandingReceiptIds = new Set<string>();
       let negotiatedProtocolVersion: `${number}.${number}` | null = null;
       let negotiatedPolicyGrammarVersion: string | null = null;
       let handshakeComplete = false;
@@ -1913,6 +1916,20 @@ export class HostBrokerConnection {
             payload?: { policyGrammarVersion?: unknown };
           };
           if (challenged) {
+            if (rawEnvelope.kind === "relay.local-stop-ack") {
+              if (!negotiatedProtocolVersion || !this.dataDir) {
+                throw new Error("Local Stop acknowledgement arrived before Host registration");
+              }
+              const acknowledgement = decodeDesktopBrowserMessage(raw, negotiatedProtocolVersion);
+              if (acknowledgement.kind !== "relay.local-stop-ack") {
+                throw new Error("invalid Local Stop acknowledgement");
+              }
+              if (!outstandingReceiptIds.delete(acknowledgement.payload.receiptId)) {
+                throw new Error("Local Stop acknowledgement does not match an outstanding receipt");
+              }
+              deleteHostBrokerLocalStopReceipt(this.dataDir, acknowledgement.payload.receiptId);
+              return;
+            }
             if (rawEnvelope.kind === "relay.invoke") {
               if (!negotiatedProtocolVersion) {
                 throw new Error("relay invoke arrived without an exact negotiated protocol version");
@@ -1972,6 +1989,27 @@ export class HostBrokerConnection {
             clearHandshakeTimeout();
             this.snapshotState.brokerStatus = "ready";
             this.emitState();
+            if (this.dataDir) {
+              for (const receipt of listHostBrokerLocalStopReceipts(this.dataDir)) {
+                outstandingReceiptIds.add(receipt.receiptId);
+                socket.send(
+                  encodeDesktopBrowserMessage({
+                    protocolVersion: message.protocolVersion,
+                    kind: "host.local-stop-receipt",
+                    payload: {
+                      receiptId: receipt.receiptId,
+                      processEpoch: receipt.processEpoch,
+                      taskId: receipt.taskId,
+                      attemptId: receipt.attemptId,
+                      operationId: receipt.operationId,
+                      operationCategory: receipt.operationCategory,
+                      requestedAt: receipt.requestedAt,
+                      status: receipt.status,
+                    },
+                  }),
+                );
+              }
+            }
             return;
           }
           if (message.kind === "relay.invoke")

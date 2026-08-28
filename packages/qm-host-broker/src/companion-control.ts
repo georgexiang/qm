@@ -161,6 +161,25 @@ export function listHostBrokerLocalStopReceipts(dataDir: string): HostBrokerLoca
     });
 }
 
+export function deleteHostBrokerLocalStopReceipt(dataDir: string, receiptId: string): void {
+  const path = receiptPath(dataDir, receiptId);
+  if (!existsSync(path)) return;
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const fileStat = fstatSync(fd);
+    if (!fileStat.isFile() || (fileStat.mode & 0o177) !== 0) throw new Error("local Stop receipt file is unsafe");
+  } finally {
+    closeSync(fd);
+  }
+  unlinkSync(path);
+  const directoryFd = openSync(join(dataDir, LOCAL_STOP_RECEIPTS_DIR), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    fsyncSync(directoryFd);
+  } finally {
+    closeSync(directoryFd);
+  }
+}
+
 export function createHostBrokerLocalControl(options: {
   dataDir: string;
   processEpoch: number;

@@ -65,6 +65,7 @@ export function createTurnMethods(
   | "desktopBrowserConsumeOperationAccepted"
   | "desktopBrowserConsumeOperationResult"
   | "desktopBrowserConsumeRelayTerminalCallback"
+  | "desktopBrowserConsumeLocalStopReceipt"
   | "desktopBrowserFinalizeTask"
   | "getApproval"
   | "subscribeSessionStates"
@@ -1020,14 +1021,20 @@ export function createTurnMethods(
       if (acceptedResult.status === "refused") return acceptedResult;
       let terminalResult;
       try {
-        terminalResult = sessionStart
-          ? await deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
-              taskId,
-              task.execution!.operation,
-              (currentAuthority) =>
-                deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority),
-            )
-          : await deps.desktopBrowserTasks.consumeOperationResult(taskId, result);
+        if (sessionStart) {
+          const validated = await deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+            taskId,
+            task.execution!.operation,
+            (currentAuthority) =>
+              deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority),
+          );
+          terminalResult =
+            validated.status === "refused"
+              ? await deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, validated)
+              : validated;
+        } else {
+          terminalResult = await deps.desktopBrowserTasks.consumeOperationResult(taskId, result);
+        }
       } catch (error) {
         if (sessionStart) await deps.desktopBrowserDeviceRegistry.quarantineDevice?.(taskId);
         throw error;
@@ -1037,6 +1044,21 @@ export function createTurnMethods(
         if (result.payload.outcome === "failed") await deps.desktopBrowserDeviceRegistry.releaseDevice(taskId);
         else await deps.desktopBrowserDeviceRegistry.quarantineDevice?.(taskId);
       }
+      return { status: "ok" };
+    },
+
+    async desktopBrowserConsumeLocalStopReceipt(receipt) {
+      const recorded = await deps.desktopBrowserTasks.consumeLocalStopReceipt(receipt);
+      if (recorded.status === "refused") return recorded;
+      await deps.desktopBrowserDeviceRegistry.quarantineDevice?.(recorded.task.id);
+      await deps.auditLog.recordOnce?.(`desktop-browser-local-stop:${receipt.payload.receiptId}`, {
+        at: receipt.payload.requestedAt,
+        principalId: "local-operator",
+        action: "desktop_browser.task.local_stopped",
+        resource: recorded.task.id,
+        scopeLabel: projectScopeId(recorded.task.projectId),
+        status: recorded.task.status,
+      });
       return { status: "ok" };
     },
 

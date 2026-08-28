@@ -193,6 +193,28 @@ export function createDesktopBrowserRelayServer(
       }
       return;
     }
+    if (req.method === "POST" && pathname === "/v1/attempt-status" && options.coreAuthSecret) {
+      try {
+        const body = await readBody(req, 4 * 1024);
+        const nonce = url.searchParams.get("_sourceAuthNonce");
+        if (!nonce || !validCoreSignature(req, pathname + url.search, body, options.coreAuthSecret)) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const now = Date.now();
+        if (!(await options.service.consumeCoreNonce(nonce, now + 5 * 60_000, now))) {
+          sendJson(res, 409, { error: "replayed_request" });
+          return;
+        }
+        const parsed = JSON.parse(body) as { attemptId?: unknown };
+        if (typeof parsed.attemptId !== "string" || !parsed.attemptId) throw new Error("invalid Attempt status request");
+        const status = await options.service.projectedAttemptStatus(parsed.attemptId);
+        sendJson(res, status ? 200 : 404, status ?? { error: "not_found" });
+      } catch {
+        sendJson(res, 409, { error: "status_failed" });
+      }
+      return;
+    }
     res.statusCode = 404;
     res.end();
   });

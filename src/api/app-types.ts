@@ -347,6 +347,9 @@ export interface App {
     accepted: HostAcceptedMessage,
     result: HostResultMessage,
   ): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
+  desktopBrowserConsumeLocalStopReceipt(
+    receipt: import("qm-desktop-browser-contracts").HostLocalStopReceiptMessage,
+  ): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   desktopBrowserFinalizeTask(
     taskId: string,
     principalId: string,

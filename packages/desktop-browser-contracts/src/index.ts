@@ -217,6 +217,27 @@ export interface CompanionStatusMessage {
   };
 }
 
+export interface HostLocalStopReceiptMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "host.local-stop-receipt";
+  payload: {
+    receiptId: string;
+    processEpoch: number;
+    taskId: string;
+    attemptId: string;
+    operationId: string;
+    operationCategory: "session_start" | "browser_effect" | "observation" | "session_cleanup";
+    requestedAt: number;
+    status: "requested" | "canceled";
+  };
+}
+
+export interface RelayLocalStopAckMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "relay.local-stop-ack";
+  payload: { receiptId: string };
+}
+
 export interface DesktopBrowserRegistrationReservationTuple {
   registrationProtocolVersion: `${number}.${number}`;
   deploymentCanonicalId: string;
@@ -302,6 +323,8 @@ export type DesktopBrowserMessage =
   | RelayInvocationMessage
   | HostAcceptedMessage
   | HostResultMessage
+  | HostLocalStopReceiptMessage
+  | RelayLocalStopAckMessage
   | CompanionStatusMessage;
 
 type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
@@ -862,6 +885,35 @@ export const desktopBrowserMessageSchemas = {
       result: desktopBrowserSessionStartResultSchema,
       error: desktopBrowserHostFailureSchema,
     }),
+  ),
+  "host.local-stop-receipt": strictMessageSchema(
+    "host.local-stop-receipt",
+    strictObjectSchema(
+      [
+        "receiptId",
+        "processEpoch",
+        "taskId",
+        "attemptId",
+        "operationId",
+        "operationCategory",
+        "requestedAt",
+        "status",
+      ],
+      {
+        receiptId: canonicalLexicalStringSchema,
+        processEpoch: positiveIntegerSchema,
+        taskId: canonicalLexicalStringSchema,
+        attemptId: canonicalLexicalStringSchema,
+        operationId: canonicalLexicalStringSchema,
+        operationCategory: { enum: ["session_start", "browser_effect", "observation", "session_cleanup"] },
+        requestedAt: positiveIntegerSchema,
+        status: { enum: ["requested", "canceled"] },
+      },
+    ),
+  ),
+  "relay.local-stop-ack": strictMessageSchema(
+    "relay.local-stop-ack",
+    strictObjectSchema(["receiptId"], { receiptId: canonicalLexicalStringSchema }),
   ),
   "companion.status": messageSchema(
     "companion.status",

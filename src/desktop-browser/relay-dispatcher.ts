@@ -4,6 +4,11 @@ import { signedRequestHeaders } from "../auth/source-auth-sign.ts";
 import type { DesktopBrowserRelayDispatcher, DesktopBrowserRelayDispatchResult } from "./operation-coordinator.ts";
 
 export interface DesktopBrowserRelayControl extends DesktopBrowserRelayDispatcher {
+  attemptStatus(attemptId: string): Promise<{
+    checkpoint: { attemptId: string; operationId: string; state: string };
+    accepted?: import("qm-desktop-browser-contracts").HostAcceptedMessage;
+    result?: import("qm-desktop-browser-contracts").HostResultMessage;
+  } | null>;
   revoke(input: {
     publicDeviceFingerprint: string;
     browserInstanceId: string;
@@ -68,6 +73,55 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
   if (options.authSecret.length < 32)
     throw new Error("Desktop Browser Relay auth secret must be at least 32 characters");
   return {
+    async attemptStatus(attemptId) {
+      const body = JSON.stringify({ attemptId });
+      const path = `/v1/attempt-status?_sourceAuthNonce=${encodeURIComponent(randomUUID())}`;
+      const response = await fetchImpl(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: signedRequestHeaders(options.authSecret, "POST", path, body, { "content-type": "application/json" }),
+        body,
+        signal: AbortSignal.timeout(20_000),
+        redirect: "manual",
+      });
+      if (response.status === 404) return null;
+      if (!response.ok) throw new Error(`Desktop Browser Relay Attempt status failed with status ${response.status}`);
+      const raw: unknown = JSON.parse(await readBoundedResponse(response, 128 * 1024));
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Desktop Browser Relay returned invalid Attempt status");
+      const record = raw as Record<string, unknown>;
+      const checkpoint = record.checkpoint;
+      if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)) {
+        throw new Error("Desktop Browser Relay returned invalid Attempt checkpoint");
+      }
+      const checkpointRecord = checkpoint as Record<string, unknown>;
+      if (
+        checkpointRecord.attemptId !== attemptId ||
+        typeof checkpointRecord.operationId !== "string" ||
+        typeof checkpointRecord.state !== "string"
+      ) {
+        throw new Error("Desktop Browser Relay Attempt checkpoint does not match request");
+      }
+      let accepted;
+      if (record.accepted !== undefined) {
+        const protocolVersion = (record.accepted as { protocolVersion?: unknown })?.protocolVersion;
+        if (typeof protocolVersion !== "string") throw new Error("Desktop Browser Relay returned invalid acceptance");
+        const decoded = decodeDesktopBrowserMessage(JSON.stringify(record.accepted), protocolVersion);
+        if (decoded.kind !== "host.accepted" || decoded.payload.operationId !== checkpointRecord.operationId) {
+          throw new Error("Desktop Browser Relay acceptance does not match Attempt checkpoint");
+        }
+        accepted = decoded;
+      }
+      let result;
+      if (record.result !== undefined) {
+        const protocolVersion = (record.result as { protocolVersion?: unknown })?.protocolVersion;
+        if (typeof protocolVersion !== "string") throw new Error("Desktop Browser Relay returned invalid result");
+        const decoded = decodeDesktopBrowserMessage(JSON.stringify(record.result), protocolVersion);
+        if (decoded.kind !== "host.result" || decoded.payload.operationId !== checkpointRecord.operationId) {
+          throw new Error("Desktop Browser Relay result does not match Attempt checkpoint");
+        }
+        result = decoded;
+      }
+      return { checkpoint: checkpointRecord as { attemptId: string; operationId: string; state: string }, ...(accepted ? { accepted } : {}), ...(result ? { result } : {}) };
+    },
     async revoke(input) {
       const body = JSON.stringify(input);
       const path = `/v1/revocations?_sourceAuthNonce=${encodeURIComponent(randomUUID())}`;

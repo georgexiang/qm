@@ -624,6 +624,11 @@ export class DesktopBrowserRelayService {
     return this.operationStore.consumeCoreNonce(nonce, expiresAt, now);
   }
 
+  async projectedAttemptStatus(attemptId: string) {
+    if (!this.operationStore) throw new Error("desktop browser durable operation storage is unavailable");
+    return this.operationStore.attemptStatus(attemptId);
+  }
+
   async drain(): Promise<void> {
     this.draining = true;
     await Promise.all(
@@ -882,6 +887,25 @@ export class DesktopBrowserRelayService {
       connection.negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
     );
     if (message.kind === "relay.invoke") throw new Error("unexpected relay.invoke frame from host");
+    if (message.kind === "relay.local-stop-ack") {
+      throw new Error("unexpected relay.local-stop-ack frame from host");
+    }
+    if (message.kind === "host.local-stop-receipt") {
+      if (!this.operationStore) throw new Error("desktop browser durable Local Stop storage is unavailable");
+      const projection = this.snapshot(connection);
+      await this.operationStore.recordLocalStopReceipt(message, {
+        publicDeviceFingerprint: projection.publicDeviceFingerprint,
+        browserInstanceId: projection.browserInstanceId,
+      });
+      connection.socket.send(
+        encodeDesktopBrowserMessage({
+          protocolVersion: message.protocolVersion,
+          kind: "relay.local-stop-ack",
+          payload: { receiptId: message.payload.receiptId },
+        }),
+      );
+      return;
+    }
     if (message.kind === "host.accepted") {
       const pending = connection.pendingDispatch;
       if (!pending) throw new Error("unexpected host.accepted without an in-flight invocation");

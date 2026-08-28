@@ -1,4 +1,9 @@
-import type { HostAcceptedMessage, HostResultMessage, RelayInvocationMessage } from "qm-desktop-browser-contracts";
+import type {
+  HostAcceptedMessage,
+  HostLocalStopReceiptMessage,
+  HostResultMessage,
+  RelayInvocationMessage,
+} from "qm-desktop-browser-contracts";
 import { createHash } from "node:crypto";
 
 export interface DesktopBrowserRelayOperationCheckpoint {
@@ -46,6 +51,23 @@ export interface DesktopBrowserRelayCallbackOutboxEntry {
   deadLetteredAt: number | null;
 }
 
+export interface DesktopBrowserRelayLocalStopEvidence {
+  message: HostLocalStopReceiptMessage;
+  receivedAt: number;
+}
+
+export interface DesktopBrowserRelayLocalStopCallbackEntry {
+  receiptId: string;
+  message: HostLocalStopReceiptMessage;
+  createdAt: number;
+  deliveredAt: number | null;
+  attempts: number;
+  nextAttemptAt: number;
+  claimOwner: string | null;
+  claimExpiresAt: number | null;
+  deadLetteredAt: number | null;
+}
+
 interface DesktopBrowserRelayOperationRecord {
   attemptId: string;
   taskId: string;
@@ -54,6 +76,9 @@ interface DesktopBrowserRelayOperationRecord {
   operationSequence: number;
   leaseVersion: number;
   leaseId: string;
+  deviceId: string;
+  browserInstanceId: string;
+  effectClass: string;
   requestHash: string;
   dispatchId?: string;
   state: "prepared" | "accepted" | "terminal";
@@ -68,6 +93,8 @@ export interface DesktopBrowserRelayOperationState {
   acceptedEvidence: DesktopBrowserRelayAcceptedEvidence[];
   terminalEvidence: DesktopBrowserRelayTerminalEvidence[];
   callbackOutbox: DesktopBrowserRelayCallbackOutboxEntry[];
+  localStopEvidence?: DesktopBrowserRelayLocalStopEvidence[];
+  localStopCallbackOutbox?: DesktopBrowserRelayLocalStopCallbackEntry[];
   coreNonceExpirations?: Record<string, number>;
 }
 
@@ -93,7 +120,31 @@ export interface DesktopBrowserRelayOperationStore {
     leaseVersion: number;
   }): Promise<"revoked" | "already_revoked">;
   recordTerminal(message: HostResultMessage): Promise<DesktopBrowserRelayOperationCheckpoint>;
+  recordLocalStopReceipt(
+    message: HostLocalStopReceiptMessage,
+    host: { publicDeviceFingerprint: string; browserInstanceId: string },
+  ): Promise<"recorded" | "existing">;
+  localStopReceipts(): Promise<DesktopBrowserRelayLocalStopEvidence[]>;
+  pendingLocalStopCallbacks(): Promise<DesktopBrowserRelayLocalStopCallbackEntry[]>;
+  claimLocalStopCallbacks(owner: string, limit: number, leaseMs: number): Promise<DesktopBrowserRelayLocalStopCallbackEntry[]>;
+  releaseLocalStopCallback(
+    receiptId: string,
+    owner: string,
+    status: HostLocalStopReceiptMessage["payload"]["status"],
+    retryAt: number,
+    deadLetter: boolean,
+  ): Promise<boolean>;
+  markLocalStopCallbackDelivered(
+    receiptId: string,
+    owner: string,
+    status: HostLocalStopReceiptMessage["payload"]["status"],
+  ): Promise<boolean>;
   checkpoint(attemptId: string): Promise<DesktopBrowserRelayOperationCheckpoint | null>;
+  attemptStatus(attemptId: string): Promise<{
+    checkpoint: DesktopBrowserRelayOperationCheckpoint;
+    accepted?: HostAcceptedMessage;
+    result?: HostResultMessage;
+  } | null>;
   acceptedEvidence(): Promise<DesktopBrowserRelayAcceptedEvidence[]>;
   terminalEvidence(): Promise<DesktopBrowserRelayTerminalEvidence[]>;
   pendingCallbacks(): Promise<DesktopBrowserRelayCallbackOutboxEntry[]>;
@@ -165,6 +216,13 @@ function operationRecord(
   return operation;
 }
 
+function localStopCategory(effectClass: string): HostLocalStopReceiptMessage["payload"]["operationCategory"] {
+  if (effectClass === "observation") return "observation";
+  if (effectClass === "cleanup") return "session_cleanup";
+  if (effectClass === "local_effect") return "session_start";
+  return "browser_effect";
+}
+
 export function createDesktopBrowserRelayOperationStore(
   backing: DesktopBrowserRelayOperationBacking,
   options: { now?: () => number } = {},
@@ -217,6 +275,9 @@ export function createDesktopBrowserRelayOperationStore(
           operationSequence: authority.operationSequence,
           leaseVersion: authority.leaseVersion,
           leaseId: authority.leaseId,
+          deviceId: authority.deviceId,
+          browserInstanceId: authority.browserInstanceId,
+          effectClass: authority.effectClass,
           requestHash: invocation.payload.requestHash,
           state: "prepared",
         };
@@ -375,6 +436,121 @@ export function createDesktopBrowserRelayOperationStore(
         return "revoked";
       });
     },
+    async recordLocalStopReceipt(message, host) {
+      return backing.transaction((state) => {
+        const operation = operationRecord(state, message.payload.operationId);
+        const expectedCategory = localStopCategory(operation.effectClass);
+        if (
+          operation.taskId !== message.payload.taskId ||
+          operation.attemptId !== message.payload.attemptId ||
+          operation.deviceId !== host.publicDeviceFingerprint ||
+          operation.browserInstanceId !== host.browserInstanceId ||
+          message.payload.operationCategory !== expectedCategory
+        ) {
+          throw new Error("desktop browser Local Stop Receipt does not match Relay operation authority");
+        }
+        state.localStopEvidence ??= [];
+        state.localStopCallbackOutbox ??= [];
+        const existing = state.localStopEvidence.find(
+          (entry) => entry.message.payload.receiptId === message.payload.receiptId,
+        );
+        if (existing) {
+          if (
+            existing.message.payload.status === "requested" &&
+            message.payload.status === "canceled" &&
+            canonicalRelayJson({ ...existing.message, payload: { ...existing.message.payload, status: "canceled" } }) ===
+              canonicalRelayJson(message)
+          ) {
+            existing.message = copy(message);
+            const callback = state.localStopCallbackOutbox.find(
+              (entry) => entry.receiptId === message.payload.receiptId,
+            );
+            if (callback) callback.message = copy(message);
+            if (callback) {
+              callback.deliveredAt = null;
+              callback.claimOwner = null;
+              callback.claimExpiresAt = null;
+              callback.nextAttemptAt = now();
+              callback.deadLetteredAt = null;
+            }
+            return "recorded";
+          }
+          if (canonicalRelayJson(existing.message) !== canonicalRelayJson(message)) {
+            throw new Error("desktop browser Local Stop Receipt identity already has different evidence");
+          }
+          return "existing";
+        }
+        const at = now();
+        state.localStopEvidence.push({ message: copy(message), receivedAt: at });
+        state.localStopCallbackOutbox.push({
+          receiptId: message.payload.receiptId,
+          message: copy(message),
+          createdAt: at,
+          deliveredAt: null,
+          attempts: 0,
+          nextAttemptAt: at,
+          claimOwner: null,
+          claimExpiresAt: null,
+          deadLetteredAt: null,
+        });
+        return "recorded";
+      });
+    },
+    async localStopReceipts() {
+      return copy((await backing.snapshot()).localStopEvidence ?? []);
+    },
+    async pendingLocalStopCallbacks() {
+      return copy(
+        ((await backing.snapshot()).localStopCallbackOutbox ?? []).filter(
+          (entry) => entry.deliveredAt === null && entry.deadLetteredAt === null,
+        ),
+      );
+    },
+    async claimLocalStopCallbacks(owner, limit, leaseMs) {
+      if (!owner || !Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+        throw new Error("desktop browser Local Stop callback claim bounds are invalid");
+      }
+      return backing.transaction((state) => {
+        const at = now();
+        return (state.localStopCallbackOutbox ?? [])
+          .filter(
+            (entry) =>
+              entry.deliveredAt === null &&
+              entry.deadLetteredAt === null &&
+              entry.nextAttemptAt <= at &&
+              (entry.claimExpiresAt === null || entry.claimExpiresAt <= at),
+          )
+          .sort((left, right) => left.createdAt - right.createdAt || left.receiptId.localeCompare(right.receiptId))
+          .slice(0, limit)
+          .map((entry) => {
+            entry.claimOwner = owner;
+            entry.claimExpiresAt = at + leaseMs;
+            entry.attempts += 1;
+            return entry;
+          });
+      });
+    },
+    async releaseLocalStopCallback(receiptId, owner, status, retryAt, deadLetter) {
+      return backing.transaction((state) => {
+        const entry = (state.localStopCallbackOutbox ?? []).find((candidate) => candidate.receiptId === receiptId);
+        if (!entry || entry.claimOwner !== owner || entry.message.payload.status !== status) return false;
+        entry.claimOwner = null;
+        entry.claimExpiresAt = null;
+        entry.nextAttemptAt = retryAt;
+        if (deadLetter) entry.deadLetteredAt = now();
+        return true;
+      });
+    },
+    async markLocalStopCallbackDelivered(receiptId, owner, status) {
+      return backing.transaction((state) => {
+        const entry = (state.localStopCallbackOutbox ?? []).find((candidate) => candidate.receiptId === receiptId);
+        if (!entry || entry.claimOwner !== owner || entry.message.payload.status !== status) return false;
+        entry.deliveredAt = now();
+        entry.claimOwner = null;
+        entry.claimExpiresAt = null;
+        return true;
+      });
+    },
     async recordTerminal(message) {
       return backing.transaction((state) => {
         const operation = operationRecord(state, message.payload.operationId);
@@ -443,6 +619,30 @@ export function createDesktopBrowserRelayOperationStore(
     },
     async checkpoint(attemptId) {
       return copy((await backing.snapshot()).checkpoints[attemptId] ?? null);
+    },
+    async attemptStatus(attemptId) {
+      const state = await backing.snapshot();
+      const checkpoint = state.checkpoints[attemptId];
+      if (!checkpoint) return null;
+      const operation = state.operations[checkpoint.operationId];
+      const accepted = state.acceptedEvidence.find((entry) => entry.operationId === checkpoint.operationId);
+      return {
+        checkpoint: copy(checkpoint),
+        ...(accepted
+          ? {
+              accepted: {
+                protocolVersion: accepted.protocolVersion,
+                kind: "host.accepted" as const,
+                payload: {
+                  operationId: accepted.operationId,
+                  dispatchId: accepted.dispatchId,
+                  requestHash: accepted.requestHash,
+                },
+              },
+            }
+          : {}),
+        ...(operation?.terminalResult ? { result: copy(operation.terminalResult) } : {}),
+      };
     },
     async acceptedEvidence() {
       return copy((await backing.snapshot()).acceptedEvidence);

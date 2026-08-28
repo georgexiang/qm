@@ -15,6 +15,34 @@ import {
   type DesktopBrowserMessage,
 } from "qm-desktop-browser-contracts";
 
+test("Ticket 11 round-trips sanitized Local Stop Receipt delivery and acknowledgement", () => {
+  const receipt = {
+    protocolVersion: "1.3",
+    kind: "host.local-stop-receipt",
+    payload: {
+      receiptId: "local-stop-42-operation-1-20000",
+      processEpoch: 42,
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      operationId: "operation-1",
+      operationCategory: "browser_effect",
+      requestedAt: 20_000,
+      status: "canceled",
+    },
+  } as const;
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(receipt), "1.3", "1.0"), receipt);
+  const acknowledgement = {
+    protocolVersion: "1.3",
+    kind: "relay.local-stop-ack",
+    payload: { receiptId: receipt.payload.receiptId },
+  } as const;
+  assert.deepEqual(
+    decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(acknowledgement), "1.3", "1.0"),
+    acknowledgement,
+  );
+  assert.doesNotMatch(JSON.stringify(receipt), /actor|goal|url|page|devicePublicKey/iu);
+});
+
 test("Core advertises Ticket 06 before Ticket 05 and the legacy handshake protocol", () => {
   assert.deepEqual([...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS], ["1.3", "1.2", "1.0"]);
 });
