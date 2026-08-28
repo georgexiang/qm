@@ -30,6 +30,7 @@ import {
   projectDesktopBrowserTaskActivity,
 } from "../desktop-browser/task-activity.ts";
 import { persistDesktopBrowserFinalizationAudit } from "../desktop-browser/finalization-audit.ts";
+import { deliverDesktopBrowserStop } from "../desktop-browser/stop-delivery.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -626,11 +627,51 @@ export function createTurnMethods(
       return drive(run.id);
     },
 
-    async desktopBrowserTaskAction(taskId, principalId, authorityId, _action) {
+    async desktopBrowserTaskAction(taskId, principalId, authorityId, action) {
       const task = await deps.desktopBrowserTasks.get(taskId);
       const actor = deps.identity.classify(principalId);
-      if (!task || task.actorId !== actor.id || !constantTimeEqual(task.authorityId, authorityId)) {
+      const administrator = task ? await deps.admin?.canAdminister(actor, projectScopeId(task.projectId)) : false;
+      const taskActor = !!task && task.actorId === actor.id && constantTimeEqual(task.authorityId, authorityId);
+      if (!task || (!taskActor && !administrator)) {
         return { status: "refused", reason: "Desktop Browser Task not found" };
+      }
+      if (action === "stop") {
+        const stopped = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+          await deps.identity.refresh();
+          const currentTask = await deps.desktopBrowserTasks.get(task.id);
+          const currentActor = deps.identity.classify(actor.id);
+          const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+          const currentAdministrator = await deps.admin?.canAdminister(currentActor, projectScopeId(task.projectId));
+          if (
+            !currentTask ||
+            project.orgId !== orgIdOf() ||
+            String(project.updatedAt) !== currentTask.projectMembershipVersion ||
+            !deps.identity.isInternal(currentActor) ||
+            (!currentMembers.has(currentActor.id) && !currentAdministrator)
+          ) {
+            return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+          }
+          return deps.desktopBrowserTasks.requestStop(task.id, {
+            requestedBy: currentActor.id,
+            reason: currentAdministrator && currentTask.actorId !== currentActor.id ? "admin" : "webui",
+          });
+        });
+        if (!stopped) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+        if (stopped.status === "refused") return stopped;
+        if (!deps.desktopBrowserRevoke) {
+          return { status: "refused", reason: "Desktop Browser Stop recorded; Relay delivery not confirmed" };
+        }
+        try {
+          await deliverDesktopBrowserStop(deps.desktopBrowserTasks, deps.auditLog, deps.desktopBrowserRevoke, stopped.task);
+        } catch {
+          return { status: "refused", reason: "Desktop Browser Stop recorded; Relay delivery not confirmed" };
+        }
+        return {
+          status: "ok",
+          sessionId: stopped.task.sessionId,
+          reply: "Desktop Browser Stop accepted.",
+          desktopBrowserActivity: projectDesktopBrowserTaskActivity(stopped.task, deps.publicWebUrl, null),
+        };
       }
       if (task.status !== "waiting_for_broker") {
         return { status: "refused", reason: "Desktop Browser Task is no longer waiting" };

@@ -75,6 +75,18 @@ test("Desktop Browser actions bind the signed-in WebUI principal", async () => {
   assert.deepEqual(call.body, { principalId: "alice", authorityId: "turn-authority", action: "cancel" });
 });
 
+test("Desktop Browser Stop reaches Core with the signed-in WebUI principal", async () => {
+  const response = await fetch(`${base}/api/desktop-browser/tasks/task-stop/actions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "stop", authorityId: "turn-authority" }),
+  });
+
+  assert.equal(response.status, 200);
+  const call = calls.find((candidate) => candidate.url.includes("task-stop/actions"));
+  assert.deepEqual(call?.body, { principalId: "alice", authorityId: "turn-authority", action: "stop" });
+});
+
 test("Continue is not an action endpoint until Ticket 09 implements resume", async () => {
   const response = await fetch(`${base}/api/desktop-browser/tasks/task-1/actions`, {
     method: "POST",

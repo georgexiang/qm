@@ -18,14 +18,14 @@ async function taskAction(ctx: ApiCtx): Promise<void> {
   const principalId = ctx.capability?.actorId ?? requested;
   const authorityId = typeof body.authorityId === "string" ? body.authorityId : "";
   const action = body.action;
-  if (!principalId || !authorityId || action !== "cancel") {
+  if (!principalId || (action !== "cancel" && action !== "stop")) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
-      message: "principalId, authorityId, and cancel action required",
+      message: "principalId and cancel or stop action required",
     });
   }
   const result = await ctx.app.desktopBrowserTaskAction(ctx.params.id!, principalId, authorityId, action);
-  if (result.status === "refused") return sendJson(ctx.res, 404, { error: "not_found", message: result.reason });
+  if (result.status === "refused") return sendJson(ctx.res, 409, { error: "not_accepted", message: result.reason });
   return sendJson(ctx.res, 200, result);
 }
 

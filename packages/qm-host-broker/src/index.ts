@@ -1556,6 +1556,7 @@ export class HostBrokerConnection {
   private readonly browserSkillTimeoutMs: number;
   private readonly writeObserver: HostBrokerWriteObserver | null;
   private readonly activeSessionRuns = new Set<HostBrokerSessionRunHandle>();
+  private lastTaskId: string | null = null;
 
   constructor(options: HostBrokerConnectionOptions) {
     this.options = options;
@@ -1622,6 +1623,7 @@ export class HostBrokerConnection {
 
     const dataDir = this.dataDir!;
     const authority = message.payload.authority;
+    this.lastTaskId = authority.taskId;
     const acceptedMessage = accepted(
       input.protocolVersion,
       message.payload.dispatchId,
@@ -1837,6 +1839,7 @@ export class HostBrokerConnection {
       let handshakeComplete = false;
       let active = true;
       let locallyRequestedStop = false;
+      let revokedTaskHash: string | null = null;
       const invocationAbortController = new AbortController();
       const handshakeTimeout = scheduler.setTimeout(() => {
         finish(
@@ -1946,6 +1949,9 @@ export class HostBrokerConnection {
       };
       const closeListener = (event?: unknown) => {
         if (!active) return;
+        const close = closeEventDetails(event);
+        const revokeMatch = close.reason?.match(/^desktop browser Task Lease revoked:([a-f0-9]{64})$/);
+        revokedTaskHash = close.code === 1008 && revokeMatch ? revokeMatch[1]! : null;
         const classified = classifySocketClose(
           event,
           challenged,
@@ -2002,7 +2008,7 @@ export class HostBrokerConnection {
                 : "BrowserSkill session start cancelled",
             );
         const inFlightCancels = [...this.activeSessionRuns].map((handle) => handle.cancel(cancelReason));
-        void Promise.allSettled(inFlightCancels).then((cancelResults) => {
+        void Promise.allSettled(inFlightCancels).then(async (cancelResults) => {
           const cleanupFailure = cancelResults.find((entry) => entry.status === "rejected");
           if (cleanupFailure) {
             const reason = cleanupFailure.reason;
@@ -2012,6 +2018,32 @@ export class HostBrokerConnection {
               ),
             );
             return;
+          }
+          if (revokedTaskHash && this.dataDir) {
+            try {
+              const ownership = readJsonFile<HostSessionOwnershipRecord>(
+                join(this.dataDir, SESSIONS_DIR, `${revokedTaskHash}.json`),
+              );
+              if (ownership && createHash("sha256").update(ownership.taskId).digest("hex") === revokedTaskHash) {
+                const cleanup = normalizeSessionRunHandle(
+                  this.sessionRunner.run(
+                    this.browserSkillExecutable,
+                    ["--json", "session", "stop", ownership.sessionId],
+                    { shell: false, stdio: ["ignore", "pipe", "pipe"] },
+                    { timeoutMs: this.browserSkillTimeoutMs },
+                  ),
+                );
+                const cleanupResult = await cleanup.result;
+                if (cleanupResult.exitCode === 0) deleteSessionOwnership(this.dataDir, ownership.taskId);
+              }
+            } catch (cleanupError) {
+              reject(
+                new Error(
+                  `Host broker Lease-revocation cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+                ),
+              );
+              return;
+            }
           }
           if (error) reject(error);
           else resolve(result ?? { reason: "settled", ready: challenged });

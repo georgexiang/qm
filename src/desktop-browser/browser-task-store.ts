@@ -21,7 +21,8 @@ import {
 } from "qm-desktop-browser-contracts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 
-type DesktopBrowserTaskStatus = "waiting_for_broker" | "completed" | "failed" | "canceled";
+type DesktopBrowserTaskStatus =
+  "waiting_for_broker" | "completed" | "failed" | "canceled" | "canceled_with_unknown_effects";
 
 export interface DesktopBrowserSessionStartRegistrationSnapshot {
   deploymentCanonicalId: string;
@@ -74,6 +75,20 @@ export interface DesktopBrowserFinalizationAudit {
   status: "pending" | "recorded";
 }
 
+export interface DesktopBrowserStopIntent {
+  requestedBy: string;
+  reason: "webui" | "admin";
+  requestedAt: number;
+  auditStatus?: "pending" | "recorded";
+  revocationStatus?: "pending" | "delivered";
+}
+
+export interface DesktopBrowserLeaseRevocation {
+  leaseId: string;
+  leaseVersion: number;
+  revokedAt: number;
+}
+
 export interface DesktopBrowserTaskExecution {
   attemptId: string;
   attemptStatus:
@@ -117,6 +132,9 @@ export interface DesktopBrowserTask {
   latestObservation?: DesktopBrowserSanitizedObservationResult;
   outcome?: DesktopBrowserTaskOutcome;
   finalizationAudit?: DesktopBrowserFinalizationAudit;
+  stopIntent?: DesktopBrowserStopIntent;
+  leaseRevocation?: DesktopBrowserLeaseRevocation;
+  auditWarnings?: string[];
   browserSkillSessionId?: string;
   browserSkillSessionStoppedAt?: number;
   browserInstanceId?: string;
@@ -142,6 +160,13 @@ export interface DesktopBrowserTaskStore {
   list(): Promise<DesktopBrowserTask[]>;
   listForSession(sessionId: string): Promise<DesktopBrowserTask[]>;
   cancelWaiting(id: string): Promise<DesktopBrowserTask | null>;
+  requestStop(
+    id: string,
+    input: { requestedBy: string; reason: "webui" | "admin" },
+  ): Promise<{ status: "ok"; task: DesktopBrowserTask } | { status: "refused"; reason: string }>;
+  listPendingStops(): Promise<DesktopBrowserTask[]>;
+  markStopAudited(id: string): Promise<DesktopBrowserTask>;
+  markStopRevocationDelivered(id: string): Promise<DesktopBrowserTask>;
   prepareSessionStart(
     id: string,
   ): Promise<
@@ -341,6 +366,85 @@ export function createDesktopBrowserTaskStore(
         return { ...current, status: "canceled", updatedAt: now() };
       });
       return canceled && task ? copy(task) : null;
+    },
+    async requestStop(taskId, input) {
+      if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
+      let stopped: DesktopBrowserTask | null = null;
+      let refusal: string | null = null;
+      await backing.update(taskId, (task) => {
+        if (task.stopIntent && task.leaseRevocation) {
+          stopped = task;
+          return task;
+        }
+        if (task.status !== "waiting_for_broker" || task.outcome) {
+          refusal = "Desktop Browser Task already has a terminal outcome";
+          return task;
+        }
+        const at = now();
+        const latestOperation = task.operations?.at(-1);
+        const latestAuthority = latestOperation?.operation.authority ?? task.execution?.operation.authority;
+        if (!latestAuthority || !task.execution) {
+          refusal = "Desktop Browser Task has no active Lease";
+          return task;
+        }
+        const unknownEffects =
+          latestOperation !== undefined
+            ? latestOperation.status === "prepared" ||
+              latestOperation.status === "accepted" ||
+              latestOperation.status === "unknown" ||
+              latestOperation.status === "result_lost_retryable"
+            : task.execution.attemptStatus === "prepared" ||
+              task.execution.attemptStatus === "accepted_unknown" ||
+              task.execution.attemptStatus === "accepted_completed_unbound" ||
+              (!!task.execution.hostAccepted && !task.execution.hostResult);
+        stopped = {
+          ...task,
+          status: unknownEffects ? "canceled_with_unknown_effects" : "canceled",
+          stopIntent: {
+            requestedBy: input.requestedBy,
+            reason: input.reason,
+            requestedAt: at,
+            auditStatus: "pending",
+            revocationStatus: "pending",
+          },
+          leaseRevocation: {
+            leaseId: latestAuthority.leaseId,
+            leaseVersion: latestAuthority.leaseVersion + 1,
+            revokedAt: at,
+          },
+          updatedAt: at,
+        };
+        return stopped;
+      });
+      if (refusal) return { status: "refused", reason: refusal };
+      if (!stopped) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return { status: "ok", task: copy(stopped) };
+    },
+    async listPendingStops() {
+      return (await backing.all())
+        .filter(
+          (task) =>
+            task.stopIntent &&
+            (task.stopIntent.auditStatus !== "recorded" || task.stopIntent.revocationStatus !== "delivered"),
+        )
+        .sort((left, right) => left.stopIntent!.requestedAt - right.stopIntent!.requestedAt)
+        .map(copy);
+    },
+    async markStopAudited(taskId) {
+      const task = await backing.update?.(taskId, (current) => {
+        if (!current.stopIntent) return current;
+        return { ...current, stopIntent: { ...current.stopIntent, auditStatus: "recorded" }, updatedAt: now() };
+      });
+      if (!task?.stopIntent) throw new Error("Desktop Browser Task Stop intent not found");
+      return copy(task);
+    },
+    async markStopRevocationDelivered(taskId) {
+      const task = await backing.update?.(taskId, (current) => {
+        if (!current.stopIntent) return current;
+        return { ...current, stopIntent: { ...current.stopIntent, revocationStatus: "delivered" }, updatedAt: now() };
+      });
+      if (!task?.stopIntent) throw new Error("Desktop Browser Task Stop intent not found");
+      return copy(task);
     },
     async prepareSessionStart(taskId) {
       const current = await backing.get(taskId);
@@ -677,6 +781,9 @@ export function createDesktopBrowserTaskStore(
     async prepareOperation(taskId, rawArgv) {
       const current = await backing.get(taskId);
       if (!current) return { status: "refused", reason: "Desktop Browser Task not found" };
+      if (current.status !== "waiting_for_broker" || current.outcome) {
+        return { status: "refused", reason: "Desktop Browser Task already has a terminal outcome" };
+      }
       if (current.browserSkillSessionStoppedAt !== undefined) {
         return { status: "refused", reason: "Desktop Browser Task-owned session is stopped" };
       }
@@ -706,7 +813,7 @@ export function createDesktopBrowserTaskStore(
       let prepared: DesktopBrowserPreparedOperation | null = null;
       let refusal: string | null = null;
       await backing.update(taskId, (task) => {
-        if (task.outcome || task.status === "completed" || task.status === "failed" || task.status === "canceled") {
+        if (task.outcome || task.status !== "waiting_for_broker") {
           refusal = "Desktop Browser Task already has a terminal outcome";
           return task;
         }
@@ -920,6 +1027,14 @@ export function createDesktopBrowserTaskStore(
           operations,
           ...(observation ? { latestObservation: structuredClone(observation) } : {}),
           ...(stopped ? { browserSkillSessionStoppedAt: at } : {}),
+          ...(task.stopIntent
+            ? {
+                auditWarnings: [
+                  ...(task.auditWarnings ?? []),
+                  `Late Host result recorded after Stop for operation ${resultPayload.operationId}`,
+                ],
+              }
+            : {}),
           updatedAt: at,
         };
         return recorded;
@@ -977,7 +1092,7 @@ export function createDesktopBrowserTaskStore(
           finalized = task;
           return task;
         }
-        if (task.outcome || task.status === "completed" || task.status === "failed" || task.status === "canceled") {
+        if (task.outcome || task.status !== "waiting_for_broker") {
           refusal = "Desktop Browser Task already has a terminal outcome";
           return task;
         }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   computeDesktopBrowserRequestHash,
@@ -112,6 +112,7 @@ interface RelayConnectionState {
   negotiatedProtocolVersion: `${number}.${number}` | null;
   negotiatedPolicyGrammarVersion: string | null;
   projectionPublished: boolean;
+  currentLease: { taskId: string; attemptId: string; leaseId: string; leaseVersion: number } | null;
   pendingDispatch: {
     dispatchId: string;
     operationId: string;
@@ -311,6 +312,7 @@ export class DesktopBrowserRelayService {
       negotiatedProtocolVersion: null,
       negotiatedPolicyGrammarVersion: null,
       projectionPublished: false,
+      currentLease: null,
       pendingDispatch: null,
       lastSeenAt: this.options.clock.now(),
       closeReason: null,
@@ -430,6 +432,9 @@ export class DesktopBrowserRelayService {
       );
     }
     const authority = decoded.payload.authority;
+    if (Date.parse(authority.leaseExpiresAt) <= this.options.clock.now()) {
+      throw new Error("desktop browser invocation Lease expired before Relay delivery");
+    }
     if (authority.deploymentCanonicalId !== this.options.deploymentCanonicalId) {
       throw new Error("desktop browser invocation deployment does not match this relay");
     }
@@ -459,6 +464,9 @@ export class DesktopBrowserRelayService {
     ) {
       throw new Error("desktop browser invocation capability set does not match the registered host");
     }
+    if (connection.pendingDispatch) {
+      throw new Error("desktop browser host already has an in-flight invocation");
+    }
     if (this.operationStore) {
       const prepared = await this.operationStore.prepare(decoded);
       if (prepared.status === "existing" && prepared.checkpoint.deliveryState === "started") {
@@ -475,12 +483,15 @@ export class DesktopBrowserRelayService {
         };
       }
     }
+    connection.currentLease = {
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      leaseId: authority.leaseId,
+      leaseVersion: authority.leaseVersion,
+    };
     this.pruneDispatchTracking(this.options.clock.now());
     this.assertOperationRequestHash(authority.operationId, canonicalRequestHash);
     this.assertDispatchIdAvailable(decoded.payload.dispatchId);
-    if (connection.pendingDispatch) {
-      throw new Error("desktop browser host already has an in-flight invocation");
-    }
     return new Promise<RelayDispatchResult>((resolve, reject) => {
       this.startDispatchTracking(decoded.payload.dispatchId, authority.operationId, canonicalRequestHash);
       const timeout = this.options.clock.setTimeout(() => {
@@ -573,6 +584,44 @@ export class DesktopBrowserRelayService {
       browserInstanceId: input.browserInstanceId,
       invocation: input.invocation,
     });
+  }
+
+  async revokeProjectedLease(input: {
+    publicDeviceFingerprint: string;
+    browserInstanceId: string;
+    taskId: string;
+    attemptId: string;
+    leaseId: string;
+    leaseVersion: number;
+  }): Promise<void> {
+    if (!this.operationStore) throw new Error("desktop browser durable revocation storage is unavailable");
+    await this.operationStore.recordLeaseRevocation(input);
+    const candidates = [...this.connections.values()].filter((connection) => {
+      if (connection.stage !== "registered" || !connection.binding || !connection.hello) return false;
+      const snapshot = this.snapshot(connection);
+      return (
+        snapshot.publicDeviceFingerprint === input.publicDeviceFingerprint &&
+        snapshot.browserInstanceId === input.browserInstanceId
+      );
+    });
+    if (candidates.length !== 1) throw new Error("desktop browser host is not uniquely connected");
+    const currentLease = candidates[0]!.currentLease;
+    if (
+      currentLease &&
+      (currentLease.taskId !== input.taskId ||
+        currentLease.attemptId !== input.attemptId ||
+        currentLease.leaseId !== input.leaseId ||
+        currentLease.leaseVersion + 1 !== input.leaseVersion)
+    ) {
+      throw new Error("desktop browser Relay revocation does not match the current Host Lease");
+    }
+    const taskHash = createHash("sha256").update(input.taskId).digest("hex");
+    await this.closeConnection(candidates[0]!, 1008, `desktop browser Task Lease revoked:${taskHash}`);
+  }
+
+  async consumeCoreNonce(nonce: string, expiresAt: number, now: number): Promise<boolean> {
+    if (!this.operationStore) throw new Error("desktop browser durable nonce storage is unavailable");
+    return this.operationStore.consumeCoreNonce(nonce, expiresAt, now);
   }
 
   async drain(): Promise<void> {

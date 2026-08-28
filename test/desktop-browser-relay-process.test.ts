@@ -337,7 +337,13 @@ test("relay server separates health from readiness and only upgrades the configu
 test("Core dispatcher signs the bounded Relay invocation endpoint", async () => {
   const authSecret = "relay-core-auth-secret-for-tests-0000001";
   const seen: unknown[] = [];
+  const consumedNonces = new Set<string>();
   const service = {
+    async consumeCoreNonce(nonce: string) {
+      if (consumedNonces.has(nonce)) return false;
+      consumedNonces.add(nonce);
+      return true;
+    },
     async dispatchProjectedInvocation(input: unknown) {
       seen.push(input);
       return {
@@ -347,6 +353,9 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
         requestHash: desktopBrowserRelayInvocationFixture.payload.requestHash,
         error: { code: "host_not_accepted", message: "Host did not accept the operation" },
       };
+    },
+    async revokeProjectedLease(input: unknown) {
+      seen.push({ revoke: input });
     },
     async drain() {},
   } as unknown as DesktopBrowserRelayService;
@@ -401,6 +410,14 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
       invocation: desktopBrowserRelayInvocationFixture,
     });
     assert.equal(result.kind, "not_accepted_or_unknown");
+    await dispatcher.revoke({
+      publicDeviceFingerprint: "0123456789abcdef",
+      browserInstanceId: "browser-primary",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      leaseId: "lease-1",
+      leaseVersion: 4,
+    });
     assert.deepEqual(seen, [
       {
         publicDeviceFingerprint: "0123456789abcdef",
@@ -411,6 +428,16 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
         publicDeviceFingerprint: "0123456789abcdef",
         browserInstanceId: "browser-primary",
         invocation: desktopBrowserRelayInvocationFixture,
+      },
+      {
+        revoke: {
+          publicDeviceFingerprint: "0123456789abcdef",
+          browserInstanceId: "browser-primary",
+          taskId: "task-1",
+          attemptId: "attempt-1",
+          leaseId: "lease-1",
+          leaseVersion: 4,
+        },
       },
     ]);
   } finally {

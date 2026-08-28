@@ -146,6 +146,9 @@ export function createDesktopBrowserOperationCoordinator(options: {
           : (dispatched.result ?? unknownResult(dispatched.accepted, dispatched.error));
       const consumed = await options.tasks.consumeOperationResult(task.id, result);
       if (consumed.status === "refused") return consumed;
+      if (consumed.task.status === "canceled_with_unknown_effects") {
+        return { status: "refused", reason: "Desktop Browser Task was stopped; browser effects may be unknown" };
+      }
       return {
         status: "ok",
         taskId: task.id,

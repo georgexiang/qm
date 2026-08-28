@@ -52,11 +52,14 @@ interface DesktopBrowserRelayOperationRecord {
   protocolVersion: `${number}.${number}`;
   operationId: string;
   operationSequence: number;
+  leaseVersion: number;
+  leaseId: string;
   requestHash: string;
   dispatchId?: string;
   state: "prepared" | "accepted" | "terminal";
   resultHash?: string;
   terminalResult?: HostResultMessage;
+  revokedAt?: number;
 }
 
 export interface DesktopBrowserRelayOperationState {
@@ -65,6 +68,7 @@ export interface DesktopBrowserRelayOperationState {
   acceptedEvidence: DesktopBrowserRelayAcceptedEvidence[];
   terminalEvidence: DesktopBrowserRelayTerminalEvidence[];
   callbackOutbox: DesktopBrowserRelayCallbackOutboxEntry[];
+  coreNonceExpirations?: Record<string, number>;
 }
 
 export interface DesktopBrowserRelayOperationBacking {
@@ -73,6 +77,7 @@ export interface DesktopBrowserRelayOperationBacking {
 }
 
 export interface DesktopBrowserRelayOperationStore {
+  consumeCoreNonce(nonce: string, expiresAt: number, now: number): Promise<boolean>;
   prepare(invocation: RelayInvocationMessage): Promise<{
     status: "prepared" | "existing";
     checkpoint: DesktopBrowserRelayOperationCheckpoint;
@@ -81,6 +86,12 @@ export interface DesktopBrowserRelayOperationStore {
   markDeliveryNotStarted(attemptId: string, dispatchId: string): Promise<DesktopBrowserRelayOperationCheckpoint>;
   recordAccepted(message: HostAcceptedMessage): Promise<DesktopBrowserRelayOperationCheckpoint>;
   recordAcceptedUnknown(message: HostAcceptedMessage): Promise<HostResultMessage>;
+  recordLeaseRevocation(input: {
+    taskId: string;
+    attemptId: string;
+    leaseId: string;
+    leaseVersion: number;
+  }): Promise<"revoked" | "already_revoked">;
   recordTerminal(message: HostResultMessage): Promise<DesktopBrowserRelayOperationCheckpoint>;
   checkpoint(attemptId: string): Promise<DesktopBrowserRelayOperationCheckpoint | null>;
   acceptedEvidence(): Promise<DesktopBrowserRelayAcceptedEvidence[]>;
@@ -160,6 +171,17 @@ export function createDesktopBrowserRelayOperationStore(
 ): DesktopBrowserRelayOperationStore {
   const now = options.now ?? Date.now;
   return {
+    async consumeCoreNonce(nonce, expiresAt, now) {
+      return backing.transaction((state) => {
+        state.coreNonceExpirations ??= {};
+        for (const [key, expiration] of Object.entries(state.coreNonceExpirations)) {
+          if (expiration <= now) delete state.coreNonceExpirations[key];
+        }
+        if (state.coreNonceExpirations[nonce] !== undefined) return false;
+        state.coreNonceExpirations[nonce] = expiresAt;
+        return true;
+      });
+    },
     async prepare(invocation) {
       return backing.transaction((state) => {
         const authority = invocation.payload.authority;
@@ -169,7 +191,11 @@ export function createDesktopBrowserRelayOperationStore(
             return { status: "existing" as const, checkpoint: current };
           }
           const previous = operationRecord(state, current.operationId);
-          if (current.state !== "terminal" || authority.operationSequence <= previous.operationSequence) {
+          if (
+            current.state !== "terminal" ||
+            authority.operationSequence <= previous.operationSequence ||
+            authority.leaseVersion <= previous.leaseVersion
+          ) {
             throw new Error("desktop browser Relay Attempt already has a different current operation");
           }
         }
@@ -189,6 +215,8 @@ export function createDesktopBrowserRelayOperationStore(
           protocolVersion: invocation.protocolVersion,
           operationId: authority.operationId,
           operationSequence: authority.operationSequence,
+          leaseVersion: authority.leaseVersion,
+          leaseId: authority.leaseId,
           requestHash: invocation.payload.requestHash,
           state: "prepared",
         };
@@ -328,6 +356,23 @@ export function createDesktopBrowserRelayOperationStore(
           delete checkpoint.invocation;
         }
         return result;
+      });
+    },
+    async recordLeaseRevocation(input) {
+      return backing.transaction((state) => {
+        const checkpoint = state.checkpoints[input.attemptId];
+        if (!checkpoint) throw new Error("desktop browser Relay revocation Attempt not found");
+        const operation = operationRecord(state, checkpoint.operationId);
+        if (
+          operation.taskId !== input.taskId ||
+          operation.leaseId !== input.leaseId ||
+          input.leaseVersion !== operation.leaseVersion + 1
+        ) {
+          throw new Error("desktop browser Relay revocation Lease is stale");
+        }
+        if (operation.revokedAt !== undefined) return "already_revoked";
+        operation.revokedAt = now();
+        return "revoked";
       });
     },
     async recordTerminal(message) {

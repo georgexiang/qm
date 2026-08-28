@@ -81,8 +81,9 @@ function schemaStatements(schema: string): string[] {
     )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.operations(
       operation_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, task_id TEXT NOT NULL,
-      protocol_version TEXT NOT NULL, operation_sequence BIGINT NOT NULL, request_hash TEXT NOT NULL,
-      dispatch_id TEXT, state TEXT NOT NULL, result_hash TEXT, terminal_result JSONB
+      protocol_version TEXT NOT NULL, operation_sequence BIGINT NOT NULL, lease_version BIGINT NOT NULL,
+      lease_id TEXT NOT NULL, request_hash TEXT NOT NULL, dispatch_id TEXT, state TEXT NOT NULL,
+      result_hash TEXT, terminal_result JSONB, revoked_at BIGINT
     )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.accepted_evidence(
       operation_id TEXT NOT NULL, dispatch_id TEXT NOT NULL, protocol_version TEXT NOT NULL,
@@ -98,6 +99,9 @@ function schemaStatements(schema: string): string[] {
       accepted JSONB NOT NULL, result JSONB NOT NULL, created_at BIGINT NOT NULL, delivered_at BIGINT,
       attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at BIGINT NOT NULL, claim_owner TEXT,
       claim_expires_at BIGINT, dead_lettered_at BIGINT, PRIMARY KEY(operation_id, callback_type)
+    )`,
+    `CREATE TABLE IF NOT EXISTS ${schema}.core_request_nonces(
+      nonce TEXT PRIMARY KEY, expires_at BIGINT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS callback_outbox_ready ON ${schema}.callback_outbox(next_attempt_at, created_at)
       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL`,
@@ -141,6 +145,17 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
   };
 
   return {
+    async consumeCoreNonce(nonce, expiresAt, now) {
+      return transaction(pool, async (client) => {
+        await client.query(`DELETE FROM ${schema}.core_request_nonces WHERE expires_at <= $1`, [now]);
+        const inserted = await client.query(
+          `INSERT INTO ${schema}.core_request_nonces(nonce, expires_at) VALUES($1, $2)
+           ON CONFLICT(nonce) DO NOTHING RETURNING nonce`,
+          [nonce, expiresAt],
+        );
+        return inserted.rowCount === 1;
+      });
+    },
     async prepare(invocation) {
       await ready;
       return transaction(pool, async (client) => {
@@ -159,25 +174,28 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
             return { status: "existing" as const, checkpoint: checkpoint(current) };
           }
           const previous = await client.query(
-            `SELECT operation_sequence FROM ${schema}.operations WHERE operation_id = $1`,
+            `SELECT operation_sequence, lease_version FROM ${schema}.operations WHERE operation_id = $1`,
             [current.operation_id],
           );
           if (
             !["terminal", "accepted_unknown"].includes(String(current.state)) ||
-            authority.operationSequence <= Number(previous.rows[0]?.operation_sequence)
+            authority.operationSequence <= Number(previous.rows[0]?.operation_sequence) ||
+            authority.leaseVersion <= Number(previous.rows[0]?.lease_version)
           ) {
             throw new Error("desktop browser Relay Attempt already has a different current operation");
           }
         }
         await client.query(
-          `INSERT INTO ${schema}.operations(operation_id, attempt_id, task_id, protocol_version, operation_sequence, request_hash, state)
-           VALUES ($1,$2,$3,$4,$5,$6,'prepared')`,
+          `INSERT INTO ${schema}.operations(operation_id, attempt_id, task_id, protocol_version, operation_sequence, lease_version, lease_id, request_hash, state)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepared')`,
           [
             authority.operationId,
             authority.attemptId,
             authority.taskId,
             invocation.protocolVersion,
             authority.operationSequence,
+            authority.leaseVersion,
+            authority.leaseId,
             invocation.payload.requestHash,
           ],
         );
@@ -333,6 +351,32 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
           [operation.attempt_id, message.payload.operationId, resultHash, at],
         );
         return result;
+      });
+    },
+    async recordLeaseRevocation(input) {
+      await ready;
+      return transaction(pool, async (client) => {
+        const selected = await client.query(
+          `SELECT o.* FROM ${schema}.operation_checkpoints c
+           JOIN ${schema}.operations o ON o.operation_id=c.operation_id
+           WHERE c.attempt_id=$1 FOR UPDATE OF o`,
+          [input.attemptId],
+        );
+        const operation = selected.rows[0] as Record<string, unknown> | undefined;
+        if (!operation) throw new Error("desktop browser Relay revocation Attempt not found");
+        if (
+          operation.task_id !== input.taskId ||
+          operation.lease_id !== input.leaseId ||
+          input.leaseVersion !== Number(operation.lease_version) + 1
+        ) {
+          throw new Error("desktop browser Relay revocation Lease is stale");
+        }
+        if (operation.revoked_at != null) return "already_revoked" as const;
+        await client.query(`UPDATE ${schema}.operations SET revoked_at=$2 WHERE operation_id=$1`, [
+          operation.operation_id,
+          now(),
+        ]);
+        return "revoked" as const;
       });
     },
     async recordTerminal(message) {

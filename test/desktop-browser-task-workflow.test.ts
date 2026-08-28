@@ -15,6 +15,7 @@ import { createTurnMethods } from "../src/api/app-turn.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/desktop-browser/browser-task-store.ts";
 import { createDesktopBrowserOperationCoordinator } from "../src/desktop-browser/operation-coordinator.ts";
 import { reconcileDesktopBrowserFinalizationAudits } from "../src/desktop-browser/finalization-audit.ts";
+import { reconcileDesktopBrowserStops } from "../src/desktop-browser/stop-delivery.ts";
 import { projectDesktopBrowserTaskActivity } from "../src/desktop-browser/task-activity.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
@@ -566,6 +567,54 @@ test("Ticket 06 coordinator never redispatches navigate after ambiguous Relay de
   assert.equal(dispatches, 1);
 });
 
+test("Ticket 08 coordinator does not return a late Host completion after Stop wins", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-late-stop", readyTask("task-late-stop", "start-late-stop"));
+  const ids = ["observe-late-stop", "nonce-late-stop"];
+  const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => 11_000 });
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    createDispatchId: () => "dispatch-late-stop",
+    dispatcher: {
+      async dispatch(input) {
+        const operation = input.invocation.payload;
+        await store.requestStop("task-late-stop", { requestedBy: "actor-1", reason: "webui" });
+        return {
+          kind: "host.result" as const,
+          accepted: acceptedFor(operation, operation.dispatchId),
+          result: {
+            protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+            kind: "host.result" as const,
+            payload: {
+              dispatchId: operation.dispatchId,
+              operationId: operation.authority.operationId,
+              outcome: "completed" as const,
+              resultHash: "sha256:late-completion",
+              result: {
+                schemaVersion: "1.0" as const,
+                command: "observe" as const,
+                completedAt: "2036-08-27T12:00:11.000Z",
+                data: { tab_id: 7, text: "Late", ref_count: 0, truncated: false },
+              },
+            },
+          },
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(
+    await coordinator.invokeForSession({
+      sessionId: "conversation-task-late-stop",
+      actorId: "actor-1",
+      projectScopeLabel: "group:web-project-project-1",
+      projectMembershipVersion: "42",
+      argv: buildDesktopBrowserObserveArgv("browser-session-task-late-stop"),
+    }),
+    { status: "refused", reason: "Desktop Browser Task was stopped; browser effects may be unknown" },
+  );
+});
+
 test("Ticket 06 reconciles a finalization audit after a crash-window write failure", async () => {
   const backing = createMemoryMap<DesktopBrowserTask>();
   await backing.put("task-audit", readyTask("task-audit", "start-audit"));
@@ -596,4 +645,225 @@ test("Ticket 06 reconciles a finalization audit after a crash-window write failu
   await reconcileDesktopBrowserFinalizationAudits(store, auditLog);
   assert.equal((await store.get("task-audit"))?.finalizationAudit?.status, "recorded");
   assert.equal(events.length, 1);
+});
+
+test("Ticket 08 persists Stop and Lease revoke before late result evidence without rewriting outcome", async () => {
+  const now = Date.parse("2036-08-27T12:00:10.000Z");
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-stop", "start-stop");
+  await backing.put(task.id, task);
+  const ids = ["navigate-stop", "nonce-stop"];
+  const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => now });
+  const prepared = await store.prepareOperation(
+    task.id,
+    buildDesktopBrowserNavigateArgv("https://example.test", "browser-session-task-stop"),
+  );
+  assert.equal(prepared.status, "ok");
+  const accepted = acceptedFor(prepared.operation, "dispatch-stop");
+  assert.equal((await store.consumeOperationAccepted(task.id, accepted)).status, "ok");
+
+  const stopped = await store.requestStop(task.id, { requestedBy: "actor-1", reason: "webui" });
+  assert.equal(stopped.status, "ok");
+  assert.equal(stopped.task.status, "canceled_with_unknown_effects");
+  assert.deepEqual(stopped.task.stopIntent, {
+    requestedBy: "actor-1",
+    reason: "webui",
+    requestedAt: now,
+    auditStatus: "pending",
+    revocationStatus: "pending",
+  });
+  assert.deepEqual(stopped.task.leaseRevocation, {
+    leaseId: task.execution!.leaseId,
+    leaseVersion: 3,
+    revokedAt: now,
+  });
+  assert.deepEqual(await store.requestStop(task.id, { requestedBy: "actor-1", reason: "webui" }), stopped);
+  const restarted = createDesktopBrowserTaskStore(backing, { now: () => now + 1 });
+  assert.deepEqual(await restarted.listPendingStops(), [stopped.task]);
+  const retried = await restarted.requestStop(task.id, { requestedBy: "administrator-2", reason: "admin" });
+  assert.equal(retried.status, "ok");
+  assert.equal(retried.task.stopIntent?.requestedBy, "actor-1");
+  await restarted.markStopAudited(task.id);
+  await restarted.markStopRevocationDelivered(task.id);
+  assert.deepEqual(await restarted.listPendingStops(), []);
+  assert.deepEqual(await store.prepareOperation(task.id, buildDesktopBrowserObserveArgv("browser-session-task-stop")), {
+    status: "refused",
+    reason: "Desktop Browser Task already has a terminal outcome",
+  });
+
+  const lateResult: HostResultMessage = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    kind: "host.result",
+    payload: {
+      dispatchId: accepted.payload.dispatchId,
+      operationId: accepted.payload.operationId,
+      outcome: "completed",
+      resultHash: "sha256:late-stop-result",
+      result: {
+        schemaVersion: "1.0",
+        command: "navigate",
+        completedAt: "2036-08-27T12:00:11.000Z",
+        data: { tab_id: 7, reached: "load" },
+      },
+    },
+  };
+  const recorded = await store.consumeOperationResult(task.id, lateResult);
+  assert.equal(recorded.status, "ok");
+  assert.equal(recorded.task.status, "canceled_with_unknown_effects");
+  assert.equal(recorded.task.operations?.at(-1)?.hostResult?.payload.resultHash, "sha256:late-stop-result");
+});
+
+test("Ticket 08 Stop during initial Host acceptance records unknown effects", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-start-stop", "start-in-flight-stop");
+  task.execution!.attemptStatus = "prepared";
+  task.execution!.hostAccepted = acceptedFor(task.execution!.operation, "dispatch-start-stop");
+  task.browserSkillSessionId = undefined;
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 13_000 });
+
+  const stopped = await store.requestStop(task.id, { requestedBy: "actor-1", reason: "webui" });
+
+  assert.equal(stopped.status, "ok");
+  assert.equal(stopped.task.status, "canceled_with_unknown_effects");
+});
+
+test("Ticket 08 Stop reconciliation continues after an earlier revoke failure", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-stop-first", readyTask("task-stop-first", "start-stop-first"));
+  await backing.put("task-stop-second", readyTask("task-stop-second", "start-stop-second"));
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 14_000 });
+  await store.requestStop("task-stop-first", { requestedBy: "actor-1", reason: "webui" });
+  await store.requestStop("task-stop-second", { requestedBy: "actor-1", reason: "webui" });
+
+  await assert.rejects(
+    reconcileDesktopBrowserStops(
+      store,
+      { recordOnce: async () => undefined } as any,
+      async (input) => {
+        if (input.taskId === "task-stop-first") throw new Error("first Host offline");
+      },
+    ),
+    /Stop reconciliation failed/,
+  );
+
+  assert.equal((await store.get("task-stop-first"))?.stopIntent?.revocationStatus, "pending");
+  assert.equal((await store.get("task-stop-second"))?.stopIntent?.revocationStatus, "delivered");
+});
+
+test("Ticket 08 WebUI Stop persists before Relay delivery and never acknowledges failed delivery", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-webui-stop", readyTask("task-webui-stop", "start-webui-stop"));
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 12_000 });
+  let observedDurableStop = false;
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (id: string) => ({ id, type: "internal" }),
+        isInternal: () => true,
+      },
+      projects: {
+        withRosterLock: async (_projectId: string, fn: (project: unknown) => Promise<unknown>) =>
+          fn({
+            id: "project-1",
+            orgId: "default-org",
+            ownerId: "actor-1",
+            memberIds: [],
+            channelMemberIds: [],
+            updatedAt: 42,
+          }),
+      },
+      desktopBrowserTasks: store,
+      desktopBrowserRevoke: async () => {
+        const persisted = await store.get("task-webui-stop");
+        observedDurableStop = !!persisted?.stopIntent && !!persisted.leaseRevocation;
+        throw new Error("relay unavailable");
+      },
+      admin: { canAdminister: async () => false },
+      auditLog: {
+        recordOnce: async () => {
+          throw new Error("audit unavailable");
+        },
+      },
+      publicWebUrl: "https://qm.example.test",
+    } as any,
+    {} as any,
+    {} as any,
+  );
+
+  const result = await app.desktopBrowserTaskAction("task-webui-stop", "actor-1", "authority-1", "stop");
+
+  assert.deepEqual(result, {
+    status: "refused",
+    reason: "Desktop Browser Stop recorded; Relay delivery not confirmed",
+  });
+  assert.equal(observedDurableStop, true);
+  assert.equal((await store.get("task-webui-stop"))?.status, "canceled");
+});
+
+test("Ticket 08 concurrent Stop and completion use first-persisted-wins CAS", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-cas", readyTask("task-cas", "start-cas"));
+  const first = createDesktopBrowserTaskStore(backing, { now: () => 20_000 });
+  const second = createDesktopBrowserTaskStore(backing, { now: () => 20_001 });
+
+  const [stop, finalize] = await Promise.all([
+    first.requestStop("task-cas", { requestedBy: "actor-1", reason: "webui" }),
+    second.finalize("task-cas", { outcome: "completed", summary: "completed concurrently" }),
+  ]);
+
+  assert.equal([stop, finalize].filter((result) => result.status === "ok").length, 1);
+  assert.equal([stop, finalize].filter((result) => result.status === "refused").length, 1);
+  assert.ok(["canceled", "completed"].includes((await first.get("task-cas"))!.status));
+});
+
+test("Ticket 08 project administrator Stop is acknowledged only after Relay revoke succeeds", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-admin-stop", readyTask("task-admin-stop", "start-admin-stop"));
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 30_000 });
+  let revoked = false;
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (id: string) => ({ id, type: "internal" }),
+        isInternal: () => true,
+      },
+      projects: {
+        withRosterLock: async (_projectId: string, fn: (project: unknown) => Promise<unknown>) =>
+          fn({
+            id: "project-1",
+            orgId: "default-org",
+            ownerId: "actor-1",
+            memberIds: [],
+            channelMemberIds: [],
+            updatedAt: 42,
+          }),
+      },
+      desktopBrowserTasks: store,
+      desktopBrowserRevoke: async () => {
+        revoked = true;
+      },
+      admin: { canAdminister: async () => true },
+      auditLog: {
+        recordOnce: async () => {
+          throw new Error("audit unavailable");
+        },
+      },
+      publicWebUrl: "https://qm.example.test",
+    } as any,
+    {} as any,
+    {} as any,
+  );
+
+  const result = await app.desktopBrowserTaskAction("task-admin-stop", "admin-1", "", "stop");
+
+  assert.equal(result.status, "ok");
+  assert.equal(result.reply, "Desktop Browser Stop accepted.");
+  assert.equal(revoked, true);
+  const stopped = await store.get("task-admin-stop");
+  assert.equal(stopped?.stopIntent?.reason, "admin");
+  assert.equal(stopped?.stopIntent?.auditStatus, "pending");
+  assert.equal(stopped?.stopIntent?.revocationStatus, "delivered");
 });

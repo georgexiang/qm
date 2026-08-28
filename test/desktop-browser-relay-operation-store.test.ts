@@ -12,6 +12,19 @@ import {
   desktopBrowserSessionStartCompletedResultFixture,
 } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 
+test("Ticket 08 consumes Core request nonces atomically across Relay replicas", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const first = createDesktopBrowserRelayOperationStore(backing);
+  const second = createDesktopBrowserRelayOperationStore(backing);
+
+  const consumed = await Promise.all([
+    first.consumeCoreNonce("shared-nonce", 301_000, 1_000),
+    second.consumeCoreNonce("shared-nonce", 301_000, 1_000),
+  ]);
+  assert.deepEqual(consumed.sort(), [false, true]);
+  assert.equal(await second.consumeCoreNonce("shared-nonce", 602_000, 302_000), true);
+});
+
 test("Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal state, and callback outbox", async () => {
   const backing = createMemoryDesktopBrowserRelayOperationBacking();
   const first = createDesktopBrowserRelayOperationStore(backing, { now: () => 1_000 });
@@ -96,6 +109,7 @@ test("Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal
     ...desktopBrowserRelayInvocationFixture.payload.authority,
     operationId: "operation-2",
     operationSequence: 2,
+    leaseVersion: 4,
     nonce: "nonce-2",
   };
   const nextInvocation = {

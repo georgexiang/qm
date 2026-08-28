@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   accessSync,
@@ -45,6 +46,10 @@ import {
   type DesktopBrowserRelaySocket,
 } from "../packages/qm-broker-relay/src/index.ts";
 import { createDesktopBrowserRelayServer } from "../packages/qm-broker-relay/src/server.ts";
+import {
+  createDesktopBrowserRelayOperationStore,
+  createMemoryDesktopBrowserRelayOperationBacking,
+} from "../packages/qm-broker-relay/src/operation-store.ts";
 import { desktopBrowserRegistrationReservationTupleFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/desktop-browser/browser-task-store.ts";
 import { createDesktopBrowserOperationCoordinator } from "../src/desktop-browser/operation-coordinator.ts";
@@ -738,6 +743,7 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
     supportedProtocolVersions: [DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION],
     supportedPolicyGrammarVersions: ["1.0"],
     registry,
+    operationStore: createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking()),
     createNonce: () => "relay-nonce-product",
     createConnectionId: () => "connection-product",
   });
@@ -1772,6 +1778,107 @@ test("a matching terminal Host fence replays after lease expiry without respawn"
   assert.equal(spawnCalls, 1);
   second.socket.close(1000, "done");
   await second.running;
+});
+
+test("Ticket 08 Lease-revoked close cleans the durable Task-owned BrowserSkill session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-lease-revoke-cleanup-"));
+  const argvCalls: Array<readonly string[]> = [];
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run(_executable, argv) {
+      argvCalls.push(argv);
+      if (argv[1] === "session" && argv[2] === "stop") {
+        return { exitCode: 0, stdout: JSON.stringify({ returned_tab_ids: [], return_failures: [] }), stderr: "" };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          session_id: "session-revoked",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        }),
+        stderr: "",
+      };
+    },
+  };
+  const authority = sessionStartAuthority("operation-revoked");
+  const { socket, running } = await connectOperationHost({ dataDir: dir, sessionRunner });
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-revoked",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  await waitFor(() => socket.sent[3], "Lease revoke session ownership");
+  assert.equal(readdirSync(join(dir, "sessions")).length, 1);
+
+  socket.close(1008, `desktop browser Task Lease revoked:${createHash("sha256").update(authority.taskId).digest("hex")}`);
+  await assert.rejects(running);
+
+  assert.deepEqual(argvCalls, [authority.argv, ["--json", "session", "stop", "session-revoked"]]);
+  assert.equal(readdirSync(join(dir, "sessions")).length, 0);
+});
+
+test("Ticket 08 Lease-revoked close discovers durable session ownership after Host restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-restarted-lease-revoke-"));
+  const argvCalls: Array<readonly string[]> = [];
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run(_executable, argv) {
+      argvCalls.push(argv);
+      if (argv[1] === "session" && argv[2] === "stop") {
+        return { exitCode: 0, stdout: JSON.stringify({ returned_tab_ids: [], return_failures: [] }), stderr: "" };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          session_id: "session-restarted-revoke",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        }),
+        stderr: "",
+      };
+    },
+  };
+  const authority = sessionStartAuthority("operation-restarted-revoke");
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner });
+  first.socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-restarted-revoke",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  await waitFor(() => first.socket.sent[3], "session ownership before Host restart");
+  first.socket.close(1000, "restart");
+  await first.running;
+  assert.equal(readdirSync(join(dir, "sessions")).length, 1);
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner });
+  second.socket.close(
+    1008,
+    `desktop browser Task Lease revoked:${createHash("sha256").update(`${authority.taskId}-other`).digest("hex")}`,
+  );
+  await assert.rejects(second.running);
+  assert.equal(readdirSync(join(dir, "sessions")).length, 1);
+  assert.deepEqual(argvCalls, [authority.argv]);
+
+  const third = await connectOperationHost({ dataDir: dir, sessionRunner });
+  third.socket.close(
+    1008,
+    `desktop browser Task Lease revoked:${createHash("sha256").update(authority.taskId).digest("hex")}`,
+  );
+  await assert.rejects(third.running);
+
+  assert.deepEqual(argvCalls, [authority.argv, ["--json", "session", "stop", "session-restarted-revoke"]]);
+  assert.equal(readdirSync(join(dir, "sessions")).length, 0);
 });
 
 test("post-fence BrowserSkill output failures persist unknown without task ownership or retry", async () => {

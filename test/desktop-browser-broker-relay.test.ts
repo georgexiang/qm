@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { test } from "node:test";
 import {
   DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
@@ -602,6 +602,7 @@ test("Ticket 07 appends a late terminal without replacing the newer current chec
     ...desktopBrowserRelayInvocationFixture.payload.authority,
     operationId: "operation-next",
     operationSequence: 2,
+    leaseVersion: 4,
     nonce: "nonce-next",
   };
   const nextInvocation: RelayInvocationMessage = {
@@ -652,6 +653,253 @@ test("Ticket 07 appends a late terminal without replacing the newer current chec
   assert.equal((await next).kind, "host.result");
   assert.equal((await operationStore.checkpoint(nextAuthority.attemptId))?.operationId, nextAuthority.operationId);
   assert.equal((await operationStore.terminalEvidence()).length, 2);
+});
+
+test("Ticket 08 Lease revoke closes the active Device and terminalizes accepted work as unknown", async () => {
+  const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+  await flushMessages();
+  const projection = service.snapshots()[0]!;
+
+  await service.revokeProjectedLease({
+    publicDeviceFingerprint: projection.publicDeviceFingerprint,
+    browserInstanceId: projection.browserInstanceId,
+    taskId: desktopBrowserRelayInvocationFixture.payload.authority.taskId,
+    attemptId: desktopBrowserRelayInvocationFixture.payload.authority.attemptId,
+    leaseId: desktopBrowserRelayInvocationFixture.payload.authority.leaseId,
+    leaseVersion: desktopBrowserRelayInvocationFixture.payload.authority.leaseVersion + 1,
+  });
+
+  assert.equal(socket.closeCode, 1008);
+  assert.equal(
+    socket.closeReason,
+    `desktop browser Task Lease revoked:${createHash("sha256").update(desktopBrowserRelayInvocationFixture.payload.authority.taskId).digest("hex")}`,
+  );
+  assert.equal((await pending).kind, "accepted_unknown");
+  assert.equal((await operationStore.terminalEvidence()).at(-1)?.outcome, "unknown");
+});
+
+test("Ticket 08 delayed stale Lease revoke does not close a newer Host operation", async () => {
+  const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const first = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+  socket.message(JSON.stringify(desktopBrowserSessionStartCompletedResultFixture));
+  assert.equal((await first).kind, "host.result");
+
+  const previousAuthority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const nextAuthority = {
+    ...previousAuthority,
+    taskId: "task-after-delayed-revoke",
+    attemptId: "attempt-after-delayed-revoke",
+    leaseId: "lease-after-delayed-revoke",
+    operationId: "operation-after-delayed-revoke",
+    operationSequence: 1,
+    leaseVersion: previousAuthority.leaseVersion + 1,
+    nonce: "nonce-after-delayed-revoke",
+  };
+  const nextInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      dispatchId: "dispatch-after-delayed-revoke",
+      requestHash: computeDesktopBrowserRequestHash(nextAuthority),
+      authority: nextAuthority,
+    },
+  };
+  const next = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: nextInvocation,
+  });
+  await flushMessages();
+
+  await assert.rejects(
+    service.revokeProjectedLease({
+      publicDeviceFingerprint: service.snapshots()[0]!.publicDeviceFingerprint,
+      browserInstanceId: "browser-primary",
+      taskId: previousAuthority.taskId,
+      attemptId: previousAuthority.attemptId,
+      leaseId: previousAuthority.leaseId,
+      leaseVersion: previousAuthority.leaseVersion + 1,
+    }),
+    /does not match the current Host Lease/,
+  );
+  assert.equal(socket.closeCode, undefined);
+  assert.equal((await operationStore.checkpoint(nextAuthority.attemptId))?.operationId, nextAuthority.operationId);
+
+  socket.message(
+    JSON.stringify({
+      ...desktopBrowserSessionStartAcceptedFixture,
+      payload: {
+        dispatchId: nextInvocation.payload.dispatchId,
+        operationId: nextAuthority.operationId,
+        requestHash: nextInvocation.payload.requestHash,
+      },
+    }),
+  );
+  socket.message(
+    JSON.stringify({
+      ...desktopBrowserSessionStartCompletedResultFixture,
+      payload: {
+        ...desktopBrowserSessionStartCompletedResultFixture.payload,
+        dispatchId: nextInvocation.payload.dispatchId,
+        operationId: nextAuthority.operationId,
+      },
+    }),
+  );
+  assert.equal((await next).kind, "host.result");
+});
+
+test("Ticket 08 retries Host closure after revocation persisted while the Device was offline", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const firstStore = createDesktopBrowserRelayOperationStore(backing);
+  await firstStore.prepare(desktopBrowserRelayInvocationFixture);
+  const first = await createRegisteredTicket05Relay({ operationStore: firstStore });
+  const projection = first.service.snapshots()[0]!;
+  first.socket.close(1000, "offline");
+  await flushMessages();
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const revocation = {
+    publicDeviceFingerprint: projection.publicDeviceFingerprint,
+    browserInstanceId: projection.browserInstanceId,
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    leaseId: authority.leaseId,
+    leaseVersion: authority.leaseVersion + 1,
+  };
+
+  await assert.rejects(first.service.revokeProjectedLease(revocation), /not uniquely connected/);
+  const restarted = await createRegisteredTicket05Relay({
+    operationStore: createDesktopBrowserRelayOperationStore(backing),
+  });
+  await restarted.service.revokeProjectedLease({
+    ...revocation,
+    publicDeviceFingerprint: restarted.service.snapshots()[0]!.publicDeviceFingerprint,
+  });
+
+  assert.equal(restarted.socket.closeCode, 1008);
+  assert.equal(
+    restarted.socket.closeReason,
+    `desktop browser Task Lease revoked:${createHash("sha256").update(authority.taskId).digest("hex")}`,
+  );
+});
+
+test("Ticket 08 busy cross-Task dispatch cannot replace the active revoke Lease", async () => {
+  const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const active = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  const authority = desktopBrowserRelayInvocationFixture.payload.authority;
+  const competingAuthority = {
+    ...authority,
+    taskId: "competing-task",
+    attemptId: "competing-attempt",
+    leaseId: "competing-lease",
+    operationId: "competing-operation",
+    nonce: "competing-nonce",
+  };
+  await assert.rejects(
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation: {
+        ...desktopBrowserRelayInvocationFixture,
+        payload: {
+          dispatchId: "competing-dispatch",
+          requestHash: computeDesktopBrowserRequestHash(competingAuthority),
+          authority: competingAuthority,
+        },
+      },
+    }),
+    /already has an in-flight invocation/,
+  );
+
+  await service.revokeProjectedLease({
+    publicDeviceFingerprint: service.snapshots()[0]!.publicDeviceFingerprint,
+    browserInstanceId: authority.browserInstanceId,
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    leaseId: authority.leaseId,
+    leaseVersion: authority.leaseVersion + 1,
+  });
+
+  assert.equal(socket.closeCode, 1008);
+  assert.equal((await active).kind, "not_accepted_or_unknown");
+  assert.equal(await operationStore.checkpoint(competingAuthority.attemptId), null);
+});
+
+test("Ticket 08 Relay rejects expired authority and stale Lease versions before delivery", async () => {
+  const operationStore = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const { clock, identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const expiredIssuedAt = new Date(clock.now() - 60_001).toISOString();
+  const expiredAuthority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    issuedAt: expiredIssuedAt,
+    leaseExpiresAt: new Date(Date.parse(expiredIssuedAt) + 60_000).toISOString(),
+  };
+  await assert.rejects(
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation: {
+        ...desktopBrowserRelayInvocationFixture,
+        payload: {
+          ...desktopBrowserRelayInvocationFixture.payload,
+          requestHash: computeDesktopBrowserRequestHash(expiredAuthority),
+          authority: expiredAuthority,
+        },
+      },
+    }),
+    /Lease expired/,
+  );
+  assert.equal(socket.sent.length, 1);
+
+  await operationStore.prepare(desktopBrowserRelayInvocationFixture);
+  await operationStore.markDeliveryStarted(
+    desktopBrowserRelayInvocationFixture.payload.authority.attemptId,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+  );
+  await operationStore.recordAccepted(desktopBrowserSessionStartAcceptedFixture);
+  await operationStore.recordTerminal(desktopBrowserSessionStartCompletedResultFixture);
+  const staleAuthority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    operationId: "stale-lease-operation",
+    operationSequence: 2,
+    nonce: "stale-lease-nonce",
+  };
+  await assert.rejects(
+    operationStore.prepare({
+      ...desktopBrowserRelayInvocationFixture,
+      payload: {
+        dispatchId: "stale-lease-dispatch",
+        requestHash: computeDesktopBrowserRequestHash(staleAuthority),
+        authority: staleAuthority,
+      },
+    }),
+    /different current operation/,
+  );
 });
 
 test("Ticket 06 relay dispatches protocol 1.3 navigate and returns the sanitized Host result", async () => {

@@ -102,7 +102,6 @@ export function createDesktopBrowserRelayServer(
 
   const wsServer = new WebSocketServer({ noServer: true });
   const detach = attachDesktopBrowserRelayWebSocketServer(wsServer, options.service);
-  const coreNonceExpirations = new Map<string, number>();
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
 
@@ -127,19 +126,10 @@ export function createDesktopBrowserRelayServer(
           return;
         }
         const now = Date.now();
-        for (const [key, expiresAt] of coreNonceExpirations) {
-          if (expiresAt <= now) coreNonceExpirations.delete(key);
-        }
-        if (coreNonceExpirations.has(nonce)) {
+        if (!(await options.service.consumeCoreNonce(nonce, now + 5 * 60_000, now))) {
           sendJson(res, 409, { error: "replayed_request" });
           return;
         }
-        while (coreNonceExpirations.size >= 10_000) {
-          const oldest = coreNonceExpirations.keys().next().value;
-          if (typeof oldest !== "string") break;
-          coreNonceExpirations.delete(oldest);
-        }
-        coreNonceExpirations.set(nonce, now + 5 * 60_000);
         const parsed: unknown = JSON.parse(body);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
           throw new Error("invalid invocation request");
@@ -161,6 +151,45 @@ export function createDesktopBrowserRelayServer(
         sendJson(res, 200, result);
       } catch {
         sendJson(res, 409, { error: "dispatch_failed" });
+      }
+      return;
+    }
+    if (req.method === "POST" && pathname === "/v1/revocations" && options.coreAuthSecret) {
+      try {
+        const body = await readBody(req, 16 * 1024);
+        const nonce = url.searchParams.get("_sourceAuthNonce");
+        if (!nonce || !validCoreSignature(req, pathname + url.search, body, options.coreAuthSecret)) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const now = Date.now();
+        if (!(await options.service.consumeCoreNonce(nonce, now + 5 * 60_000, now))) {
+          sendJson(res, 409, { error: "replayed_request" });
+          return;
+        }
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        if (
+          typeof parsed.publicDeviceFingerprint !== "string" ||
+          typeof parsed.browserInstanceId !== "string" ||
+          typeof parsed.taskId !== "string" ||
+          typeof parsed.attemptId !== "string" ||
+          typeof parsed.leaseId !== "string" ||
+          !Number.isSafeInteger(parsed.leaseVersion)
+        ) {
+          throw new Error("invalid revocation request");
+        }
+        await options.service.revokeProjectedLease({
+          publicDeviceFingerprint: parsed.publicDeviceFingerprint,
+          browserInstanceId: parsed.browserInstanceId,
+          taskId: parsed.taskId,
+          attemptId: parsed.attemptId,
+          leaseId: parsed.leaseId,
+          leaseVersion: parsed.leaseVersion as number,
+        });
+        res.statusCode = 204;
+        res.end();
+      } catch {
+        sendJson(res, 409, { error: "revocation_failed" });
       }
       return;
     }

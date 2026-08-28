@@ -2043,13 +2043,13 @@ export function createChatSurface(
       work.activity = [...work.activity];
       ctx.chat.redraw();
     };
-    const cancel = async (): Promise<void> => {
+    const taskAction = async (action: "cancel" | "stop"): Promise<void> => {
       const before = task.actions;
       activity.payload = { ...task, actions: [] };
       work.activity = [...work.activity];
       ctx.chat.redraw();
       try {
-        const result = await runDesktopBrowserTaskAction(task.taskId, task.actionAuthority, "cancel");
+        const result = await runDesktopBrowserTaskAction(task.taskId, task.actionAuthority, action);
         activity.payload = result.desktopBrowserActivity ?? {
           ...task,
           actions: before,
@@ -2136,9 +2136,24 @@ export function createChatSurface(
                     </button>`
                   : nothing
               }
-              <button type="button" class="desktop-browser-cancel" @click=${() => void cancel()}>
-                ${icon(Ban, 14)}<span>Cancel</span>
-              </button>
+              ${task.actions.includes("cancel")
+                ? html`<button
+                    type="button"
+                    class="desktop-browser-cancel"
+                    @click=${() => void taskAction("cancel")}
+                  >
+                    ${icon(Ban, 14)}<span>Cancel</span>
+                  </button>`
+                : nothing}
+              ${task.actions.includes("stop")
+                ? html`<button
+                    type="button"
+                    class="desktop-browser-cancel"
+                    @click=${() => void taskAction("stop")}
+                  >
+                    ${icon(Ban, 14)}<span>Stop</span>
+                  </button>`
+                : nothing}
             </div>`
           : nothing
       }

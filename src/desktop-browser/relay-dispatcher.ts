@@ -3,6 +3,17 @@ import { decodeDesktopBrowserMessage } from "qm-desktop-browser-contracts";
 import { signedRequestHeaders } from "../auth/source-auth-sign.ts";
 import type { DesktopBrowserRelayDispatcher, DesktopBrowserRelayDispatchResult } from "./operation-coordinator.ts";
 
+export interface DesktopBrowserRelayControl extends DesktopBrowserRelayDispatcher {
+  revoke(input: {
+    publicDeviceFingerprint: string;
+    browserInstanceId: string;
+    taskId: string;
+    attemptId: string;
+    leaseId: string;
+    leaseVersion: number;
+  }): Promise<void>;
+}
+
 async function readBoundedResponse(response: Response, maxBytes: number): Promise<string> {
   if (!response.body) return "";
   const reader = response.body.getReader();
@@ -35,7 +46,7 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
   baseUrl: string;
   authSecret: string;
   fetch?: typeof fetch;
-}): DesktopBrowserRelayDispatcher {
+}): DesktopBrowserRelayControl {
   const baseUrl = options.baseUrl.replace(/\/$/, "");
   const fetchImpl = options.fetch ?? fetch;
   const parsedBase = new URL(baseUrl);
@@ -57,6 +68,22 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
   if (options.authSecret.length < 32)
     throw new Error("Desktop Browser Relay auth secret must be at least 32 characters");
   return {
+    async revoke(input) {
+      const body = JSON.stringify(input);
+      const path = `/v1/revocations?_sourceAuthNonce=${encodeURIComponent(randomUUID())}`;
+      const response = await fetchImpl(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: signedRequestHeaders(options.authSecret, "POST", path, body, {
+          "content-type": "application/json",
+        }),
+        body,
+        signal: AbortSignal.timeout(20_000),
+        redirect: "manual",
+      });
+      if (response.status !== 204) {
+        throw new Error(`Desktop Browser Relay revocation failed with status ${response.status}`);
+      }
+    },
     async dispatch(input) {
       const body = JSON.stringify(input);
       const path = `/v1/invocations?_sourceAuthNonce=${encodeURIComponent(randomUUID())}`;

@@ -189,6 +189,7 @@ import { createDesktopBrowserTaskStore, type DesktopBrowserTaskStore } from "./d
 import { reconcileDesktopBrowserFinalizationAudits } from "./desktop-browser/finalization-audit.ts";
 import { createDesktopBrowserOperationCoordinator } from "./desktop-browser/operation-coordinator.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "./desktop-browser/relay-dispatcher.ts";
+import { reconcileDesktopBrowserStops } from "./desktop-browser/stop-delivery.ts";
 import {
   createDesktopBrowserDeviceRegistry,
   type DesktopBrowserDeviceRegistry,
@@ -331,6 +332,7 @@ export interface BuiltApp {
   tasks: TaskStore;
   desktopBrowserTasks: DesktopBrowserTaskStore;
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
+  desktopBrowserStopReconciliation?: Sweeper;
   sessionStateBus: SessionStateBus;
   runtime: Runtime;
   config: ScopedConfigStore;
@@ -747,17 +749,31 @@ export function buildApp(
   void reconcileDesktopBrowserFinalizationAudits(desktopBrowserTasks, auditLog).catch((error) =>
     console.error("[wiring] desktop browser finalization audit reconciliation failed:", errMessage(error)),
   );
-  const desktopBrowserOperations =
+  const desktopBrowserRelayControl =
     config.desktopBrowserRelayUrl && config.desktopBrowserRelayAuthSecret
-      ? createDesktopBrowserOperationCoordinator({
-          tasks: desktopBrowserTasks,
-          auditLog,
-          dispatcher: createHttpDesktopBrowserRelayDispatcher({
+      ? createHttpDesktopBrowserRelayDispatcher({
             baseUrl: config.desktopBrowserRelayUrl,
             authSecret: config.desktopBrowserRelayAuthSecret,
-          }),
         })
       : undefined;
+  const desktopBrowserOperations = desktopBrowserRelayControl
+    ? createDesktopBrowserOperationCoordinator({
+        tasks: desktopBrowserTasks,
+        auditLog,
+        dispatcher: desktopBrowserRelayControl,
+      })
+    : undefined;
+  const desktopBrowserStopReconciliation = desktopBrowserRelayControl
+    ? createSweeper(
+        () =>
+          reconcileDesktopBrowserStops(desktopBrowserTasks, auditLog, (input) =>
+            desktopBrowserRelayControl.revoke(input),
+          ),
+        30_000,
+        { label: "desktop browser Stop reconciliation", immediate: true },
+      )
+    : undefined;
+  desktopBrowserStopReconciliation?.start();
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
@@ -1183,6 +1199,18 @@ export function buildApp(
     signals: runSignals,
     tasks,
     desktopBrowserTasks,
+    ...(desktopBrowserRelayControl
+      ? {
+          desktopBrowserRevoke: (input: {
+            publicDeviceFingerprint: string;
+            browserInstanceId: string;
+            taskId: string;
+            attemptId: string;
+            leaseId: string;
+            leaseVersion: number;
+          }) => desktopBrowserRelayControl.revoke(input),
+        }
+      : {}),
     desktopBrowserDeviceRegistry,
     modelGateway,
     modelCredentials,
@@ -1495,6 +1523,7 @@ export function buildApp(
         swallowAs("wiring: worker drain failed", undefined),
       );
       await Promise.all(workers.map((w) => w.releaseInFlight()));
+      desktopBrowserStopReconciliation?.stop();
       drain.stop();
       runs.close?.();
       void runSignals.close?.();
@@ -1518,6 +1547,7 @@ export function buildApp(
     tasks,
     desktopBrowserTasks,
     desktopBrowserDeviceRegistry,
+    ...(desktopBrowserStopReconciliation ? { desktopBrowserStopReconciliation } : {}),
     sessionStateBus,
     runtime,
     config: configStore,

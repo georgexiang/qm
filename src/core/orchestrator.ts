@@ -1902,22 +1902,29 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                     | { action: "invoke"; argv: string[] }
                     | { action: "finalize"; outcome: "completed" | "failed"; summary: string },
                 ) =>
-                  request.action === "invoke"
-                    ? deps.desktopBrowserOperations!.invokeForSession({
-                        sessionId: session.id,
-                        actorId: actor.id,
-                        projectScopeLabel: scopeId,
-                        projectMembershipVersion: input.scopeVersion!,
-                        argv: request.argv,
-                      })
-                    : deps.desktopBrowserOperations!.finalizeForSession({
-                        sessionId: session.id,
-                        actorId: actor.id,
-                        projectScopeLabel: scopeId,
-                        projectMembershipVersion: input.scopeVersion!,
-                        outcome: request.outcome,
-                        summary: request.summary,
-                      }),
+                  withManagedRosterVersion(async () => {
+                    await deps.identity.refresh();
+                    const currentActor = deps.identity.classify(actor.id);
+                    if (!deps.identity.isInternal(currentActor)) {
+                      return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+                    }
+                    return request.action === "invoke"
+                      ? deps.desktopBrowserOperations!.invokeForSession({
+                          sessionId: session.id,
+                          actorId: currentActor.id,
+                          projectScopeLabel: scopeId,
+                          projectMembershipVersion: input.scopeVersion!,
+                          argv: request.argv,
+                        })
+                      : deps.desktopBrowserOperations!.finalizeForSession({
+                          sessionId: session.id,
+                          actorId: currentActor.id,
+                          projectScopeLabel: scopeId,
+                          projectMembershipVersion: input.scopeVersion!,
+                          outcome: request.outcome,
+                          summary: request.summary,
+                        });
+                  }),
               }
             : {}),
           memory: deps.memory,

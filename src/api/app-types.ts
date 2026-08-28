@@ -253,7 +253,7 @@ export interface App {
     taskId: string,
     principalId: string,
     authorityId: string,
-    action: "cancel",
+    action: "cancel" | "stop",
   ): Promise<TurnResult>;
   desktopBrowserReserveRegistration(
     taskId: string,
@@ -616,6 +616,14 @@ export interface AppDeps {
   signals?: RunSignalStore;
   tasks?: TaskStore;
   desktopBrowserTasks: DesktopBrowserTaskStore;
+  desktopBrowserRevoke?: (input: {
+    publicDeviceFingerprint: string;
+    browserInstanceId: string;
+    taskId: string;
+    attemptId: string;
+    leaseId: string;
+    leaseVersion: number;
+  }) => Promise<void>;
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   modelGateway: ModelGateway;
   modelCredentials?: ModelCredentialStore;

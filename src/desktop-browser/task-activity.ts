@@ -7,12 +7,14 @@ export interface DesktopBrowserActivityProjection {
     | "waiting_for_broker"
     | "waiting_for_local_confirmation"
     | "registration_confirmed"
+    | "running"
     | "completed"
     | "failed"
-    | "canceled";
+    | "canceled"
+    | "canceled_with_unknown_effects";
   connectCommand?: string;
   actionAuthority: string;
-  actions: Array<"confirm" | "cancel">;
+  actions: Array<"confirm" | "cancel" | "stop">;
   registration?: {
     registrationId: string;
     confirmationFingerprint: string;
@@ -41,6 +43,7 @@ export function projectDesktopBrowserTaskActivity(
     | "projectId"
     | "outcome"
     | "browserSkillSessionId"
+    | "browserSkillSessionStoppedAt"
     | "browserInstanceId"
     | "agentWindowId"
     | "latestObservation"
@@ -66,10 +69,18 @@ export function projectDesktopBrowserTaskActivity(
       },
     };
   }
-  if (task.status === "canceled") {
+  if (task.status === "waiting_for_broker" && task.browserSkillSessionId && !task.browserSkillSessionStoppedAt) {
     return {
       taskId: task.id,
-      status: "canceled",
+      status: "running",
+      actionAuthority: task.authorityId,
+      actions: ["stop"],
+    };
+  }
+  if (task.status === "canceled" || task.status === "canceled_with_unknown_effects") {
+    return {
+      taskId: task.id,
+      status: task.status,
       connectCommand: `qm-host-broker connect ${publicWebUrl}`,
       actionAuthority: task.authorityId,
       actions: [],
@@ -102,6 +113,10 @@ export function projectDesktopBrowserTaskActivity(
 export function projectDesktopBrowserActivityReply(activity: DesktopBrowserActivityProjection): string {
   if (activity.status === "completed" || activity.status === "failed") {
     return activity.result?.summary ?? `Desktop Browser Task ${activity.status}.`;
+  }
+  if (activity.status === "running") return "Desktop Browser Task is running.";
+  if (activity.status === "canceled_with_unknown_effects") {
+    return "Desktop Browser Task canceled with unknown browser effects.";
   }
   if (activity.status === "canceled") return "Desktop Browser Task canceled.";
   if (activity.status === "waiting_for_broker") {
