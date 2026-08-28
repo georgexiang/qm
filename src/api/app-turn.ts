@@ -29,6 +29,7 @@ import {
   projectDesktopBrowserActivityReply,
   projectDesktopBrowserTaskActivity,
 } from "../desktop-browser/task-activity.ts";
+import { persistDesktopBrowserFinalizationAudit } from "../desktop-browser/finalization-audit.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -59,6 +60,10 @@ export function createTurnMethods(
   | "desktopBrowserPrepareSessionStart"
   | "desktopBrowserConsumeSessionStartAccepted"
   | "desktopBrowserConsumeSessionStartResult"
+  | "desktopBrowserPrepareOperation"
+  | "desktopBrowserConsumeOperationAccepted"
+  | "desktopBrowserConsumeOperationResult"
+  | "desktopBrowserFinalizeTask"
   | "getApproval"
   | "subscribeSessionStates"
   | "listSessionApprovals"
@@ -83,7 +88,7 @@ export function createTurnMethods(
   } = h;
   const { shouldRouteToSpine, markTriggerHandled, addressedWakeText } = ambient;
   const waitingActivity = async (
-    task: Pick<NonNullable<Awaited<ReturnType<typeof deps.desktopBrowserTasks.get>>>, "id" | "status" | "authorityId">,
+    task: NonNullable<Awaited<ReturnType<typeof deps.desktopBrowserTasks.get>>>,
     sessionId?: string,
   ) => {
     const desktopBrowserActivity = projectDesktopBrowserTaskActivity(
@@ -103,6 +108,7 @@ export function createTurnMethods(
     authorityId: string,
     fn: (task: NonNullable<Awaited<ReturnType<typeof deps.desktopBrowserTasks.get>>>) => Promise<T>,
     onDrift?: () => Promise<void>,
+    allowTerminal = false,
   ): Promise<T | { status: "refused"; reason: string }> {
     const task = await deps.desktopBrowserTasks.get(taskId);
     if (!task) {
@@ -115,7 +121,7 @@ export function createTurnMethods(
         await onDrift?.();
         return { status: "refused", reason: "Desktop Browser Task not found" } as const;
       }
-      if (currentTask.status !== "waiting_for_broker") {
+      if (currentTask.status !== "waiting_for_broker" && !allowTerminal) {
         await onDrift?.();
         return { status: "refused", reason: "Desktop Browser Task is no longer waiting" } as const;
       }
@@ -832,6 +838,45 @@ export function createTurnMethods(
         return validated;
       }
       return deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result as HostResultMessage);
+    },
+
+    async desktopBrowserPrepareOperation(taskId, authorityId, argv) {
+      return withCurrentWaitingTask(taskId, authorityId, async () => {
+        return deps.desktopBrowserTasks.prepareOperation(taskId, argv);
+      });
+    },
+
+    async desktopBrowserConsumeOperationAccepted(taskId, accepted) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return deps.desktopBrowserTasks.consumeOperationAccepted(taskId, accepted as HostAcceptedMessage);
+    },
+
+    async desktopBrowserConsumeOperationResult(taskId, result) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return deps.desktopBrowserTasks.consumeOperationResult(taskId, result as HostResultMessage);
+    },
+
+    async desktopBrowserFinalizeTask(taskId, principalId, authorityId, input) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      const actor = deps.identity.classify(principalId);
+      if (!task || task.actorId !== actor.id || !constantTimeEqual(task.authorityId, authorityId)) {
+        return { status: "refused", reason: "Desktop Browser Task not found" };
+      }
+      return withCurrentWaitingTask(
+        taskId,
+        authorityId,
+        async () => {
+          const finalized = await deps.desktopBrowserTasks.finalize(taskId, input);
+          if (finalized.status === "ok") {
+            await persistDesktopBrowserFinalizationAudit(deps.desktopBrowserTasks, deps.auditLog, finalized.task);
+          }
+          return finalized;
+        },
+        undefined,
+        true,
+      );
     },
 
     subscribeSessionStates(cb) {

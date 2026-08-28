@@ -4,9 +4,11 @@ import {
   type Server as HttpServer,
   type ServerResponse,
 } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { WebSocketServer } from "ws";
 import { attachDesktopBrowserRelayWebSocketServer, type DesktopBrowserRelayService } from "./index.ts";
+import type { RelayInvocationMessage } from "qm-desktop-browser-contracts";
 
 export interface DesktopBrowserRelayReadinessProbe {
   check(): Promise<void>;
@@ -19,6 +21,7 @@ export interface DesktopBrowserRelayServerOptions {
   service: DesktopBrowserRelayService;
   adapterReadiness: DesktopBrowserRelayReadinessProbe;
   storageReadiness?: DesktopBrowserRelayReadinessProbe;
+  coreAuthSecret?: string;
   shutdownDrainMs: number;
 }
 
@@ -64,6 +67,28 @@ function rejectUpgrade(socket: Duplex): void {
   socket.destroy();
 }
 
+async function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maxBytes) throw new Error("request body exceeds limit");
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function validCoreSignature(req: IncomingMessage, pathWithQuery: string, body: string, secret: string): boolean {
+  const timestamp = String(req.headers["x-timestamp"] ?? "");
+  const signature = String(req.headers["x-signature"] ?? "");
+  if (!/^\d+$/.test(timestamp) || !/^v0=[a-f0-9]{64}$/.test(signature)) return false;
+  if (Math.abs(Date.now() - Number(timestamp) * 1000) > 5 * 60_000) return false;
+  const canonical = `POST\n${pathWithQuery}\n${body}`;
+  const expected = `v0=${createHmac("sha256", secret).update(`v0:${timestamp}:${canonical}`).digest("hex")}`;
+  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
 export function createDesktopBrowserRelayServer(
   options: DesktopBrowserRelayServerOptions,
 ): DesktopBrowserRelayServerRuntime {
@@ -77,11 +102,13 @@ export function createDesktopBrowserRelayServer(
 
   const wsServer = new WebSocketServer({ noServer: true });
   const detach = attachDesktopBrowserRelayWebSocketServer(wsServer, options.service);
+  const coreNonceExpirations = new Map<string, number>();
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
 
   const server = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const pathname = new URL(req.url ?? "/", "http://relay.local").pathname;
+    const url = new URL(req.url ?? "/", "http://relay.local");
+    const pathname = url.pathname;
     if (req.method === "GET" && pathname === "/healthz") {
       sendJson(res, 200, { ok: true });
       return;
@@ -89,6 +116,52 @@ export function createDesktopBrowserRelayServer(
     if (req.method === "GET" && pathname === "/readyz") {
       const state = await runtime.ready();
       sendJson(res, state.ok ? 200 : 503, state);
+      return;
+    }
+    if (req.method === "POST" && pathname === "/v1/invocations" && options.coreAuthSecret) {
+      try {
+        const body = await readBody(req, 128 * 1024);
+        const nonce = url.searchParams.get("_sourceAuthNonce");
+        if (!nonce || !validCoreSignature(req, pathname + url.search, body, options.coreAuthSecret)) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const now = Date.now();
+        for (const [key, expiresAt] of coreNonceExpirations) {
+          if (expiresAt <= now) coreNonceExpirations.delete(key);
+        }
+        if (coreNonceExpirations.has(nonce)) {
+          sendJson(res, 409, { error: "replayed_request" });
+          return;
+        }
+        while (coreNonceExpirations.size >= 10_000) {
+          const oldest = coreNonceExpirations.keys().next().value;
+          if (typeof oldest !== "string") break;
+          coreNonceExpirations.delete(oldest);
+        }
+        coreNonceExpirations.set(nonce, now + 5 * 60_000);
+        const parsed: unknown = JSON.parse(body);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          throw new Error("invalid invocation request");
+        const input = parsed as Record<string, unknown>;
+        if (
+          typeof input.publicDeviceFingerprint !== "string" ||
+          typeof input.browserInstanceId !== "string" ||
+          !input.invocation ||
+          typeof input.invocation !== "object" ||
+          Array.isArray(input.invocation)
+        ) {
+          throw new Error("invalid invocation request");
+        }
+        const result = await options.service.dispatchProjectedInvocation({
+          publicDeviceFingerprint: input.publicDeviceFingerprint,
+          browserInstanceId: input.browserInstanceId,
+          invocation: input.invocation as RelayInvocationMessage,
+        });
+        sendJson(res, 200, result);
+      } catch {
+        sendJson(res, 409, { error: "dispatch_failed" });
+      }
       return;
     }
     res.statusCode = 404;

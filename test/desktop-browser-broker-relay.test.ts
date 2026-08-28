@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { test } from "node:test";
 import {
+  DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  buildDesktopBrowserNavigateArgv,
   computeDesktopBrowserRequestHash,
   encodeHostChallengeResponseSigningBytes,
   type HostAcceptedMessage,
@@ -427,6 +429,70 @@ async function createRegisteredTicket05Relay(
   await flushMessages();
   return { adapter, clock, identity, service, socket };
 }
+
+test("Ticket 06 relay dispatches protocol 1.3 navigate and returns the sanitized Host result", async () => {
+  const { identity, service, socket } = await createRegisteredTicket05Relay({
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  });
+  const authority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    operationId: "operation-navigate",
+    operationSequence: 2,
+    capabilitySet: {
+      ...desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet,
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    },
+    argv: buildDesktopBrowserNavigateArgv("https://example.test", "session-1"),
+    effectClass: "browser_effect" as const,
+    nonce: "nonce-navigate",
+  };
+  const invocation: RelayInvocationMessage = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    kind: "relay.invoke",
+    payload: {
+      dispatchId: "dispatch-navigate",
+      requestHash: computeDesktopBrowserRequestHash(authority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+      authority,
+    },
+  };
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation,
+  });
+  await flushMessages();
+  assert.deepEqual(JSON.parse(socket.sent[1]!), invocation);
+
+  const accepted: HostAcceptedMessage = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    kind: "host.accepted",
+    payload: {
+      dispatchId: invocation.payload.dispatchId,
+      operationId: authority.operationId,
+      requestHash: invocation.payload.requestHash,
+    },
+  };
+  const completed: HostResultMessage = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    kind: "host.result",
+    payload: {
+      dispatchId: invocation.payload.dispatchId,
+      operationId: authority.operationId,
+      outcome: "completed",
+      resultHash: "sha256:navigate-result",
+      result: {
+        schemaVersion: "1.0",
+        command: "navigate",
+        completedAt: "2026-08-27T12:00:01.000Z",
+        data: { tab_id: 7, reached: "load" },
+      },
+    },
+  };
+  socket.message(JSON.stringify(accepted));
+  socket.message(JSON.stringify(completed));
+  assert.deepEqual(await pending, { kind: "host.result", accepted, result: completed });
+});
 
 test("relay keeps a verified host pending until registration refresh promotes it and blocks invocation while pending", async () => {
   const clock = new ManualClock();

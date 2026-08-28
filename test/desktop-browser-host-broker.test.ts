@@ -22,11 +22,16 @@ import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_RELAY_AUDIENCE,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
+  DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  buildDesktopBrowserNavigateArgv,
+  buildDesktopBrowserObserveArgv,
+  buildDesktopBrowserSessionStopArgv,
   computeDesktopBrowserPublicDeviceFingerprint,
   computeDesktopBrowserRegistrationConfirmationFingerprint,
   computeDesktopBrowserRequestHash,
   decodeDesktopBrowserMessage,
   projectDesktopBrowserPublicIdentity,
+  type DesktopBrowserOperationAuthorityEnvelope,
   type DesktopBrowserSessionStartAuthorityEnvelope,
   type HostAcceptedMessage,
   type HostChallengeResponseMessage,
@@ -41,6 +46,13 @@ import {
 } from "../packages/qm-broker-relay/src/index.ts";
 import { createDesktopBrowserRelayServer } from "../packages/qm-broker-relay/src/server.ts";
 import { desktopBrowserRegistrationReservationTupleFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
+import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/desktop-browser/browser-task-store.ts";
+import { createDesktopBrowserOperationCoordinator } from "../src/desktop-browser/operation-coordinator.ts";
+import { projectDesktopBrowserTaskActivity } from "../src/desktop-browser/task-activity.ts";
+import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { createAuditLog } from "../src/audit/audit-log.ts";
+import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
+import { createPiTools, type ToolContextRef } from "../src/harness/pi-tools.ts";
 import {
   HOST_BROKER_CONTROL_NOTICE,
   HostBrokerSpawnRejectedError,
@@ -349,11 +361,13 @@ async function connectOperationHost(input: {
   now?: number;
   supportedPolicyGrammarVersions?: string[];
   challengePolicyGrammarVersion?: string;
+  protocolVersion?: "1.2" | "1.3";
 }): Promise<{ socket: FakeSocket; running: Promise<unknown> }> {
   const identity = await loadOrCreateDeviceIdentity(input.dataDir);
   const socket = new FakeSocket();
   const scheduler = new FakeScheduler();
   scheduler.nowMs = input.now ?? Date.now();
+  const protocolVersion = input.protocolVersion ?? "1.2";
   const connection = new HostBrokerConnection({
     qmUrl: "https://qm.example.com",
     relayUrl: "wss://relay.example.com/v1/device",
@@ -361,7 +375,7 @@ async function connectOperationHost(input: {
     deviceId: "device-1",
     brokerInstanceId: "broker-local-1",
     brokerVersion: "0.0.0-test",
-    supportedProtocolVersions: ["1.0", "1.2"],
+    supportedProtocolVersions: ["1.0", protocolVersion],
     supportedPolicyGrammarVersions: input.supportedPolicyGrammarVersions ?? ["1.0"],
     identity,
     runtime: runtime(),
@@ -376,7 +390,7 @@ async function connectOperationHost(input: {
   socket.open();
   socket.message(
     JSON.stringify({
-      protocolVersion: "1.2",
+      protocolVersion,
       kind: "relay.challenge",
       payload: {
         relayInstanceId: "relay-a",
@@ -392,6 +406,587 @@ async function connectOperationHost(input: {
   await waitFor(() => (socket.sent.length === 2 ? true : undefined), "host challenge response");
   return { socket, running };
 }
+
+test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered output", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-ticket-06-navigate-"));
+  const spawnArgv: Array<readonly string[]> = [];
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run(_executable, argv) {
+      spawnArgv.push(argv);
+      if (argv[1] === "session" && argv[2] === "start") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            session_id: "session-1",
+            browser_instance_id: "browser-primary",
+            agent_window_id: 42,
+          }),
+          stderr: "",
+        };
+      }
+      if (argv[1] === "session" && argv[2] === "stop") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            returned_tab_ids: [7],
+            return_failures: [{ tab_id: 8, code: "permission_denied", message: "token=secret" }],
+          }),
+          stderr: "",
+        };
+      }
+      if (argv[1] === "observe") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            tab_id: 7,
+            text: "Welcome\nAuthorization: Bearer secret\npassword=hidden\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature123\nhttps://alice:secret@example.test/private\nVisible content",
+            ref_count: 2,
+            truncated: false,
+            debug: { hidden_dom: "must-not-leave-host" },
+          }),
+          stderr: "",
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          tab_id: 7,
+          reached: "load",
+          url: "https://example.test/?token=secret",
+          error_text: "Authorization: Bearer secret",
+          future_field: "must-not-leave-host",
+        }),
+        stderr: "",
+      };
+    },
+  };
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    sessionRunner,
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  });
+  const startAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...sessionStartAuthority("0198f3d2-1950-7000-8000-000000000061"),
+    capabilitySet: {
+      ...sessionStartAuthority("ignored").capabilitySet,
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    },
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-start",
+        requestHash: computeDesktopBrowserRequestHash(startAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority: startAuthority,
+      },
+    }),
+  );
+  await waitFor(() => socket.sent[3], "Ticket 06 session-start result");
+
+  const navigateAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...startAuthority,
+    operationId: "0198f3d2-1950-7000-8000-000000000062",
+    operationSequence: 2,
+    leaseVersion: 4,
+    argv: buildDesktopBrowserNavigateArgv("https://example.test", "session-1"),
+    effectClass: "browser_effect",
+    nonce: "nonce-navigate",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-navigate",
+        requestHash: computeDesktopBrowserRequestHash(navigateAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority: navigateAuthority,
+      },
+    }),
+  );
+  const navigateResult = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[5], "Ticket 06 navigate result"),
+    DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  ) as HostResultMessage;
+  assert.equal(navigateResult.payload.outcome, "completed");
+  if (
+    navigateResult.payload.outcome !== "completed" ||
+    !("schemaVersion" in navigateResult.payload.result) ||
+    navigateResult.payload.result.command !== "navigate"
+  ) {
+    assert.fail("Host did not return a sanitized navigate result");
+  }
+  assert.deepEqual(navigateResult.payload, {
+    dispatchId: "dispatch-navigate",
+    operationId: navigateAuthority.operationId,
+    outcome: "completed",
+    resultHash: navigateResult.payload.resultHash,
+    result: {
+      schemaVersion: "1.0",
+      command: "navigate",
+      completedAt: navigateResult.payload.result.completedAt,
+      data: { tab_id: 7, reached: "load" },
+    },
+  });
+
+  const observeAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...startAuthority,
+    operationId: "0198f3d2-1950-7000-8000-000000000063",
+    operationSequence: 3,
+    leaseVersion: 5,
+    argv: buildDesktopBrowserObserveArgv("session-1"),
+    effectClass: "observation",
+    nonce: "nonce-observe",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-observe",
+        requestHash: computeDesktopBrowserRequestHash(observeAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority: observeAuthority,
+      },
+    }),
+  );
+  const observeResult = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[7], "Ticket 06 observe result"),
+    DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  ) as HostResultMessage;
+  assert.equal(observeResult.payload.outcome, "completed");
+  if (
+    observeResult.payload.outcome !== "completed" ||
+    !("schemaVersion" in observeResult.payload.result) ||
+    observeResult.payload.result.command !== "observe"
+  ) {
+    assert.fail("Host did not return a sanitized observation result");
+  }
+  assert.deepEqual(observeResult.payload.result, {
+    schemaVersion: "1.0",
+    command: "observe",
+    completedAt: observeResult.payload.result.completedAt,
+    data: {
+      tab_id: 7,
+      text: "Welcome\n[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\nVisible content",
+      ref_count: 2,
+      truncated: false,
+    },
+  });
+
+  assert.equal(readdirSync(join(dir, "sessions")).length, 1);
+  const stopAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...startAuthority,
+    operationId: "0198f3d2-1950-7000-8000-000000000064",
+    operationSequence: 4,
+    leaseVersion: 6,
+    argv: buildDesktopBrowserSessionStopArgv("session-1"),
+    effectClass: "cleanup",
+    nonce: "nonce-stop",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-stop",
+        requestHash: computeDesktopBrowserRequestHash(stopAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority: stopAuthority,
+      },
+    }),
+  );
+  const stopResult = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[9], "Ticket 06 session-stop result"),
+    DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  ) as HostResultMessage;
+  assert.equal(stopResult.payload.outcome, "completed");
+  if (
+    stopResult.payload.outcome !== "completed" ||
+    !("schemaVersion" in stopResult.payload.result) ||
+    stopResult.payload.result.command !== "session.stop"
+  ) {
+    assert.fail("Host did not return a sanitized session-stop result");
+  }
+  assert.deepEqual(stopResult.payload.result, {
+    schemaVersion: "1.0",
+    command: "session.stop",
+    completedAt: stopResult.payload.result.completedAt,
+    data: {
+      returned_tab_ids: [7],
+      return_failures: [{ tab_id: 8, code: "permission_denied" }],
+    },
+  });
+  assert.equal(readdirSync(join(dir, "sessions")).length, 0);
+
+  const fenceCount = readdirSync(join(dir, "operations")).length;
+  const foreignAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...navigateAuthority,
+    operationId: "0198f3d2-1950-7000-8000-000000000065",
+    operationSequence: 5,
+    argv: buildDesktopBrowserNavigateArgv("https://example.test", "session-2"),
+    nonce: "nonce-foreign-session",
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-foreign",
+        requestHash: computeDesktopBrowserRequestHash(foreignAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority: foreignAuthority,
+      },
+    }),
+  );
+  await assert.rejects(running, /Task-owned session/);
+  assert.equal(readdirSync(join(dir, "operations")).length, fenceCount);
+  assert.deepEqual(spawnArgv, [startAuthority.argv, navigateAuthority.argv, observeAuthority.argv, stopAuthority.argv]);
+});
+
+test("Ticket 06 rejects stale attempts and operation ordering before fencing or spawning", async () => {
+  for (const mutation of [
+    { attemptId: "attempt-stale", operationSequence: 2, leaseVersion: 4 },
+    { attemptId: "attempt-1", operationSequence: 3, leaseVersion: 4 },
+    { attemptId: "attempt-1", operationSequence: 2, leaseVersion: 5 },
+  ]) {
+    const dir = mkdtempSync(join(tmpdir(), "host-broker-ticket-06-ordering-"));
+    let spawnCalls = 0;
+    const { socket, running } = await connectOperationHost({
+      dataDir: dir,
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      sessionRunner: {
+        async run() {
+          spawnCalls += 1;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              session_id: "session-1",
+              browser_instance_id: "browser-primary",
+              agent_window_id: 42,
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+    const startAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+      ...sessionStartAuthority("start-ordering"),
+      capabilitySet: {
+        ...sessionStartAuthority("ignored").capabilitySet,
+        protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      },
+    };
+    socket.message(
+      JSON.stringify({
+        protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: "dispatch-start",
+          requestHash: computeDesktopBrowserRequestHash(startAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+          authority: startAuthority,
+        },
+      }),
+    );
+    await waitFor(() => socket.sent[3], "ordered session start");
+    const fenceCount = readdirSync(join(dir, "operations")).length;
+    const invalidAuthority: DesktopBrowserOperationAuthorityEnvelope = {
+      ...startAuthority,
+      ...mutation,
+      operationId: "invalid-ordering",
+      argv: buildDesktopBrowserNavigateArgv("https://example.test", "session-1"),
+      effectClass: "browser_effect",
+      nonce: "nonce-invalid-ordering",
+    };
+    socket.message(
+      JSON.stringify({
+        protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: "dispatch-invalid",
+          requestHash: computeDesktopBrowserRequestHash(invalidAuthority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+          authority: invalidAuthority,
+        },
+      }),
+    );
+    await assert.rejects(running, /attempt|sequence|lease version/);
+    assert.equal(readdirSync(join(dir, "operations")).length, fenceCount);
+    assert.equal(spawnCalls, 1);
+  }
+});
+
+test("Ticket 06 product seam reaches a visible window, sanitized observation, cleanup, and Core outcome", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "desktop-browser-ticket-06-product-"));
+  const identity = await loadOrCreateDeviceIdentity(dir);
+  const publicDeviceFingerprint = computeDesktopBrowserPublicDeviceFingerprint({
+    publicIdentityVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    deploymentCanonicalId: "qm://deployments/example",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-product",
+    browserInstanceId: "browser-primary",
+  });
+  const registry = new MemoryRegistryAdapter();
+  registry.setBinding({
+    registrationId: "registration-product",
+    registrationState: "registered",
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-product",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+  });
+  const relay = new DesktopBrowserRelayService({
+    relayInstanceId: "relay-product",
+    deploymentCanonicalId: "qm://deployments/example",
+    supportedProtocolVersions: [DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION],
+    supportedPolicyGrammarVersions: ["1.0"],
+    registry,
+    createNonce: () => "relay-nonce-product",
+    createConnectionId: () => "connection-product",
+  });
+  const relayHttp = createDesktopBrowserRelayServer({
+    host: "127.0.0.1",
+    port: 0,
+    path: DESKTOP_BROWSER_RELAY_WSS_PATH,
+    service: relay,
+    adapterReadiness: { check: async () => undefined },
+    coreAuthSecret: "relay-core-auth-secret-for-product-test-0001",
+    shutdownDrainMs: 50,
+  });
+  await relayHttp.listen();
+  const relayHttpPort = (relayHttp.server.address() as AddressInfo).port;
+  const sockets = createLinkedSocketPair();
+  relay.acceptSocket(sockets.relay);
+  const host = new HostBrokerConnection({
+    qmUrl: "https://qm.example.com",
+    relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
+    deploymentCanonicalId: "qm://deployments/example",
+    deviceId: publicDeviceFingerprint,
+    brokerInstanceId: "broker-product",
+    brokerVersion: "0.0.0-test",
+    supportedProtocolVersions: [DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION],
+    supportedPolicyGrammarVersions: ["1.0"],
+    identity,
+    runtime: runtime(),
+    dataDir: dir,
+    browserSkillExecutable: TEST_BROWSER_SKILL_EXECUTABLE,
+    sessionRunner: {
+      async run(_executable, argv) {
+        if (argv[1] === "session" && argv[2] === "start") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              session_id: "browser-session-product",
+              browser_instance_id: "browser-primary",
+              agent_window_id: 42,
+            }),
+            stderr: "",
+          };
+        }
+        if (argv[1] === "navigate") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({ tab_id: 7, reached: "load", url: "https://example.test/?token=secret" }),
+            stderr: "",
+          };
+        }
+        if (argv[1] === "observe") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              tab_id: 7,
+              text: "Heading: Example\nAuthorization: Bearer secret",
+              ref_count: 1,
+              truncated: false,
+            }),
+            stderr: "",
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ returned_tab_ids: [7], return_failures: [] }),
+          stderr: "",
+        };
+      },
+    },
+    transport: {
+      connect() {
+        return sockets.host;
+      },
+    },
+  });
+  const running = host.start().catch(() => undefined);
+  sockets.host.open();
+  const projection = await waitFor(() => registry.published.get("connection-product"), "product relay projection");
+  assert.equal(projection.publicDeviceFingerprint, publicDeviceFingerprint);
+  const now = Date.now();
+  const authorityState = {
+    registration: {
+      deploymentCanonicalId: "qm://deployments/example",
+      registrationId: "registration-product",
+      waitingTaskId: "task-product",
+      actorId: "actor-product",
+      projectId: "project-product",
+      membershipEpoch: 42,
+      authorityId: "authority-product",
+      authorityExpiresAt: now + 120_000,
+      publicDeviceFingerprint: projection.publicDeviceFingerprint,
+      browserInstanceId: "browser-primary",
+      status: "online" as const,
+      browserRuntimeStatus: "ready" as const,
+    },
+    relayConnection: projection,
+  };
+  const ids = [
+    "task-product",
+    "attempt-product",
+    "lease-product",
+    "operation-start-product",
+    "nonce-start-product",
+    "operation-navigate-product",
+    "nonce-navigate-product",
+    "operation-observe-product",
+    "nonce-observe-product",
+    "operation-stop-product",
+    "nonce-stop-product",
+  ];
+  const tasks = createDesktopBrowserTaskStore(createMemoryMap<DesktopBrowserTask>(), {
+    id: () => ids.shift()!,
+    now: () => now,
+    sessionStartAuthority: async () => structuredClone(authorityState),
+  });
+  const task = await tasks.createWaiting({
+    goal: "Inspect the example page",
+    actorId: "actor-product",
+    projectId: "project-product",
+    projectName: "Product Project",
+    projectMembershipVersion: "42",
+    authorityId: "authority-product",
+    authorityExpiresAt: now + 120_000,
+    sessionId: "session-product",
+    threadRef: "thread-product",
+  });
+  const preparedStart = await tasks.prepareSessionStart(task.id);
+  assert.equal(preparedStart.status, "ok");
+  const startInvocation = {
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    kind: "relay.invoke" as const,
+    payload: {
+      dispatchId: "dispatch-start-product",
+      requestHash: preparedStart.operation.requestHash,
+      authority: preparedStart.operation.authority,
+    },
+  };
+  const startDispatch = await relay.dispatchProjectedInvocation({
+    publicDeviceFingerprint: projection.publicDeviceFingerprint,
+    browserInstanceId: "browser-primary",
+    invocation: startInvocation,
+  });
+  assert.equal(startDispatch.kind, "host.result");
+  if (startDispatch.kind !== "host.result") assert.fail("session start did not reach Host");
+  await tasks.consumeSessionStartAccepted(task.id, startDispatch.accepted);
+  await tasks.consumeSessionStartResult(task.id, startDispatch.result, { status: "ok", authority: authorityState });
+
+  let dispatchNumber = 0;
+  const auditLog = createAuditLog();
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks,
+    auditLog,
+    createDispatchId: () => `dispatch-product-${++dispatchNumber}`,
+    dispatcher: createHttpDesktopBrowserRelayDispatcher({
+      baseUrl: `http://127.0.0.1:${relayHttpPort}`,
+      authSecret: "relay-core-auth-secret-for-product-test-0001",
+    }),
+  });
+  const scope = {
+    sessionId: "session-product",
+    actorId: "actor-product",
+    projectScopeLabel: "group:web-project-project-product",
+    projectMembershipVersion: "42",
+  };
+  const toolRef: ToolContextRef = {
+    current: {
+      browserTask: (
+        request:
+          | { action: "invoke"; argv: string[] }
+          | { action: "finalize"; outcome: "completed" | "failed"; summary: string },
+      ) =>
+        request.action === "invoke"
+          ? coordinator.invokeForSession({ ...scope, argv: request.argv })
+          : coordinator.finalizeForSession({
+              ...scope,
+              outcome: request.outcome,
+              summary: request.summary,
+            }),
+      mcpToolDefs: () => [],
+      callMcpTool: async () => "",
+    } as any,
+    scopeLabel: scope.projectScopeLabel,
+  };
+  const browserTask = createPiTools(toolRef).find((tool) => tool.name === "browser_task");
+  assert.ok(browserTask);
+  const invokeTool = async (params: unknown) => {
+    const executeTool = browserTask.execute as unknown as (callId: string, input: unknown) => Promise<unknown>;
+    const response = (await executeTool("browser-task-call", params)) as {
+      content: Array<{ type: string; text?: string }>;
+    };
+    return JSON.parse(response.content[0]!.text ?? "null") as Record<string, any>;
+  };
+  assert.equal(
+    (
+      await invokeTool({
+        action: "invoke",
+        argv: buildDesktopBrowserNavigateArgv("https://example.test", "browser-session-product"),
+      })
+    ).status,
+    "ok",
+  );
+  const observed = await invokeTool({
+    action: "invoke",
+    argv: buildDesktopBrowserObserveArgv("browser-session-product"),
+  });
+  assert.equal(observed.status, "ok");
+  assert.equal(observed.observation.data.text, "Heading: Example\n[REDACTED]");
+  assert.equal(
+    (
+      await invokeTool({
+        action: "invoke",
+        argv: buildDesktopBrowserSessionStopArgv("browser-session-product"),
+      })
+    ).status,
+    "ok",
+  );
+  assert.deepEqual(await invokeTool({ action: "finalize", outcome: "completed", summary: "Example page inspected" }), {
+    status: "ok",
+    taskId: "task-product",
+  });
+  assert.deepEqual(await invokeTool({ action: "finalize", outcome: "completed", summary: "Example page inspected" }), {
+    status: "ok",
+    taskId: "task-product",
+  });
+  const completed = await tasks.get(task.id);
+  assert.ok(completed);
+  assert.deepEqual(projectDesktopBrowserTaskActivity(completed, "https://qm.example.com", null).result, {
+    outcome: "completed",
+    summary: "Example page inspected",
+    actorId: "actor-product",
+    projectId: "project-product",
+    browserSkillSessionId: "browser-session-product",
+    browserInstanceId: "browser-primary",
+    agentWindowId: 42,
+    observation: observed.observation,
+  });
+  assert.deepEqual(await auditLog.events(), [
+    {
+      at: now,
+      principalId: "actor-product",
+      action: "desktop_browser.task.finalized",
+      resource: "task-product",
+      scopeLabel: "group:web-project-project-product",
+      status: "completed",
+    },
+  ]);
+  assert.deepEqual(ids, []);
+  await relayHttp.shutdown();
+  await running;
+});
 
 function tupleForIdentity(devicePublicKey: string) {
   return {
@@ -850,6 +1445,8 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
     sessionId: "session-1",
     browserInstanceId: "browser-primary",
     agentWindowId: 42,
+    latestOperationSequence: 1,
+    latestLeaseVersion: 3,
   });
 
   await running;
@@ -1122,6 +1719,59 @@ test("a durable operation fence prevents duplicate and mismatched session-start 
 
   third.socket.close(1000, "done");
   await third.running;
+});
+
+test("a matching terminal Host fence replays after lease expiry without respawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-expired-terminal-replay-"));
+  let spawnCalls = 0;
+  const sessionRunner: HostBrokerSessionRunner = {
+    async run() {
+      spawnCalls += 1;
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          session_id: "session-expired-replay",
+          browser_instance_id: "browser-primary",
+          agent_window_id: 42,
+        }),
+        stderr: "",
+      };
+    },
+  };
+  const issuedAt = Date.now() - 1_000;
+  const authority = sessionStartAuthority("operation-expired-replay", issuedAt + 1_000);
+  const invocation = {
+    protocolVersion: "1.2",
+    kind: "relay.invoke",
+    payload: {
+      dispatchId: "dispatch-first",
+      requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+      authority,
+    },
+  };
+  const first = await connectOperationHost({ dataDir: dir, sessionRunner, now: issuedAt + 1_000 });
+  first.socket.message(JSON.stringify(invocation));
+  await waitFor(() => first.socket.sent[3], "terminal result before lease expiry");
+  first.socket.close(1000, "restart");
+  await first.running;
+
+  const second = await connectOperationHost({ dataDir: dir, sessionRunner, now: issuedAt + 61_001 });
+  second.socket.message(
+    JSON.stringify({
+      ...invocation,
+      payload: { ...invocation.payload, dispatchId: "dispatch-after-expiry" },
+    }),
+  );
+  const replayed = decodeDesktopBrowserMessage(
+    await waitFor(() => second.socket.sent[3], "terminal replay after lease expiry"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(replayed.payload.outcome, "completed");
+  assert.equal(replayed.payload.dispatchId, "dispatch-after-expiry");
+  assert.equal(spawnCalls, 1);
+  second.socket.close(1000, "done");
+  await second.running;
 });
 
 test("post-fence BrowserSkill output failures persist unknown without task ownership or retry", async () => {
@@ -1426,6 +2076,8 @@ test("disconnect after durable completion preserves completed ownership and repl
     sessionId: "session-ambiguous",
     browserInstanceId: "browser-primary",
     agentWindowId: 42,
+    latestOperationSequence: 1,
+    latestLeaseVersion: 3,
   });
 
   const second = await connectOperationHost({ dataDir: dir, sessionRunner });
@@ -1537,7 +2189,10 @@ test("explicit spawn rejection after acceptance persists failed and replays with
     operationId: authority.operationId,
     outcome: "failed",
     resultHash: failed.payload.resultHash,
-    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+    error: {
+      code: "browser_cli_spawn_rejected",
+      message: "BrowserSkill process creation was rejected before execution",
+    },
   });
   assert.equal(spawnCalls, 1);
   assert.equal(existsSync(join(dir, "sessions")), false);
@@ -1550,7 +2205,10 @@ test("explicit spawn rejection after acceptance persists failed and replays with
   assert.deepEqual(fence.terminalPayload, {
     dispatchId: "dispatch-spawn-rejected",
     outcome: "failed",
-    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+    error: {
+      code: "browser_cli_spawn_rejected",
+      message: "BrowserSkill process creation was rejected before execution",
+    },
   });
   first.socket.close(1000, "done");
   await first.running;
@@ -1578,7 +2236,10 @@ test("explicit spawn rejection after acceptance persists failed and replays with
     operationId: authority.operationId,
     outcome: "failed",
     resultHash: replayFailed.payload.resultHash,
-    error: { code: "browser_cli_spawn_rejected", message: "spawn ENOENT" },
+    error: {
+      code: "browser_cli_spawn_rejected",
+      message: "BrowserSkill process creation was rejected before execution",
+    },
   });
   assert.equal(spawnCalls, 1);
   second.socket.close(1000, "done");

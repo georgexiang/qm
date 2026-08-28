@@ -3,8 +3,14 @@ import type { DesktopBrowserTaskRegistrationProjection } from "./device-registry
 
 export interface DesktopBrowserActivityProjection {
   taskId: string;
-  status: "waiting_for_broker" | "waiting_for_local_confirmation" | "registration_confirmed" | "canceled";
-  connectCommand: string;
+  status:
+    | "waiting_for_broker"
+    | "waiting_for_local_confirmation"
+    | "registration_confirmed"
+    | "completed"
+    | "failed"
+    | "canceled";
+  connectCommand?: string;
   actionAuthority: string;
   actions: Array<"confirm" | "cancel">;
   registration?: {
@@ -13,13 +19,53 @@ export interface DesktopBrowserActivityProjection {
     expiresAt: string;
     confirmReady: boolean;
   };
+  result?: {
+    outcome: "completed" | "failed";
+    summary: string;
+    actorId: string;
+    projectId: string;
+    browserSkillSessionId?: string;
+    browserInstanceId?: string;
+    agentWindowId?: number;
+    observation?: DesktopBrowserTask["latestObservation"];
+  };
 }
 
 export function projectDesktopBrowserTaskActivity(
-  task: Pick<DesktopBrowserTask, "id" | "status" | "authorityId">,
+  task: Pick<
+    DesktopBrowserTask,
+    | "id"
+    | "status"
+    | "authorityId"
+    | "actorId"
+    | "projectId"
+    | "outcome"
+    | "browserSkillSessionId"
+    | "browserInstanceId"
+    | "agentWindowId"
+    | "latestObservation"
+  >,
   publicWebUrl: string | undefined,
   registration: DesktopBrowserTaskRegistrationProjection | null,
 ): DesktopBrowserActivityProjection {
+  if ((task.status === "completed" || task.status === "failed") && task.outcome) {
+    return {
+      taskId: task.id,
+      status: task.status,
+      actionAuthority: task.authorityId,
+      actions: [],
+      result: {
+        outcome: task.outcome.outcome,
+        summary: task.outcome.summary,
+        actorId: task.actorId,
+        projectId: task.projectId,
+        ...(task.browserSkillSessionId ? { browserSkillSessionId: task.browserSkillSessionId } : {}),
+        ...(task.browserInstanceId ? { browserInstanceId: task.browserInstanceId } : {}),
+        ...(task.agentWindowId === undefined ? {} : { agentWindowId: task.agentWindowId }),
+        ...(task.latestObservation ? { observation: structuredClone(task.latestObservation) } : {}),
+      },
+    };
+  }
   if (task.status === "canceled") {
     return {
       taskId: task.id,
@@ -54,6 +100,9 @@ export function projectDesktopBrowserTaskActivity(
 }
 
 export function projectDesktopBrowserActivityReply(activity: DesktopBrowserActivityProjection): string {
+  if (activity.status === "completed" || activity.status === "failed") {
+    return activity.result?.summary ?? `Desktop Browser Task ${activity.status}.`;
+  }
   if (activity.status === "canceled") return "Desktop Browser Task canceled.";
   if (activity.status === "waiting_for_broker") {
     return `No Host Broker is connected. Start it on the customer desktop:\n\n${activity.connectCommand}`;

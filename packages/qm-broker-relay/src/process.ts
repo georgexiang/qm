@@ -27,6 +27,7 @@ export interface DesktopBrowserRelayRuntimeConfig {
   deploymentCanonicalId: string;
   coreApiUrl: string;
   sourceAuthSecret: string;
+  coreAuthSecret: string;
   supportedProtocolVersions: string[];
   supportedPolicyGrammarVersions: string[];
   maxSettledDispatchHistory: number;
@@ -77,6 +78,10 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
   if (sourceAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
     throw new Error(`QM_RELAY_SOURCE_AUTH_SECRET must be at least ${MIN_SOURCE_AUTH_SECRET_LENGTH} characters`);
   }
+  const coreAuthSecret = requireEnv("QM_RELAY_CORE_AUTH_SECRET", env.QM_RELAY_CORE_AUTH_SECRET);
+  if (coreAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
+    throw new Error(`QM_RELAY_CORE_AUTH_SECRET must be at least ${MIN_SOURCE_AUTH_SECRET_LENGTH} characters`);
+  }
   return {
     host: env.QM_RELAY_HOST ?? "127.0.0.1",
     port: parseInteger("QM_RELAY_PORT", env.QM_RELAY_PORT, 8091),
@@ -85,6 +90,7 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
     deploymentCanonicalId: requireEnv("QM_RELAY_DEPLOYMENT_CANONICAL_ID", env.QM_RELAY_DEPLOYMENT_CANONICAL_ID),
     coreApiUrl: requireEnv("QM_RELAY_CORE_API_URL", env.QM_RELAY_CORE_API_URL).replace(/\/$/, ""),
     sourceAuthSecret,
+    coreAuthSecret,
     supportedProtocolVersions: parseList(env.QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS, [
       ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
     ]),
@@ -208,6 +214,7 @@ export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRunt
     service,
     adapterReadiness: registry,
     storageReadiness: new NoopReadinessProbe(),
+    coreAuthSecret: config.coreAuthSecret,
     shutdownDrainMs: config.shutdownDrainMs,
   });
 

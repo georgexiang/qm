@@ -89,6 +89,8 @@ export interface Config {
   apiBaseUrl?: string;
   publicUrl?: string;
   publicWebUrl?: string;
+  desktopBrowserRelayUrl?: string;
+  desktopBrowserRelayAuthSecret?: string;
   flyAppName?: string;
   slack?: SlackPluginConfig;
   runStore: "memory" | "postgres";
@@ -723,6 +725,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     numEnvStrict("RUN_MAX_AGE_MS", env.RUN_MAX_AGE_MS) ??
     (turnWallClockMs > 0 ? 2 * turnWallClockMs : CONFIG_DEFAULTS.runMaxAgeMs);
   const slack = slackPluginConfigFromEnv(env);
+  const desktopBrowserRelayUrl = env.QM_DESKTOP_BROWSER_RELAY_URL?.replace(/\/$/, "");
+  const desktopBrowserRelayAuthSecret = env.QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET;
+  if (Boolean(desktopBrowserRelayUrl) !== Boolean(desktopBrowserRelayAuthSecret)) {
+    throw new Error(
+      "QM_DESKTOP_BROWSER_RELAY_URL and QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET must be configured together",
+    );
+  }
+  if (desktopBrowserRelayAuthSecret && desktopBrowserRelayAuthSecret.length < 32) {
+    throw new Error("QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET must be at least 32 characters");
+  }
   return {
     production: env.NODE_ENV === "production",
     allowUnauthenticatedCore: boolEnvStrict("ALLOW_UNAUTHENTICATED_CORE", env.ALLOW_UNAUTHENTICATED_CORE) ?? false,
@@ -831,6 +843,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(publicApiUrl ? { apiBaseUrl: publicApiUrl } : {}),
     ...(publicUrl ? { publicUrl } : {}),
     ...(env.PUBLIC_WEB_URL ? { publicWebUrl: env.PUBLIC_WEB_URL } : {}),
+    ...(desktopBrowserRelayUrl ? { desktopBrowserRelayUrl } : {}),
+    ...(desktopBrowserRelayAuthSecret ? { desktopBrowserRelayAuthSecret } : {}),
     ...(env.FLY_APP_NAME ? { flyAppName: env.FLY_APP_NAME } : {}),
     ...(slack ? { slack } : {}),
     runStore,

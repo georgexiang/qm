@@ -15,8 +15,8 @@ import {
   type DesktopBrowserMessage,
 } from "qm-desktop-browser-contracts";
 
-test("Core advertises Ticket 05 before the legacy handshake protocol", () => {
-  assert.deepEqual([...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS], ["1.2", "1.0"]);
+test("Core advertises Ticket 06 before Ticket 05 and the legacy handshake protocol", () => {
+  assert.deepEqual([...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS], ["1.3", "1.2", "1.0"]);
 });
 
 test("Core round-trips a versioned authority message through the public contract", () => {

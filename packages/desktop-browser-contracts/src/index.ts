@@ -67,8 +67,23 @@ export interface DesktopBrowserBrokerOptions {
 }
 
 export type DesktopBrowserSessionStartArgv = ["--json", "session", "start", "--browser", string];
+export type DesktopBrowserNavigateArgv = ["--json", "navigate", string, "--session", string];
+export type DesktopBrowserObserveArgv = ["--json", "observe", "--session", string];
+export type DesktopBrowserSessionStopArgv = ["--json", "session", "stop", string];
+export type DesktopBrowserPhaseFArgv =
+  | DesktopBrowserSessionStartArgv
+  | DesktopBrowserNavigateArgv
+  | DesktopBrowserObserveArgv
+  | DesktopBrowserSessionStopArgv;
 
-export interface DesktopBrowserSessionStartAuthorityEnvelope {
+export interface DesktopBrowserPhaseFArgvBindings {
+  browserInstanceId: string;
+  sessionId?: string;
+}
+
+export type DesktopBrowserEffectClass = "local_effect" | "browser_effect" | "observation" | "cleanup";
+
+export interface DesktopBrowserOperationAuthorityEnvelope {
   authorityVersion: `${number}.${number}`;
   audience: typeof DESKTOP_BROWSER_RELAY_AUDIENCE;
   deploymentCanonicalId: string;
@@ -87,12 +102,20 @@ export interface DesktopBrowserSessionStartAuthorityEnvelope {
   operationId: string;
   operationSequence: number;
   capabilitySet: DesktopBrowserCapabilitySet;
-  argv: DesktopBrowserSessionStartArgv;
+  argv: DesktopBrowserPhaseFArgv;
   brokerOptions: DesktopBrowserBrokerOptions;
-  effectClass: "local_effect";
+  effectClass: DesktopBrowserEffectClass;
   nonce: string;
   issuedAt: string;
 }
+
+export type DesktopBrowserSessionStartAuthorityEnvelope = Omit<
+  DesktopBrowserOperationAuthorityEnvelope,
+  "argv" | "effectClass"
+> & {
+  argv: DesktopBrowserSessionStartArgv;
+  effectClass: "local_effect";
+};
 
 export interface RelayInvocationMessage {
   protocolVersion: `${number}.${number}`;
@@ -100,7 +123,7 @@ export interface RelayInvocationMessage {
   payload: {
     dispatchId: string;
     requestHash: string;
-    authority: DesktopBrowserSessionStartAuthorityEnvelope;
+    authority: DesktopBrowserOperationAuthorityEnvelope;
   };
 }
 
@@ -120,6 +143,44 @@ export interface DesktopBrowserSessionStartResult {
   agent_window_id: number;
 }
 
+export interface DesktopBrowserSanitizedObservationResult {
+  schemaVersion: "1.0";
+  command: "observe";
+  completedAt: string;
+  data: {
+    tab_id: number;
+    text: string;
+    ref_count: number;
+    truncated: boolean;
+  };
+}
+
+export interface DesktopBrowserSanitizedNavigateResult {
+  schemaVersion: "1.0";
+  command: "navigate";
+  completedAt: string;
+  data: {
+    tab_id: number;
+    reached: string;
+  };
+}
+
+export interface DesktopBrowserSanitizedSessionStopResult {
+  schemaVersion: "1.0";
+  command: "session.stop";
+  completedAt: string;
+  data: {
+    returned_tab_ids: number[];
+    return_failures: Array<{ tab_id: number; code: string }>;
+  };
+}
+
+export type DesktopBrowserCompletedResult =
+  | DesktopBrowserSessionStartResult
+  | DesktopBrowserSanitizedNavigateResult
+  | DesktopBrowserSanitizedObservationResult
+  | DesktopBrowserSanitizedSessionStopResult;
+
 export interface DesktopBrowserHostFailure {
   code: string;
   message: string;
@@ -135,7 +196,7 @@ export type HostResultMessage = {
         operationId: string;
         outcome: "completed";
         resultHash: string;
-        result: DesktopBrowserSessionStartResult;
+        result: DesktopBrowserCompletedResult;
       }
     | {
         dispatchId: string;
@@ -247,8 +308,10 @@ type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
 
 export const DESKTOP_BROWSER_PROTOCOL_VERSION = "1.0" as const;
 export const DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION = "1.2" as const;
+export const DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION = "1.3" as const;
 export const DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION = "1.0" as const;
 export const DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS = [
+  DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
   DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
   DESKTOP_BROWSER_PROTOCOL_VERSION,
 ] as const;
@@ -399,12 +462,117 @@ export const desktopBrowserSessionStartAuthorityEnvelopeSchema = strictObjectSch
   },
 );
 
+export const desktopBrowserOperationAuthorityEnvelopeSchema = strictObjectSchema(
+  [
+    "authorityVersion",
+    "audience",
+    "deploymentCanonicalId",
+    "actorId",
+    "actorSnapshotHash",
+    "projectId",
+    "projectSnapshotHash",
+    "membershipEpoch",
+    "taskId",
+    "attemptId",
+    "deviceId",
+    "browserInstanceId",
+    "leaseId",
+    "leaseVersion",
+    "leaseExpiresAt",
+    "operationId",
+    "operationSequence",
+    "capabilitySet",
+    "argv",
+    "brokerOptions",
+    "effectClass",
+    "nonce",
+    "issuedAt",
+  ],
+  {
+    authorityVersion: canonicalProtocolVersionSchema,
+    audience: { const: DESKTOP_BROWSER_RELAY_AUDIENCE },
+    deploymentCanonicalId: canonicalLexicalStringSchema,
+    actorId: canonicalLexicalStringSchema,
+    actorSnapshotHash: canonicalLexicalStringSchema,
+    projectId: canonicalLexicalStringSchema,
+    projectSnapshotHash: canonicalLexicalStringSchema,
+    membershipEpoch: nonNegativeIntegerSchema,
+    taskId: canonicalLexicalStringSchema,
+    attemptId: canonicalLexicalStringSchema,
+    deviceId: canonicalLexicalStringSchema,
+    browserInstanceId: canonicalLexicalStringSchema,
+    leaseId: canonicalLexicalStringSchema,
+    leaseVersion: positiveIntegerSchema,
+    leaseExpiresAt: canonicalUtcMillisecondInstantSchema,
+    operationId: canonicalLexicalStringSchema,
+    operationSequence: positiveIntegerSchema,
+    capabilitySet: desktopBrowserCapabilitySetSchema,
+    argv: { type: "array", minItems: 1, items: { type: "string" } },
+    brokerOptions: desktopBrowserBrokerOptionsSchema,
+    effectClass: { enum: ["local_effect", "browser_effect", "observation", "cleanup"] },
+    nonce: canonicalLexicalStringSchema,
+    issuedAt: canonicalUtcMillisecondInstantSchema,
+  },
+);
+
 export const desktopBrowserSessionStartResultSchema = strictObjectSchema(
   ["session_id", "browser_instance_id", "agent_window_id"],
   {
     session_id: canonicalLexicalStringSchema,
     browser_instance_id: canonicalLexicalStringSchema,
     agent_window_id: nonNegativeIntegerSchema,
+  },
+);
+
+const desktopBrowserSanitizedObservationDataSchema = strictObjectSchema(["tab_id", "text", "ref_count", "truncated"], {
+  tab_id: nonNegativeIntegerSchema,
+  text: { type: "string" },
+  ref_count: nonNegativeIntegerSchema,
+  truncated: { type: "boolean" },
+});
+
+export const desktopBrowserSanitizedObservationResultSchema = strictObjectSchema(
+  ["schemaVersion", "command", "completedAt", "data"],
+  {
+    schemaVersion: { const: "1.0" },
+    command: { const: "observe" },
+    completedAt: canonicalUtcMillisecondInstantSchema,
+    data: desktopBrowserSanitizedObservationDataSchema,
+  },
+);
+
+const desktopBrowserSanitizedNavigateDataSchema = strictObjectSchema(["tab_id", "reached"], {
+  tab_id: nonNegativeIntegerSchema,
+  reached: canonicalLexicalStringSchema,
+});
+
+export const desktopBrowserSanitizedNavigateResultSchema = strictObjectSchema(
+  ["schemaVersion", "command", "completedAt", "data"],
+  {
+    schemaVersion: { const: "1.0" },
+    command: { const: "navigate" },
+    completedAt: canonicalUtcMillisecondInstantSchema,
+    data: desktopBrowserSanitizedNavigateDataSchema,
+  },
+);
+
+const desktopBrowserSanitizedSessionStopFailureSchema = strictObjectSchema(["tab_id", "code"], {
+  tab_id: nonNegativeIntegerSchema,
+  code: canonicalLexicalStringSchema,
+});
+
+const desktopBrowserSanitizedSessionStopDataSchema = strictObjectSchema(["returned_tab_ids", "return_failures"], {
+  returned_tab_ids: { type: "array", items: nonNegativeIntegerSchema },
+  return_failures: { type: "array", items: desktopBrowserSanitizedSessionStopFailureSchema },
+});
+
+export const desktopBrowserSanitizedSessionStopResultSchema = strictObjectSchema(
+  ["schemaVersion", "command", "completedAt", "data"],
+  {
+    schemaVersion: { const: "1.0" },
+    command: { const: "session.stop" },
+    completedAt: canonicalUtcMillisecondInstantSchema,
+    data: desktopBrowserSanitizedSessionStopDataSchema,
   },
 );
 
@@ -714,7 +882,7 @@ const relayInvocationAdditiveMessageSchema = messageSchema(
   strictObjectSchema(["dispatchId", "requestHash", "authority"], {
     dispatchId: nonEmptyStringSchema,
     requestHash: nonEmptyStringSchema,
-    authority: desktopBrowserSessionStartAuthorityEnvelopeSchema,
+    authority: desktopBrowserOperationAuthorityEnvelopeSchema,
   }),
 );
 
@@ -734,7 +902,14 @@ const hostResultAdditiveMessageSchema = messageSchema(
     operationId: nonEmptyStringSchema,
     outcome: { enum: ["completed", "failed", "unknown"] },
     resultHash: nonEmptyStringSchema,
-    result: desktopBrowserSessionStartResultSchema,
+    result: {
+      anyOf: [
+        desktopBrowserSessionStartResultSchema,
+        desktopBrowserSanitizedNavigateResultSchema,
+        desktopBrowserSanitizedObservationResultSchema,
+        desktopBrowserSanitizedSessionStopResultSchema,
+      ],
+    },
     error: desktopBrowserHostFailureSchema,
   }),
 );
@@ -790,6 +965,9 @@ const brokerOptionsParser = fromJSONSchema(
 );
 const sessionStartAuthorityEnvelopeParser = fromJSONSchema(
   desktopBrowserSessionStartAuthorityEnvelopeSchema as unknown as Parameters<typeof fromJSONSchema>[0],
+);
+const operationAuthorityEnvelopeParser = fromJSONSchema(
+  desktopBrowserOperationAuthorityEnvelopeSchema as unknown as Parameters<typeof fromJSONSchema>[0],
 );
 export function encodeDesktopBrowserMessage(message: DesktopBrowserMessage): string {
   return JSON.stringify(message);
@@ -920,11 +1098,18 @@ export function decodeDesktopBrowserMessage(
   }
   if (message.kind === "relay.invoke") {
     assertTicket05OperationVersion(message);
-    const authority = parseDesktopBrowserSessionStartAuthorityEnvelope(
-      message.payload.authority,
-      supportedVersion,
-      expectedPolicyGrammarVersion,
-    );
+    const authority =
+      protocolMinor(supportedVersion) >= protocolMinor(DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION)
+        ? parseDesktopBrowserOperationAuthorityEnvelope(
+            message.payload.authority,
+            supportedVersion,
+            expectedPolicyGrammarVersion,
+          )
+        : parseDesktopBrowserSessionStartAuthorityEnvelope(
+            message.payload.authority,
+            supportedVersion,
+            expectedPolicyGrammarVersion,
+          );
     const canonicalRequestHash = computeDesktopBrowserRequestHash(
       authority,
       supportedVersion,
@@ -972,6 +1157,74 @@ function canonicalizeDesktopBrowserHostAccepted(message: HostAcceptedMessage): H
 function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostResultMessage {
   const payload = message.payload;
   if (payload.outcome === "completed") {
+    if ("schemaVersion" in payload.result && payload.result.command === "session.stop") {
+      return {
+        protocolVersion: message.protocolVersion,
+        kind: message.kind,
+        payload: {
+          dispatchId: payload.dispatchId,
+          operationId: payload.operationId,
+          outcome: "completed",
+          resultHash: payload.resultHash,
+          result: {
+            schemaVersion: payload.result.schemaVersion,
+            command: payload.result.command,
+            completedAt: payload.result.completedAt,
+            data: {
+              returned_tab_ids: [...payload.result.data.returned_tab_ids],
+              return_failures: payload.result.data.return_failures.map((failure) => ({
+                tab_id: failure.tab_id,
+                code: failure.code,
+              })),
+            },
+          },
+        },
+      };
+    }
+    if ("schemaVersion" in payload.result && payload.result.command === "navigate") {
+      return {
+        protocolVersion: message.protocolVersion,
+        kind: message.kind,
+        payload: {
+          dispatchId: payload.dispatchId,
+          operationId: payload.operationId,
+          outcome: "completed",
+          resultHash: payload.resultHash,
+          result: {
+            schemaVersion: payload.result.schemaVersion,
+            command: payload.result.command,
+            completedAt: payload.result.completedAt,
+            data: {
+              tab_id: payload.result.data.tab_id,
+              reached: payload.result.data.reached,
+            },
+          },
+        },
+      };
+    }
+    if ("schemaVersion" in payload.result) {
+      return {
+        protocolVersion: message.protocolVersion,
+        kind: message.kind,
+        payload: {
+          dispatchId: payload.dispatchId,
+          operationId: payload.operationId,
+          outcome: "completed",
+          resultHash: payload.resultHash,
+          result: {
+            schemaVersion: payload.result.schemaVersion,
+            command: payload.result.command,
+            completedAt: payload.result.completedAt,
+            data: {
+              tab_id: payload.result.data.tab_id,
+              text: payload.result.data.text,
+              ref_count: payload.result.data.ref_count,
+              truncated: payload.result.data.truncated,
+            },
+          },
+        },
+      };
+    }
     return {
       protocolVersion: message.protocolVersion,
       kind: message.kind,
@@ -1237,6 +1490,141 @@ export function validateDesktopBrowserSessionStartArgv(
     throw new Error(`argv must equal canonical session-start argv ${JSON.stringify(expected)}`);
   }
   return [...expected];
+}
+
+export function buildDesktopBrowserNavigateArgv(url: string, sessionId: string): DesktopBrowserNavigateArgv {
+  if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(url)) {
+    throw new Error("url must be a canonical lexical string");
+  }
+  if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(sessionId)) {
+    throw new Error("sessionId must be a canonical lexical string");
+  }
+  return ["--json", "navigate", url, "--session", sessionId];
+}
+
+export function validateDesktopBrowserNavigateArgv(raw: unknown, sessionId: string): DesktopBrowserNavigateArgv {
+  if (!Array.isArray(raw) || raw.length !== 5 || typeof raw[2] !== "string") {
+    throw new Error("argv must equal canonical navigate argv");
+  }
+  const expected = buildDesktopBrowserNavigateArgv(raw[2], sessionId);
+  if (raw.some((value, index) => value !== expected[index])) {
+    throw new Error(`argv must equal canonical navigate argv ${JSON.stringify(expected)}`);
+  }
+  return [...expected];
+}
+
+export function buildDesktopBrowserObserveArgv(sessionId: string): DesktopBrowserObserveArgv {
+  if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(sessionId)) {
+    throw new Error("sessionId must be a canonical lexical string");
+  }
+  return ["--json", "observe", "--session", sessionId];
+}
+
+export function validateDesktopBrowserObserveArgv(raw: unknown, sessionId: string): DesktopBrowserObserveArgv {
+  const expected = buildDesktopBrowserObserveArgv(sessionId);
+  if (!Array.isArray(raw) || raw.length !== expected.length || raw.some((value, index) => value !== expected[index])) {
+    throw new Error(`argv must equal canonical observe argv ${JSON.stringify(expected)}`);
+  }
+  return [...expected];
+}
+
+export function buildDesktopBrowserSessionStopArgv(sessionId: string): DesktopBrowserSessionStopArgv {
+  if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(sessionId)) {
+    throw new Error("sessionId must be a canonical lexical string");
+  }
+  return ["--json", "session", "stop", sessionId];
+}
+
+export function validateDesktopBrowserSessionStopArgv(raw: unknown, sessionId: string): DesktopBrowserSessionStopArgv {
+  const expected = buildDesktopBrowserSessionStopArgv(sessionId);
+  if (!Array.isArray(raw) || raw.length !== expected.length || raw.some((value, index) => value !== expected[index])) {
+    throw new Error(`argv must equal canonical session-stop argv ${JSON.stringify(expected)}`);
+  }
+  return [...expected];
+}
+
+export function validateDesktopBrowserPhaseFArgv(
+  raw: unknown,
+  bindings: DesktopBrowserPhaseFArgvBindings,
+): DesktopBrowserPhaseFArgv {
+  if (!Array.isArray(raw) || raw[0] !== "--json") {
+    throw new Error("browser_cli_policy_missing: argv does not match a Phase F command");
+  }
+  if (raw[1] === "session" && raw[2] === "start") {
+    return validateDesktopBrowserSessionStartArgv(raw, bindings.browserInstanceId);
+  }
+  if (bindings.sessionId === undefined) {
+    throw new Error("browser_cli_policy_missing: Task-owned session is required");
+  }
+  if (raw[1] === "navigate") return validateDesktopBrowserNavigateArgv(raw, bindings.sessionId);
+  if (raw[1] === "observe") return validateDesktopBrowserObserveArgv(raw, bindings.sessionId);
+  if (raw[1] === "session" && raw[2] === "stop") {
+    return validateDesktopBrowserSessionStopArgv(raw, bindings.sessionId);
+  }
+  throw new Error("browser_cli_policy_missing: argv does not match a Phase F command");
+}
+
+function phaseFSessionId(argv: readonly string[]): string | undefined {
+  if (argv[1] === "navigate") return argv[4];
+  if (argv[1] === "observe") return argv[3];
+  if (argv[1] === "session" && argv[2] === "stop") return argv[3];
+  return undefined;
+}
+
+function phaseFEffectClass(argv: DesktopBrowserPhaseFArgv): DesktopBrowserEffectClass {
+  if (argv[1] === "navigate") return "browser_effect";
+  if (argv[1] === "observe") return "observation";
+  if (argv[1] === "session" && argv[2] === "stop") return "cleanup";
+  return "local_effect";
+}
+
+export function parseDesktopBrowserOperationAuthorityEnvelope(
+  raw: unknown,
+  expectedProtocolVersion: string = DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  expectedPolicyGrammarVersion: string = DESKTOP_BROWSER_POLICY_GRAMMAR_VERSION,
+): DesktopBrowserOperationAuthorityEnvelope {
+  const authority = parseDesktopBrowserRecord<DesktopBrowserOperationAuthorityEnvelope>(
+    operationAuthorityEnvelopeParser,
+    "desktop browser operation authority envelope",
+    raw,
+  );
+  if (!isDesktopBrowserProtocolCompatible(authority.authorityVersion, DESKTOP_BROWSER_AUTHORITY_VERSION)) {
+    throw new Error(
+      `authority protocol major ${protocolMajor(authority.authorityVersion)} is incompatible with supported major ${protocolMajor(DESKTOP_BROWSER_AUTHORITY_VERSION)}`,
+    );
+  }
+  assertCanonicalProtocolVersion(authority.authorityVersion, "authorityVersion");
+  assertCanonicalUtcMillisecondInstant(authority.issuedAt, "issuedAt");
+  assertCanonicalUtcMillisecondInstant(authority.leaseExpiresAt, "leaseExpiresAt");
+  if (
+    Date.parse(authority.leaseExpiresAt) - Date.parse(authority.issuedAt) !==
+    DESKTOP_BROWSER_TASK_LEASE_DURATION_MS
+  ) {
+    throw new Error("desktop browser operation authority lease must expire exactly 60 seconds after issuedAt");
+  }
+  const capabilitySet = parseDesktopBrowserCapabilitySet(
+    authority.capabilitySet,
+    expectedProtocolVersion,
+    expectedPolicyGrammarVersion,
+  );
+  const argv = validateDesktopBrowserPhaseFArgv(authority.argv, {
+    browserInstanceId: authority.browserInstanceId,
+    sessionId: phaseFSessionId(authority.argv),
+  });
+  const effectClass = phaseFEffectClass(argv);
+  if (authority.effectClass !== effectClass) {
+    throw new Error(`desktop browser operation authority effect class does not match ${argv[1]}`);
+  }
+  if (authority.brokerOptions.forceSharedRuntime) {
+    throw new Error("desktop browser operation authority forceSharedRuntime must be false for Phase F");
+  }
+  return {
+    ...authority,
+    capabilitySet,
+    argv,
+    brokerOptions: { forceSharedRuntime: false },
+    effectClass,
+  };
 }
 
 export function parseDesktopBrowserSessionStartAuthorityEnvelope(

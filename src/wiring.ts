@@ -186,6 +186,9 @@ import { createMemoryTaskStore } from "./tasks/memory-task-store.ts";
 import { createPostgresTaskStore } from "./tasks/postgres-task-store.ts";
 import type { TaskStore } from "./tasks/task-store.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTaskStore } from "./desktop-browser/browser-task-store.ts";
+import { reconcileDesktopBrowserFinalizationAudits } from "./desktop-browser/finalization-audit.ts";
+import { createDesktopBrowserOperationCoordinator } from "./desktop-browser/operation-coordinator.ts";
+import { createHttpDesktopBrowserRelayDispatcher } from "./desktop-browser/relay-dispatcher.ts";
 import {
   createDesktopBrowserDeviceRegistry,
   type DesktopBrowserDeviceRegistry,
@@ -741,6 +744,20 @@ export function buildApp(
   const desktopBrowserTasks = createDesktopBrowserTaskStore(artifactMap("desktop_browser_tasks"), {
     sessionStartAuthority: (taskId) => desktopBrowserDeviceRegistry.sessionStartAuthority(taskId),
   });
+  void reconcileDesktopBrowserFinalizationAudits(desktopBrowserTasks, auditLog).catch((error) =>
+    console.error("[wiring] desktop browser finalization audit reconciliation failed:", errMessage(error)),
+  );
+  const desktopBrowserOperations =
+    config.desktopBrowserRelayUrl && config.desktopBrowserRelayAuthSecret
+      ? createDesktopBrowserOperationCoordinator({
+          tasks: desktopBrowserTasks,
+          auditLog,
+          dispatcher: createHttpDesktopBrowserRelayDispatcher({
+            baseUrl: config.desktopBrowserRelayUrl,
+            authSecret: config.desktopBrowserRelayAuthSecret,
+          }),
+        })
+      : undefined;
   const customProviders = createCustomProviderStore({
     backing: artifactMap("custom_model_providers"),
     keyMaterial: config.connectorSecretKey ?? randomBytes(32),
@@ -1070,6 +1087,7 @@ export function buildApp(
     layerBrokerFor,
     brokeredTools,
     deploymentLayer,
+    ...(desktopBrowserOperations ? { desktopBrowserOperations } : {}),
   };
   const orchestrator = createOrchestrator(orchestratorDeps);
 

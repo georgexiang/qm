@@ -2827,6 +2827,56 @@ export function createPiTools(ref: ToolContextRef, opts?: PiToolsOptions): ToolD
       );
     },
   });
+  const browserTask = defineTool({
+    name: "browser_task",
+    label: "Desktop Browser Task",
+    description: "Invoke one canonical Desktop Browser argv operation or explicitly finalize the current Browser Task.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("invoke"), Type.Literal("finalize")]),
+      argv: Type.Optional(Type.Array(Type.String())),
+      outcome: Type.Optional(Type.Union([Type.Literal("completed"), Type.Literal("failed")])),
+      summary: Type.Optional(Type.String()),
+    }),
+    async execute(callId, params) {
+      const input = params as {
+        action: "invoke" | "finalize";
+        argv?: string[];
+        outcome?: "completed" | "failed";
+        summary?: string;
+      };
+      await recordCall(callId, { tool: "browser_task", action: input.action });
+      const invoke = ref.current?.browserTask;
+      if (!invoke)
+        return recordResult(
+          callId,
+          { tool: "browser_task", error: "unavailable" },
+          text("Desktop Browser Task is unavailable."),
+          true,
+        );
+      if (input.action === "invoke") {
+        if (!input.argv?.length) {
+          return recordResult(
+            callId,
+            { tool: "browser_task", error: "argv_required" },
+            text("Desktop Browser argv is required."),
+            true,
+          );
+        }
+        const result = await invoke({ action: "invoke", argv: input.argv });
+        return recordResult(callId, { tool: "browser_task", action: "invoke" }, text(JSON.stringify(result)));
+      }
+      if (!input.outcome || !input.summary?.trim()) {
+        return recordResult(
+          callId,
+          { tool: "browser_task", error: "finalize_fields_required" },
+          text("Desktop Browser outcome and summary are required."),
+          true,
+        );
+      }
+      const result = await invoke({ action: "finalize", outcome: input.outcome, summary: input.summary });
+      return recordResult(callId, { tool: "browser_task", action: "finalize" }, text(JSON.stringify(result)));
+    },
+  });
   const tools = [
     execute,
     ...(credentialExecServices.length ? [credentialExec] : []),
@@ -2839,6 +2889,7 @@ export function createPiTools(ref: ToolContextRef, opts?: PiToolsOptions): ToolD
     ...(controlTools ? [cron, share] : []),
     ...(controlTools || surfaceTools ? [guidance] : []),
     ...(surfaceTools ? [surface, staySilent] : [finishSilently]),
+    ...(ref.current?.browserTask ? [browserTask] : []),
     ...mcpTools,
     createGoal,
     getGoal,

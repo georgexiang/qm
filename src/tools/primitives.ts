@@ -150,6 +150,10 @@ interface ReachedProvenance {
 }
 
 export interface ToolContext extends SurfaceToolDeps {
+  browserTask?(
+    input:
+      { action: "invoke"; argv: string[] } | { action: "finalize"; outcome: "completed" | "failed"; summary: string },
+  ): Promise<unknown>;
   credentialExecServices?: readonly { service: string; binary: string }[];
   credentialExec?(
     service: string,
@@ -420,6 +424,7 @@ export interface ToolContextDeps {
   control?: ControlService;
   controlClaims?: CapabilityClaims;
   surface?: SurfaceToolDeps;
+  browserTask?: ToolContext["browserTask"];
 }
 
 export function createToolContext(deps: ToolContextDeps): ToolContext {
@@ -511,6 +516,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
   }
 
   return {
+    ...(deps.browserTask ? { browserTask: deps.browserTask } : {}),
     ...(deps.credentialExecServices ? { credentialExecServices: deps.credentialExecServices } : {}),
     ...(deps.credentialExec ? { credentialExec: deps.credentialExec } : {}),
     async computerStatus(): Promise<ComputerStatus> {

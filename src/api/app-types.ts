@@ -329,6 +329,25 @@ export interface App {
     taskId: string,
     result: HostResultMessage,
   ): ReturnType<DesktopBrowserTaskStore["consumeSessionStartResult"]>;
+  desktopBrowserPrepareOperation(
+    taskId: string,
+    authorityId: string,
+    argv: unknown,
+  ): ReturnType<DesktopBrowserTaskStore["prepareOperation"]>;
+  desktopBrowserConsumeOperationAccepted(
+    taskId: string,
+    accepted: HostAcceptedMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeOperationAccepted"]>;
+  desktopBrowserConsumeOperationResult(
+    taskId: string,
+    result: HostResultMessage,
+  ): ReturnType<DesktopBrowserTaskStore["consumeOperationResult"]>;
+  desktopBrowserFinalizeTask(
+    taskId: string,
+    principalId: string,
+    authorityId: string,
+    input: { outcome: "completed" | "failed"; summary: string },
+  ): ReturnType<DesktopBrowserTaskStore["finalize"]>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
   subscribeSessionStates(cb: (event: SessionStateEvent) => void): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;

@@ -339,6 +339,32 @@ test("each pi tool emits a tool_call then a tool_result", async () => {
   );
 });
 
+test("browser_task forwards exact argv and explicit finalize through the Task-scoped coordinator", async () => {
+  const calls: unknown[] = [];
+  const ref: ToolContextRef = {
+    current: {
+      ...fakeToolContext(),
+      async browserTask(input) {
+        calls.push(input);
+        return input.action === "invoke"
+          ? { status: "ok", observation: { data: { text: "Heading: Example" } } }
+          : { status: "ok", taskId: "task-1" };
+      },
+    },
+    emit: () => undefined,
+    scopeLabel: "group:web-project-project-1",
+  };
+  const tool = createPiTools(ref).find((candidate) => candidate.name === "browser_task");
+
+  await call(tool, { action: "invoke", argv: ["--json", "observe", "--session", "session-1"] });
+  await call(tool, { action: "finalize", outcome: "completed", summary: "Example page inspected" });
+
+  assert.deepEqual(calls, [
+    { action: "invoke", argv: ["--json", "observe", "--session", "session-1"] },
+    { action: "finalize", outcome: "completed", summary: "Example page inspected" },
+  ]);
+});
+
 test("execute's computer param manages the box out-of-band instead of running a command", async () => {
   const restarted: number[] = [];
   const tc = {

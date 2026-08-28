@@ -28,6 +28,7 @@ import type { CredentialUsageSink } from "../../admin/credential-usage-sink.ts";
 import type { LivenessCache } from "../../credentials/resident-auth.ts";
 import type { ConnectorStatusCache } from "../../credentials/connector-status.ts";
 import type { ModelGateway } from "../../model/model-gateway.ts";
+import type { DesktopBrowserOperationCoordinator } from "../../desktop-browser/operation-coordinator.ts";
 import type { AuditLog } from "../../audit/audit-log.ts";
 import type { SecurityScreener } from "../../security/security-screener.ts";
 import type { RateLimiter } from "../../ratelimit/rate-limiter.ts";
@@ -171,6 +172,7 @@ export interface OrchestratorDeps {
   surfaceCache?: SurfaceCache;
   channelPolicy?: ChannelPolicyStore;
   surfaceDebugFooter?: boolean;
+  desktopBrowserOperations?: DesktopBrowserOperationCoordinator;
 }
 
 export interface SurfaceContextPuller {

@@ -34,8 +34,10 @@ import {
   parseDesktopBrowserRegistrationConfirmationEnvelope,
   parseDesktopBrowserRegistrationReservationTuple,
   projectDesktopBrowserPublicIdentity,
+  validateDesktopBrowserPhaseFArgv,
+  type DesktopBrowserCompletedResult,
   type DesktopBrowserHostFailure,
-  type DesktopBrowserSessionStartAuthorityEnvelope,
+  type DesktopBrowserOperationAuthorityEnvelope,
   type DesktopBrowserSessionStartResult,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRegistrationReservationTuple,
@@ -260,7 +262,7 @@ type PersistedHostTerminalPayload =
       operationId?: string;
       outcome: "completed";
       resultHash?: string;
-      result: DesktopBrowserSessionStartResult;
+      result: DesktopBrowserCompletedResult;
     }
   | {
       dispatchId?: string;
@@ -277,6 +279,18 @@ interface HostOperationFence {
   attemptId: string;
   state: "accepted" | "completed" | "failed" | "unknown";
   terminalPayload?: PersistedHostTerminalPayload;
+}
+
+interface HostSessionOwnershipRecord {
+  taskId: string;
+  attemptId: string;
+  operationId: string;
+  requestHash: string;
+  sessionId: string;
+  browserInstanceId: string;
+  agentWindowId: number;
+  latestOperationSequence: number;
+  latestLeaseVersion: number;
 }
 
 const DEVICE_KEY_FILE = "device-key.json";
@@ -407,6 +421,18 @@ function operationFencePath(dataDir: string, operationId: string): string {
 
 function sessionOwnershipPath(dataDir: string, taskId: string): string {
   return localRecordPath(dataDir, SESSIONS_DIR, taskId);
+}
+
+function deleteSessionOwnership(dataDir: string, taskId: string): void {
+  const filePath = sessionOwnershipPath(dataDir, taskId);
+  if (!existsSync(filePath)) return;
+  unlinkSync(filePath);
+  const dirFd = openSync(dirname(filePath), "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
 }
 
 function loadOperationFence(dataDir: string, operationId: string): HostOperationFence | null {
@@ -546,13 +572,17 @@ function computeHostResultHash(value: unknown): string {
   return `sha256:${createHash("sha256").update(stableJson(value)).digest("hex")}`;
 }
 
-function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): DesktopBrowserSessionStartResult {
+function parseBrowserSkillJsonObject(stdout: string, maxBytes: number, label: string): Record<string, unknown> {
   if (Buffer.byteLength(stdout, "utf8") > maxBytes) throw new Error("BrowserSkill output exceeded the maximum size");
   const raw: unknown = JSON.parse(stdout);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("BrowserSkill session start output must be an object");
+    throw new Error(`BrowserSkill ${label} output must be an object`);
   }
-  const record = raw as Record<string, unknown>;
+  return raw as Record<string, unknown>;
+}
+
+function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): DesktopBrowserSessionStartResult {
+  const record = parseBrowserSkillJsonObject(stdout, maxBytes, "session start");
   if (typeof record.session_id !== "string" || record.session_id.length === 0 || /\s/.test(record.session_id)) {
     throw new Error("BrowserSkill session start output has an invalid session_id");
   }
@@ -573,6 +603,125 @@ function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): 
   });
 }
 
+function sanitizeBrowserSkillObservationText(text: string): string {
+  const sensitiveLine =
+    /\b(?:authorization|proxy-authorization|cookie|set-cookie|password|passwd|access[_ -]?token|refresh[_ -]?token|api[_ -]?key|secret)\b/i;
+  const credentialShape =
+    /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/-]+=*|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|https?:\/\/[^\s/:@]+:[^\s/@]+@|\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b|\b[A-Fa-f0-9]{32,}\b/i;
+  return text
+    .split(/\r?\n/)
+    .map((line) => (sensitiveLine.test(line) || credentialShape.test(line) ? "[REDACTED]" : line))
+    .join("\n");
+}
+
+function parseBrowserSkillCompletedResult(
+  authority: DesktopBrowserOperationAuthorityEnvelope,
+  stdout: string,
+  maxBytes: number,
+  completedAt: string,
+): DesktopBrowserCompletedResult {
+  if (isSessionStartOperation(authority)) return parseBrowserSkillSessionStartResult(stdout, maxBytes);
+  const record = parseBrowserSkillJsonObject(stdout, maxBytes, String(authority.argv[1]));
+  if (authority.argv[1] === "navigate") {
+    if (!Number.isSafeInteger(record.tab_id) || (record.tab_id as number) < 0) {
+      throw new Error("BrowserSkill navigate output has an invalid tab_id");
+    }
+    if (
+      typeof record.reached !== "string" ||
+      !["commit", "domcontentloaded", "load", "networkidle", "timeout"].includes(record.reached)
+    ) {
+      throw new Error("BrowserSkill navigate output has an invalid reached value");
+    }
+    return {
+      schemaVersion: "1.0",
+      command: "navigate",
+      completedAt,
+      data: {
+        tab_id: record.tab_id as number,
+        reached: record.reached,
+      },
+    };
+  }
+  if (authority.argv[1] === "observe") {
+    if (!Number.isSafeInteger(record.tab_id) || (record.tab_id as number) < 0) {
+      throw new Error("BrowserSkill observe output has an invalid tab_id");
+    }
+    if (typeof record.text !== "string") {
+      throw new Error("BrowserSkill observe output has invalid text");
+    }
+    if (!Number.isSafeInteger(record.ref_count) || (record.ref_count as number) < 0) {
+      throw new Error("BrowserSkill observe output has an invalid ref_count");
+    }
+    if (record.truncated !== undefined && typeof record.truncated !== "boolean") {
+      throw new Error("BrowserSkill observe output has an invalid truncated value");
+    }
+    return {
+      schemaVersion: "1.0",
+      command: "observe",
+      completedAt,
+      data: {
+        tab_id: record.tab_id as number,
+        text: sanitizeBrowserSkillObservationText(record.text),
+        ref_count: record.ref_count as number,
+        truncated: record.truncated === true,
+      },
+    };
+  }
+  if (authority.argv[1] === "session" && authority.argv[2] === "stop") {
+    const returnedTabIds = record.returned_tab_ids ?? [];
+    const returnFailures = record.return_failures ?? [];
+    if (
+      !Array.isArray(returnedTabIds) ||
+      returnedTabIds.some((tabId) => !Number.isSafeInteger(tabId) || (tabId as number) < 0)
+    ) {
+      throw new Error("BrowserSkill session stop output has invalid returned_tab_ids");
+    }
+    if (!Array.isArray(returnFailures)) {
+      throw new Error("BrowserSkill session stop output has invalid return_failures");
+    }
+    const sanitizedFailures = returnFailures.map((failure) => {
+      if (!failure || typeof failure !== "object" || Array.isArray(failure)) {
+        throw new Error("BrowserSkill session stop output has an invalid return failure");
+      }
+      const entry = failure as Record<string, unknown>;
+      if (!Number.isSafeInteger(entry.tab_id) || (entry.tab_id as number) < 0) {
+        throw new Error("BrowserSkill session stop output has an invalid return failure tab_id");
+      }
+      if (
+        typeof entry.code !== "string" ||
+        ![
+          "unknown_method",
+          "unsupported",
+          "invalid_params",
+          "not_found",
+          "permission_denied",
+          "timeout",
+          "cdp_failed",
+          "protocol_error",
+          "cancelled",
+          "user_aborted",
+          "version_too_old",
+          "multiple_browsers_online",
+          "no_browser_connected",
+        ].includes(entry.code)
+      ) {
+        throw new Error("BrowserSkill session stop output has an invalid return failure code");
+      }
+      return { tab_id: entry.tab_id as number, code: entry.code };
+    });
+    return {
+      schemaVersion: "1.0",
+      command: "session.stop",
+      completedAt,
+      data: {
+        returned_tab_ids: returnedTabIds as number[],
+        return_failures: sanitizedFailures,
+      },
+    };
+  }
+  throw new Error("BrowserSkill output policy is unavailable for this Phase F command");
+}
+
 function classifyAcceptedFailure(error: unknown): {
   state: "failed" | "unknown";
   terminalPayload: PersistedHostTerminalPayload;
@@ -584,19 +733,18 @@ function classifyAcceptedFailure(error: unknown): {
         outcome: "failed",
         error: {
           code: "browser_cli_spawn_rejected",
-          message: error.message,
+          message: "BrowserSkill process creation was rejected before execution",
         },
       },
     };
   }
-  const unknownError = error instanceof Error ? error : new Error(String(error));
   return {
     state: "unknown",
     terminalPayload: {
       outcome: "unknown",
       error: {
         code: "host_operation_unknown",
-        message: unknownError.message,
+        message: "Host operation outcome is unknown after acceptance",
       },
     },
   };
@@ -1024,14 +1172,13 @@ function currentCapabilitySet(
   };
 }
 
-function assertSessionStartAuthorityBindings(
-  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+function assertOperationAuthorityBindings(
+  authority: DesktopBrowserOperationAuthorityEnvelope,
   deviceId: string | null,
   runtime: BrowserRuntimeMetadata,
   state: HostBrokerStateSnapshot,
   negotiatedProtocolVersion: string,
   negotiatedPolicyGrammarVersion: string,
-  now: number,
 ): void {
   if (authority.audience !== DESKTOP_BROWSER_RELAY_AUDIENCE) throw new Error("authority audience is not the relay");
   if (!state.deploymentCanonicalId || authority.deploymentCanonicalId !== state.deploymentCanonicalId) {
@@ -1054,12 +1201,15 @@ function assertSessionStartAuthorityBindings(
   if (stableJson(authority.capabilitySet) !== stableJson(expectedCapabilitySet)) {
     throw new Error("authority capability set does not exactly match the live host runtime");
   }
+}
+
+function assertOperationAuthorityFreshness(authority: DesktopBrowserOperationAuthorityEnvelope, now: number): void {
   if (Date.parse(authority.issuedAt) > now) throw new Error("authority lease is not valid yet");
   if (Date.parse(authority.leaseExpiresAt) <= now) throw new Error("authority lease expired before acceptance");
 }
 
-function assertSessionStartRequestHash(
-  authority: DesktopBrowserSessionStartAuthorityEnvelope,
+function assertOperationRequestHash(
+  authority: DesktopBrowserOperationAuthorityEnvelope,
   requestHash: string,
   negotiatedProtocolVersion: string,
   negotiatedPolicyGrammarVersion: string,
@@ -1072,6 +1222,61 @@ function assertSessionStartRequestHash(
   if (canonicalRequestHash !== requestHash) {
     throw new Error("relay.invoke request hash does not match the locally recomputed authority hash");
   }
+}
+
+function isSessionStartOperation(authority: DesktopBrowserOperationAuthorityEnvelope): boolean {
+  return authority.argv[1] === "session" && authority.argv[2] === "start";
+}
+
+function validateOperationSessionOwnership(
+  dataDir: string,
+  authority: DesktopBrowserOperationAuthorityEnvelope,
+): HostSessionOwnershipRecord | null {
+  if (isSessionStartOperation(authority)) {
+    validateDesktopBrowserPhaseFArgv(authority.argv, { browserInstanceId: authority.browserInstanceId });
+    return null;
+  }
+  const ownership = readJsonFile<HostSessionOwnershipRecord>(sessionOwnershipPath(dataDir, authority.taskId));
+  if (!ownership || ownership.taskId !== authority.taskId) {
+    throw new Error("Desktop Browser Task-owned session is unavailable");
+  }
+  if (ownership.attemptId !== authority.attemptId) {
+    throw new Error("Desktop Browser operation attempt does not match the Task-owned session");
+  }
+  if (ownership.browserInstanceId !== authority.browserInstanceId) {
+    throw new Error("Desktop Browser Task-owned session browser does not match authority");
+  }
+  if (authority.operationSequence !== ownership.latestOperationSequence + 1) {
+    throw new Error("Desktop Browser operation sequence does not advance the Task-owned session");
+  }
+  if (authority.leaseVersion !== ownership.latestLeaseVersion + 1) {
+    throw new Error("Desktop Browser lease version does not advance the Task-owned session");
+  }
+  try {
+    validateDesktopBrowserPhaseFArgv(authority.argv, {
+      browserInstanceId: authority.browserInstanceId,
+      sessionId: ownership.sessionId,
+    });
+  } catch {
+    throw new Error("Desktop Browser argv does not use the Task-owned session");
+  }
+  return ownership;
+}
+
+function advanceSessionOwnership(
+  dataDir: string,
+  ownership: HostSessionOwnershipRecord,
+  authority: DesktopBrowserOperationAuthorityEnvelope,
+): void {
+  atomicWriteText(
+    sessionOwnershipPath(dataDir, authority.taskId),
+    `${JSON.stringify({
+      ...ownership,
+      latestOperationSequence: authority.operationSequence,
+      latestLeaseVersion: authority.leaseVersion,
+    })}\n`,
+    SAFE_FILE_MODE,
+  );
 }
 
 function accepted(
@@ -1399,16 +1604,15 @@ export class HostBrokerConnection {
     const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
     if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
     if (!this.dataDir) throw new Error("host operation state directory is not configured");
-    assertSessionStartAuthorityBindings(
+    assertOperationAuthorityBindings(
       decoded.payload.authority,
       this.deviceId,
       this.options.runtime,
       this.snapshotState,
       input.protocolVersion,
       input.policyGrammarVersion,
-      input.now(),
     );
-    assertSessionStartRequestHash(
+    assertOperationRequestHash(
       decoded.payload.authority,
       decoded.payload.requestHash,
       input.protocolVersion,
@@ -1427,6 +1631,13 @@ export class HostBrokerConnection {
     let existingFence = loadOperationFence(dataDir, authority.operationId);
     if (existingFence) {
       if (existingFence.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        if (
+          existingFence.terminalPayload.outcome === "completed" &&
+          "schemaVersion" in existingFence.terminalPayload.result &&
+          existingFence.terminalPayload.result.command === "session.stop"
+        ) {
+          deleteSessionOwnership(dataDir, authority.taskId);
+        }
         input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
           encodeDesktopBrowserMessage(
@@ -1449,6 +1660,9 @@ export class HostBrokerConnection {
       return;
     }
 
+    assertOperationAuthorityFreshness(authority, input.now());
+    const sessionOwnership = validateOperationSessionOwnership(dataDir, authority);
+
     const fence: HostOperationFence = {
       operationId: authority.operationId,
       requestHash: message.payload.requestHash,
@@ -1459,6 +1673,13 @@ export class HostBrokerConnection {
     if (!createOperationFence(dataDir, fence)) {
       existingFence = loadOperationFence(dataDir, authority.operationId);
       if (existingFence?.requestHash === message.payload.requestHash && existingFence.terminalPayload) {
+        if (
+          existingFence.terminalPayload.outcome === "completed" &&
+          "schemaVersion" in existingFence.terminalPayload.result &&
+          existingFence.terminalPayload.result.command === "session.stop"
+        ) {
+          deleteSessionOwnership(dataDir, authority.taskId);
+        }
         input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
         input.socket.send(
           encodeDesktopBrowserMessage(
@@ -1489,6 +1710,7 @@ export class HostBrokerConnection {
       return;
     }
     this.writeObserver?.onFenceCreated?.(fence);
+    if (sessionOwnership) advanceSessionOwnership(dataDir, sessionOwnership, authority);
     this.snapshotState.currentTaskPresent = true;
     this.emitState();
     input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
@@ -1511,10 +1733,12 @@ export class HostBrokerConnection {
     try {
       const runResult = await runHandle.result;
       if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
-      const result = parseBrowserSkillSessionStartResult(runResult.stdout, this.maxBrowserSkillOutputBytes);
-      if (result.browser_instance_id !== authority.browserInstanceId) {
-        throw new Error("BrowserSkill returned a browser outside the authority binding");
-      }
+      const result = parseBrowserSkillCompletedResult(
+        authority,
+        runResult.stdout,
+        this.maxBrowserSkillOutputBytes,
+        new Date(input.now()).toISOString(),
+      );
       const completedTerminalPayload: PersistedHostTerminalPayload = {
         dispatchId: message.payload.dispatchId,
         outcome: "completed",
@@ -1526,21 +1750,28 @@ export class HostBrokerConnection {
         authority.operationId,
         completedTerminalPayload,
       );
-      const sessionOwnership = {
-        taskId: authority.taskId,
-        attemptId: authority.attemptId,
-        operationId: authority.operationId,
-        requestHash: message.payload.requestHash,
-        sessionId: result.session_id,
-        browserInstanceId: result.browser_instance_id,
-        agentWindowId: result.agent_window_id,
-      };
-      atomicWriteText(
-        sessionOwnershipPath(dataDir, authority.taskId),
-        `${JSON.stringify(sessionOwnership)}\n`,
-        SAFE_FILE_MODE,
-      );
-      this.writeObserver?.onSessionOwnershipSaved(sessionOwnership);
+      if (!("schemaVersion" in result)) {
+        if (result.browser_instance_id !== authority.browserInstanceId) {
+          throw new Error("BrowserSkill returned a browser outside the authority binding");
+        }
+        const sessionOwnership = {
+          taskId: authority.taskId,
+          attemptId: authority.attemptId,
+          operationId: authority.operationId,
+          requestHash: message.payload.requestHash,
+          sessionId: result.session_id,
+          browserInstanceId: result.browser_instance_id,
+          agentWindowId: result.agent_window_id,
+          latestOperationSequence: authority.operationSequence,
+          latestLeaseVersion: authority.leaseVersion,
+        };
+        atomicWriteText(
+          sessionOwnershipPath(dataDir, authority.taskId),
+          `${JSON.stringify(sessionOwnership)}\n`,
+          SAFE_FILE_MODE,
+        );
+        this.writeObserver?.onSessionOwnershipSaved(sessionOwnership);
+      }
       const completedFence = {
         ...fence,
         state: "completed" as const,
@@ -1549,6 +1780,9 @@ export class HostBrokerConnection {
       saveOperationFence(dataDir, completedFence);
       completedPersisted = true;
       this.writeObserver?.onFenceSaved?.(completedFence);
+      if ("schemaVersion" in result && result.command === "session.stop") {
+        deleteSessionOwnership(dataDir, authority.taskId);
+      }
       if (!input.isActive()) return;
       input.socket.send(encodeDesktopBrowserMessage(completed));
       return;

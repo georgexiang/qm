@@ -387,9 +387,20 @@ export class DesktopBrowserRelayService {
     const connection = await this.resolveCurrentRegisteredConnection(input);
     const binding = connection.binding;
     if (!binding) throw new Error("desktop browser host is not connected");
-    if (connection.negotiatedProtocolVersion !== DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) {
+    if (!connection.negotiatedProtocolVersion) {
+      throw new Error("desktop browser host protocol version is unavailable");
+    }
+    if (
+      compareCanonicalVersions(connection.negotiatedProtocolVersion, DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION) < 0
+    ) {
       throw new Error(
-        `desktop browser session-start requires negotiated protocol version ${DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION}`,
+        `desktop browser invocation requires protocol version ${DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION} or newer`,
+      );
+    }
+
+    if (input.invocation.protocolVersion !== connection.negotiatedProtocolVersion) {
+      throw new Error(
+        `desktop browser invocation requires negotiated protocol version ${input.invocation.protocolVersion}`,
       );
     }
     if (!connection.hello || !connection.negotiatedPolicyGrammarVersion) {
@@ -477,6 +488,29 @@ export class DesktopBrowserRelayService {
         this.dropDispatchTracking(decoded.payload.dispatchId);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
+    });
+  }
+
+  async dispatchProjectedInvocation(input: {
+    publicDeviceFingerprint: string;
+    browserInstanceId: string;
+    invocation: RelayInvocationMessage;
+  }): Promise<RelayDispatchResult> {
+    const candidates = [...this.connections.values()].filter((connection) => {
+      if (connection.stage !== "registered" || !connection.binding || !connection.hello) return false;
+      const snapshot = this.snapshot(connection);
+      return (
+        snapshot.publicDeviceFingerprint === input.publicDeviceFingerprint &&
+        snapshot.browserInstanceId === input.browserInstanceId
+      );
+    });
+    if (candidates.length !== 1) throw new Error("desktop browser host is not uniquely connected");
+    const binding = candidates[0]!.binding!;
+    return this.dispatchInvocation({
+      devicePublicKey: binding.devicePublicKey,
+      brokerInstanceId: binding.brokerInstanceId,
+      browserInstanceId: input.browserInstanceId,
+      invocation: input.invocation,
     });
   }
 

@@ -30,6 +30,9 @@ import {
 } from "../packages/qm-broker-relay/src/server.ts";
 import { canonicalPayload } from "../src/api/http.ts";
 import { createSourceAuth } from "../src/auth/source-auth.ts";
+import { signedRequestHeaders } from "../src/auth/source-auth-sign.ts";
+import { desktopBrowserRelayInvocationFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
+import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
 
 class Probe implements DesktopBrowserRelayReadinessProbe {
   error: string | null = null;
@@ -111,6 +114,7 @@ function relayProcessEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
     QM_RELAY_CORE_API_URL: "http://127.0.0.1:8080",
     QM_RELAY_SOURCE_AUTH_SECRET: "relay-source-auth-secret-for-tests-0001",
+    QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
     ...overrides,
   };
 }
@@ -314,6 +318,138 @@ test("relay server separates health from readiness and only upgrades the configu
   }
 });
 
+test("Core dispatcher signs the bounded Relay invocation endpoint", async () => {
+  const authSecret = "relay-core-auth-secret-for-tests-0000001";
+  const seen: unknown[] = [];
+  const service = {
+    async dispatchProjectedInvocation(input: unknown) {
+      seen.push(input);
+      return {
+        kind: "not_accepted_or_unknown",
+        dispatchId: desktopBrowserRelayInvocationFixture.payload.dispatchId,
+        operationId: desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+        requestHash: desktopBrowserRelayInvocationFixture.payload.requestHash,
+        error: { code: "host_not_accepted", message: "Host did not accept the operation" },
+      };
+    },
+    async drain() {},
+  } as unknown as DesktopBrowserRelayService;
+  const runtime = createDesktopBrowserRelayServer({
+    host: "127.0.0.1",
+    port: 0,
+    path: "/relay",
+    service,
+    adapterReadiness: new Probe(),
+    coreAuthSecret: authSecret,
+    shutdownDrainMs: 50,
+  });
+  await runtime.listen();
+  const port = (runtime.server.address() as AddressInfo).port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const unsigned = await fetch(`${baseUrl}/v1/invocations?_sourceAuthNonce=unsigned`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(unsigned.status, 401);
+
+    const replayBody = JSON.stringify({
+      publicDeviceFingerprint: "0123456789abcdef",
+      browserInstanceId: "browser-primary",
+      invocation: desktopBrowserRelayInvocationFixture,
+    });
+    const replayPath = "/v1/invocations?_sourceAuthNonce=replay-once";
+    const replayHeaders = signedRequestHeaders(authSecret, "POST", replayPath, replayBody, {
+      "content-type": "application/json",
+    });
+    const firstSigned = await fetch(`${baseUrl}${replayPath}`, {
+      method: "POST",
+      headers: replayHeaders,
+      body: replayBody,
+    });
+    assert.equal(firstSigned.status, 200);
+    const replayed = await fetch(`${baseUrl}${replayPath}`, {
+      method: "POST",
+      headers: replayHeaders,
+      body: replayBody,
+    });
+    assert.equal(replayed.status, 409);
+    assert.deepEqual(await replayed.json(), { error: "replayed_request" });
+
+    const dispatcher = createHttpDesktopBrowserRelayDispatcher({ baseUrl, authSecret });
+    const result = await dispatcher.dispatch({
+      publicDeviceFingerprint: "0123456789abcdef",
+      browserInstanceId: "browser-primary",
+      invocation: desktopBrowserRelayInvocationFixture,
+    });
+    assert.equal(result.kind, "not_accepted_or_unknown");
+    assert.deepEqual(seen, [
+      {
+        publicDeviceFingerprint: "0123456789abcdef",
+        browserInstanceId: "browser-primary",
+        invocation: desktopBrowserRelayInvocationFixture,
+      },
+      {
+        publicDeviceFingerprint: "0123456789abcdef",
+        browserInstanceId: "browser-primary",
+        invocation: desktopBrowserRelayInvocationFixture,
+      },
+    ]);
+  } finally {
+    await runtime.shutdown();
+  }
+});
+
+test("Core Relay dispatcher rejects unsafe URLs, crossed responses, redirects, and oversized bodies", async () => {
+  const authSecret = "relay-core-auth-secret-for-tests-0000001";
+  for (const baseUrl of [
+    "http://relay.example.com",
+    "https://user:secret@relay.example.com",
+    "https://relay.example.com/base",
+    "https://relay.example.com?target=other",
+    "https://relay.example.com#fragment",
+  ]) {
+    assert.throws(() => createHttpDesktopBrowserRelayDispatcher({ baseUrl, authSecret }), /Relay URL/);
+  }
+  const input = {
+    publicDeviceFingerprint: "0123456789abcdef",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  };
+  const crossed = createHttpDesktopBrowserRelayDispatcher({
+    baseUrl: "https://relay.example.com",
+    authSecret,
+    fetch: async (_url, init) => {
+      assert.equal(init?.redirect, "manual");
+      return new Response(
+        JSON.stringify({
+          kind: "not_accepted_or_unknown",
+          dispatchId: "crossed-dispatch",
+          operationId: desktopBrowserRelayInvocationFixture.payload.authority.operationId,
+          requestHash: desktopBrowserRelayInvocationFixture.payload.requestHash,
+          error: { code: "delivery_unknown", message: "unknown" },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  await assert.rejects(crossed.dispatch(input), /does not match the submitted operation/);
+  const oversized = createHttpDesktopBrowserRelayDispatcher({
+    baseUrl: "https://relay.example.com",
+    authSecret,
+    fetch: async () => new Response("x".repeat(128 * 1024 + 1), { status: 200 }),
+  });
+  await assert.rejects(oversized.dispatch(input), /response exceeded the maximum size/);
+  const redirected = createHttpDesktopBrowserRelayDispatcher({
+    baseUrl: "https://relay.example.com",
+    authSecret,
+    fetch: async () => new Response(null, { status: 302, headers: { location: "https://other.example.com" } }),
+  });
+  await assert.rejects(redirected.dispatch(input), /status 302/);
+});
+
 test("relay shutdown drains an upgraded websocket session with 1012", async () => {
   const registry = new MemoryRegistry();
   const identity = createDeviceIdentity();
@@ -392,6 +528,7 @@ test("relay process runtime loads dedicated config and starts independently", as
       QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
       QM_RELAY_CORE_API_URL: base,
       QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
+      QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
       QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2,1.0",
       QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
       QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
@@ -506,6 +643,7 @@ test("relay process runtime preserves an explicit websocket path override", asyn
       QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
       QM_RELAY_CORE_API_URL: base,
       QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
+      QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
       QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2,1.0",
       QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
       QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
@@ -565,6 +703,7 @@ test("relay process readiness fails when source auth is rejected or the readines
         QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
         QM_RELAY_CORE_API_URL: rejectingBase,
         QM_RELAY_SOURCE_AUTH_SECRET: "relay-source-auth-secret-for-tests-9999",
+        QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
         QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2",
         QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
         QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
@@ -589,6 +728,7 @@ test("relay process readiness fails when source auth is rejected or the readines
         QM_RELAY_DEPLOYMENT_CANONICAL_ID: "qm://deployments/example",
         QM_RELAY_CORE_API_URL: missingRouteBase,
         QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
+        QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
         QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2",
         QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
         QM_RELAY_SHUTDOWN_DRAIN_MS: "50",

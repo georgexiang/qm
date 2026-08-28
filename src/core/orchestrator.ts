@@ -1895,6 +1895,31 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ...(deps.config ? { config: deps.config } : {}),
           ...(deps.control && controlClaims ? { control: deps.control, controlClaims } : {}),
           ...(surfaceToolDeps ? { surface: surfaceToolDeps } : {}),
+          ...(deps.desktopBrowserOperations && input.scopeVersion
+            ? {
+                browserTask: async (
+                  request:
+                    | { action: "invoke"; argv: string[] }
+                    | { action: "finalize"; outcome: "completed" | "failed"; summary: string },
+                ) =>
+                  request.action === "invoke"
+                    ? deps.desktopBrowserOperations!.invokeForSession({
+                        sessionId: session.id,
+                        actorId: actor.id,
+                        projectScopeLabel: scopeId,
+                        projectMembershipVersion: input.scopeVersion!,
+                        argv: request.argv,
+                      })
+                    : deps.desktopBrowserOperations!.finalizeForSession({
+                        sessionId: session.id,
+                        actorId: actor.id,
+                        projectScopeLabel: scopeId,
+                        projectMembershipVersion: input.scopeVersion!,
+                        outcome: request.outcome,
+                        summary: request.summary,
+                      }),
+              }
+            : {}),
           memory: deps.memory,
           memoryScopeId,
           ...(memoryAccess ? { memoryAccess } : {}),
