@@ -3,6 +3,7 @@ import { main } from "../cli.ts";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveInstalledBrowserSkillExecutable, resolveRelayUrlFromEnv } from "../index.ts";
+import { HOST_BROKER_COMPANION_PORT } from "../companion-control.ts";
 
 const controller = new AbortController();
 const onSignal = (): void => controller.abort();
@@ -17,6 +18,7 @@ try {
     stdout: process.stdout,
     stderr: process.stderr,
     signal: controller.signal,
+      companionPort: HOST_BROKER_COMPANION_PORT,
     deviceId: process.env.QM_HOST_BROKER_DEVICE_ID,
     browserSkillExecutable: resolveInstalledBrowserSkillExecutable({ env: process.env, installRoot }),
     resolveRelayUrl: (qmUrl) => resolveRelayUrlFromEnv(qmUrl, process.env),

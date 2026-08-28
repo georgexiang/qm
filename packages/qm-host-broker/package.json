@@ -3,12 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "files": [
+    "src",
+    "companion"
+  ],
   "bin": {
     "qm-host-broker": "./src/bin/qm-host-broker.ts"
   },
   "exports": {
     ".": "./src/index.ts",
-    "./cli": "./src/cli.ts"
+    "./cli": "./src/cli.ts",
+    "./companion-control": "./src/companion-control.ts"
   },
   "dependencies": {
     "qm-desktop-browser-contracts": "file:../desktop-browser-contracts"

@@ -25,6 +25,7 @@ import {
 } from "../scripts/run-browser-skill-conformance.ts";
 
 const sourceCommit = "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c";
+const companionDir = join(import.meta.dirname, "../packages/qm-host-broker/companion");
 
 test("foreground daemon keeps BrowserSkill's extension-compatible default WebSocket port", () => {
   const args = browserSkillForegroundDaemonArgs();
@@ -539,14 +540,31 @@ test("builds a fresh macOS app launch plan for Chrome app bundles", () => {
       file: "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
       args: [
         "--user-data-dir=/tmp/runtime/chrome-profile",
-        "--disable-extensions-except=/tmp/extension",
-        "--load-extension=/tmp/extension",
+        `--disable-extensions-except=/tmp/extension,${companionDir}`,
+        `--load-extension=/tmp/extension,${companionDir}`,
         "--no-first-run",
         "--no-default-browser-check",
         "about:blank",
       ],
     },
   );
+});
+
+test("Ticket 10 Chrome and Edge launch the same unpacked Companion", () => {
+  for (const browserPath of [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  ]) {
+    const plan = buildChromeLaunchPlan({
+      chromePath: browserPath,
+      extensionDir: "/opt/browserskill-extension",
+      runtimeDirectory: "/tmp/qm-browser-runtime",
+      platform: "darwin",
+    });
+    assert.equal(plan.file, browserPath);
+    assert.ok(plan.args.includes(`--load-extension=/opt/browserskill-extension,${companionDir}`));
+    assert.ok(plan.args.includes(`--disable-extensions-except=/opt/browserskill-extension,${companionDir}`));
+  }
 });
 
 test("runJsonCommand enforces a wall-clock timeout", async () => {
@@ -769,8 +787,8 @@ test("setup failures before Chrome spawn still clean every acquired resource and
         file: "/tool/chrome",
         args: [
           "--user-data-dir=/runtime/chrome-profile",
-          "--disable-extensions-except=/tool/extension",
-          "--load-extension=/tool/extension",
+          `--disable-extensions-except=/tool/extension,${companionDir}`,
+          `--load-extension=/tool/extension,${companionDir}`,
           "--no-first-run",
           "--no-default-browser-check",
           "about:blank",
@@ -1143,8 +1161,8 @@ test("refuses to reuse daemon state that already exists before start", async () 
         file: "/tool/chrome",
         args: [
           "--user-data-dir=/runtime/chrome-profile",
-          "--disable-extensions-except=/tool/extension",
-          "--load-extension=/tool/extension",
+          `--disable-extensions-except=/tool/extension,${companionDir}`,
+          `--load-extension=/tool/extension,${companionDir}`,
           "--no-first-run",
           "--no-default-browser-check",
           "about:blank",
@@ -1286,8 +1304,8 @@ test("fails closed when daemon ownership changes before browser polling", async 
         file: "/tool/chrome",
         args: [
           "--user-data-dir=/runtime/chrome-profile",
-          "--disable-extensions-except=/tool/extension",
-          "--load-extension=/tool/extension",
+          `--disable-extensions-except=/tool/extension,${companionDir}`,
+          `--load-extension=/tool/extension,${companionDir}`,
           "--no-first-run",
           "--no-default-browser-check",
           "about:blank",
@@ -1910,8 +1928,8 @@ test("builds a direct Chrome launch plan outside macOS app-bundle paths", () => 
       file: "/opt/chrome/chrome",
       args: [
         "--user-data-dir=/tmp/runtime/chrome-profile",
-        "--disable-extensions-except=/tmp/extension",
-        "--load-extension=/tmp/extension",
+        `--disable-extensions-except=/tmp/extension,${companionDir}`,
+        `--load-extension=/tmp/extension,${companionDir}`,
         "--no-first-run",
         "--no-default-browser-check",
         "about:blank",

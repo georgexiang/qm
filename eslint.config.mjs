@@ -22,6 +22,10 @@ export default tseslint.config(
     languageOptions: { globals: globals.node },
   },
   {
+    files: ["packages/qm-host-broker/companion/*.js"],
+    languageOptions: { globals: globals.browser },
+  },
+  {
     rules: {
       "no-empty": ["error", { allowEmptyCatch: false }],
 

@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "QM Desktop Browser Companion",
+  "version": "0.1.0",
+  "description": "Local readiness and emergency stop for the QM Host Broker.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApqqD/3l10+TQKYVK8rVn9aHWuVpxLTGyUZDjkY1RsGy+UiKbY9P056bLEfgKgod9UZiOg9KRWnDn9MeKINQRlGZRpdp0l9v++5RzTPzJW07uDY6jGuYN26T3u1tIqLKlriYJ7g/BhRNzr5ttYLMPXGel6YdnMbbF1j1f/IjPi+hlUFgFLpekDre6mYc52u2EloBVwhjOXsVDien6LKjvcoW4AZ7vul9zodaXnK/sulnzmX/MUMpy3wWkkCwI7p1mjAxFMZyJutQHChRt+ckwH5skbxARPzppQtDIvnOm422SqievICiDfQi+x/A8pAb8trT6LWKC+Ev1AY3TDzSNpQIDAQAB",
+  "permissions": [],
+  "host_permissions": ["http://127.0.0.1:32145/*"],
+  "action": {
+    "default_title": "QM Desktop Browser",
+    "default_popup": "popup.html"
+  }
+}

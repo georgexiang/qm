@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QM Desktop Browser</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="mark" aria-hidden="true">QM</div>
+        <div>
+          <h1>Desktop Browser</h1>
+          <p>Local control</p>
+        </div>
+      </header>
+      <section class="readiness" aria-label="Local readiness">
+        <div class="status-row">
+          <span class="signal" id="broker-signal"></span>
+          <span>Host Broker</span>
+          <strong id="broker-status">Checking</strong>
+        </div>
+        <div class="status-row">
+          <span class="signal" id="browser-signal"></span>
+          <span>Browser runtime</span>
+          <strong id="browser-status">Checking</strong>
+        </div>
+      </section>
+      <section class="operation" id="operation" hidden>
+        <div class="operation-head">
+          <span>Current operation</span>
+          <time id="elapsed">0:00</time>
+        </div>
+        <strong id="operation-category">In progress</strong>
+        <button id="stop" type="button" title="Stop current local operation">
+          <span class="stop-icon" aria-hidden="true"></span>
+          <span>Stop local operation</span>
+        </button>
+      </section>
+      <div class="idle" id="idle">No current task</div>
+      <p class="error" id="error" role="status" hidden></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

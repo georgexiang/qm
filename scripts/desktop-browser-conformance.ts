@@ -242,10 +242,12 @@ export interface DesktopBrowserConformanceDeps {
 
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
+const companionExtensionDir = join(import.meta.dirname, "../packages/qm-host-broker/companion");
+
 const chromeLaunchArgs = (extensionDir: string, runtimeDirectory: string) => [
   `--user-data-dir=${runtimeDirectory}/chrome-profile`,
-  `--disable-extensions-except=${extensionDir}`,
-  `--load-extension=${extensionDir}`,
+  `--disable-extensions-except=${extensionDir},${companionExtensionDir}`,
+  `--load-extension=${extensionDir},${companionExtensionDir}`,
   "--no-first-run",
   "--no-default-browser-check",
   "about:blank",

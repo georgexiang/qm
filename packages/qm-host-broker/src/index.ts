@@ -1,4 +1,10 @@
 import {
+  createHostBrokerCompanionServer,
+  createHostBrokerLocalControl,
+  type HostBrokerLocalControl,
+  type HostBrokerOperationCategory,
+} from "./companion-control.ts";
+import {
   accessSync,
   chmodSync,
   closeSync,
@@ -36,6 +42,7 @@ import {
   projectDesktopBrowserPublicIdentity,
   validateDesktopBrowserPhaseFArgv,
   type DesktopBrowserCompletedResult,
+  type DesktopBrowserEffectClass,
   type DesktopBrowserHostFailure,
   type DesktopBrowserOperationAuthorityEnvelope,
   type DesktopBrowserSessionStartResult,
@@ -148,6 +155,7 @@ export interface HostBrokerConnectionOptions {
   processEpoch?: number | null;
   onStateChange?: (state: HostBrokerStateSnapshot) => void;
   writeObserver?: HostBrokerWriteObserver;
+  localControl?: HostBrokerLocalControl;
 }
 
 export interface HostBrokerWriteObserver {
@@ -180,6 +188,7 @@ export interface HostBrokerCliDeps {
   scheduler?: HostBrokerScheduler;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
+  companionPort?: number;
 }
 
 export interface HostBrokerScheduler {
@@ -208,6 +217,13 @@ export interface HostBrokerSessionRunControl {
 export interface HostBrokerSessionRunHandle {
   result: Promise<HostBrokerSessionRunResult>;
   cancel(reason?: Error): Promise<void>;
+}
+
+function localOperationCategory(effectClass: DesktopBrowserEffectClass): HostBrokerOperationCategory {
+  if (effectClass === "observation") return "observation";
+  if (effectClass === "cleanup") return "session_cleanup";
+  if (effectClass === "local_effect") return "session_start";
+  return "browser_effect";
 }
 
 export interface HostBrokerSessionRunner {
@@ -1555,6 +1571,7 @@ export class HostBrokerConnection {
   private readonly maxBrowserSkillOutputBytes: number;
   private readonly browserSkillTimeoutMs: number;
   private readonly writeObserver: HostBrokerWriteObserver | null;
+    private readonly localControl: HostBrokerLocalControl | null;
   private readonly activeSessionRuns = new Set<HostBrokerSessionRunHandle>();
   private lastTaskId: string | null = null;
 
@@ -1570,6 +1587,7 @@ export class HostBrokerConnection {
     this.maxBrowserSkillOutputBytes = options.maxBrowserSkillOutputBytes ?? MAX_BROWSER_SKILL_OUTPUT_BYTES;
     this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
     this.writeObserver = options.writeObserver ?? null;
+      this.localControl = options.localControl ?? null;
     this.snapshotState = createInitialState({
       qmUrl: options.qmUrl,
       relayUrl: options.relayUrl,
@@ -1583,6 +1601,10 @@ export class HostBrokerConnection {
       processEpoch: options.processEpoch ?? null,
       connectionEpoch: options.connectionEpoch ?? null,
     });
+    this.localControl?.setBrokerState({
+      brokerStatus: this.snapshotState.brokerStatus,
+      browserSkillStatus: this.snapshotState.browserSkillStatus,
+    });
   }
 
   snapshot(): HostBrokerStateSnapshot {
@@ -1590,6 +1612,10 @@ export class HostBrokerConnection {
   }
 
   private emitState(): void {
+    this.localControl?.setBrokerState({
+      brokerStatus: this.snapshotState.brokerStatus,
+      browserSkillStatus: this.snapshotState.browserSkillStatus,
+    });
     this.options.onStateChange?.(this.snapshot());
   }
 
@@ -1717,21 +1743,28 @@ export class HostBrokerConnection {
     this.emitState();
     input.socket.send(encodeDesktopBrowserMessage(acceptedMessage));
     let completedPersisted = false;
-    const runHandle = normalizeSessionRunHandle(
-      this.sessionRunner.run(
-        this.browserSkillExecutable,
-        authority.argv,
-        {
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-        {
-          signal: input.signal,
-          timeoutMs: this.browserSkillTimeoutMs,
-        },
-      ),
+    const sessionRun = this.sessionRunner.run(
+      this.browserSkillExecutable,
+      authority.argv,
+      {
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+      {
+        signal: input.signal,
+        timeoutMs: this.browserSkillTimeoutMs,
+      },
     );
+    const runHandle = normalizeSessionRunHandle(sessionRun);
     this.activeSessionRuns.add(runHandle);
+    this.localControl?.beginOperation({
+      taskId: authority.taskId,
+      attemptId: authority.attemptId,
+      operationId: authority.operationId,
+      category: localOperationCategory(authority.effectClass),
+      startedAt: input.now(),
+      ...(isSessionRunHandle(sessionRun) ? { cancel: (reason?: Error) => runHandle.cancel(reason) } : {}),
+    });
     try {
       const runResult = await runHandle.result;
       if (runResult.exitCode !== 0) throw new Error("BrowserSkill session start did not exit successfully");
@@ -1810,8 +1843,9 @@ export class HostBrokerConnection {
       if (input.isActive()) input.socket.send(encodeDesktopBrowserMessage(terminal));
       return;
     } finally {
+      this.localControl?.endOperation(authority.operationId);
       this.activeSessionRuns.delete(runHandle);
-      this.snapshotState.currentTaskPresent = false;
+      this.snapshotState.currentTaskPresent = this.activeSessionRuns.size > 0;
       this.emitState();
     }
   }
@@ -2223,8 +2257,13 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
       processEpoch,
       connectionEpoch: stored?.connectionEpoch ?? null,
     });
-    saveState(deps.dataDir, initialState);
-    if (!json) deps.stdout.write(`${renderHumanState(initialState)}\n`);
+    const localControl =
+      deps.companionPort === undefined
+        ? null
+        : createHostBrokerLocalControl({ dataDir: deps.dataDir, processEpoch, now: scheduler.now });
+    const companionServer = localControl
+      ? createHostBrokerCompanionServer({ control: localControl, port: deps.companionPort })
+      : null;
     const createConnection = (state: HostBrokerStateSnapshot): HostBrokerConnection =>
       new HostBrokerConnection({
         qmUrl,
@@ -2247,11 +2286,15 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         transport: deps.transport ?? defaultTransport(),
         signal: deps.signal,
         scheduler,
+        localControl: localControl ?? undefined,
         onStateChange(nextState) {
           saveState(deps.dataDir, withLatestConfirmationPreview(deps.dataDir, { ...state, ...nextState }));
         },
       });
     try {
+      await companionServer?.listen();
+      saveState(deps.dataDir, initialState);
+      if (!json) deps.stdout.write(`${renderHumanState(initialState)}\n`);
       const finalState = deps.signal
         ? await runHostBrokerConnectionSupervisor({
             initialState,
@@ -2283,6 +2326,8 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
       saveState(deps.dataDir, failedState);
       deps.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       return 1;
+    } finally {
+      await companionServer?.close();
     }
   }
 

@@ -79,6 +79,12 @@ import {
   type HostBrokerWriteObserver,
 } from "../packages/qm-host-broker/src/index.ts";
 import WebSocket from "ws";
+import {
+  HOST_BROKER_COMPANION_ORIGIN,
+  createHostBrokerLocalControl,
+  listHostBrokerLocalStopReceipts,
+  type HostBrokerLocalControl,
+} from "../packages/qm-host-broker/src/companion-control.ts";
 
 class FakeSocket implements HostBrokerSocket {
   private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
@@ -367,6 +373,7 @@ async function connectOperationHost(input: {
   supportedPolicyGrammarVersions?: string[];
   challengePolicyGrammarVersion?: string;
   protocolVersion?: "1.2" | "1.3";
+  localControl?: HostBrokerLocalControl;
 }): Promise<{ socket: FakeSocket; running: Promise<unknown> }> {
   const identity = await loadOrCreateDeviceIdentity(input.dataDir);
   const socket = new FakeSocket();
@@ -387,6 +394,7 @@ async function connectOperationHost(input: {
     dataDir: input.dataDir,
     browserSkillExecutable: input.browserSkillExecutable ?? TEST_BROWSER_SKILL_EXECUTABLE,
     sessionRunner: input.sessionRunner,
+    localControl: input.localControl,
     browserSkillTimeoutMs: input.browserSkillTimeoutMs,
     scheduler,
     transport: new FakeTransport(socket, "wss://relay.example.com/v1/device"),
@@ -411,6 +419,61 @@ async function connectOperationHost(input: {
   await waitFor(() => (socket.sent.length === 2 ? true : undefined), "host challenge response");
   return { socket, running };
 }
+
+test("Ticket 10 local Companion Stop cancels the real Host operation and persists a receipt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-local-companion-stop-"));
+  let rejectRun!: (reason: Error) => void;
+  let cancelReason = "";
+  const sessionRunner: HostBrokerSessionRunner = {
+    run() {
+      return {
+        result: new Promise((_resolve, reject) => {
+          rejectRun = reject;
+        }),
+        async cancel(reason) {
+          cancelReason = reason?.message ?? "";
+          rejectRun(reason ?? new Error("canceled"));
+        },
+      };
+    },
+  };
+  const control = createHostBrokerLocalControl({
+    dataDir: dir,
+    processEpoch: 99,
+    now: () => 30_000,
+    createNonce: () => "host-stop-nonce",
+  });
+  const authority = sessionStartAuthority("operation-local-companion-stop");
+  const { socket, running } = await connectOperationHost({ dataDir: dir, sessionRunner, localControl: control });
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-local-companion-stop",
+        requestHash: computeDesktopBrowserRequestHash(authority, "1.2", "1.0"),
+        authority,
+      },
+    }),
+  );
+  await waitFor(() => socket.sent[2], "local Companion Host acceptance");
+  const status = control.status(HOST_BROKER_COMPANION_ORIGIN);
+  assert.equal(status.currentTaskPresent, true);
+  assert.equal(status.operationCategory, "session_start");
+
+  assert.equal(await control.stop(HOST_BROKER_COMPANION_ORIGIN, status.stopNonce!), "stopped");
+  const terminal = decodeDesktopBrowserMessage(
+    await waitFor(() => socket.sent[3], "local Companion Host terminal"),
+    "1.2",
+    "1.0",
+  ) as HostResultMessage;
+  assert.equal(terminal.payload.outcome, "unknown");
+  assert.match(cancelReason, /local Companion/);
+  assert.equal(listHostBrokerLocalStopReceipts(dir).length, 1);
+
+  socket.close(1000, "done");
+  await running;
+});
 
 test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered output", async () => {
   const dir = mkdtempSync(join(tmpdir(), "host-broker-ticket-06-navigate-"));
