@@ -2043,7 +2043,7 @@ export function createChatSurface(
       work.activity = [...work.activity];
       ctx.chat.redraw();
     };
-    const taskAction = async (action: "cancel" | "continue" | "stop"): Promise<void> => {
+    const taskAction = async (action: "cancel" | "continue" | "recover" | "stop"): Promise<void> => {
       const before = task.actions;
       activity.payload = { ...task, actions: [] };
       work.activity = [...work.activity];
@@ -2165,6 +2165,15 @@ export function createChatSurface(
                     @click=${() => void taskAction("stop")}
                   >
                     ${icon(Ban, 14)}<span>Stop</span>
+                  </button>`
+                : nothing}
+              ${task.actions.includes("recover")
+                ? html`<button
+                    type="button"
+                    class="desktop-browser-continue"
+                    @click=${() => void taskAction("recover")}
+                  >
+                    ${icon(Play, 14)}<span>Recover by observation</span>
                   </button>`
                 : nothing}
             </div>`

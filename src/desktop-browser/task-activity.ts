@@ -14,7 +14,7 @@ export interface DesktopBrowserActivityProjection {
     | "canceled_with_unknown_effects";
   connectCommand?: string;
   actionAuthority: string;
-  actions: Array<"confirm" | "continue" | "cancel" | "stop">;
+  actions: Array<"confirm" | "continue" | "recover" | "cancel" | "stop">;
   registration?: {
     registrationId: string;
     confirmationFingerprint: string;
@@ -89,7 +89,7 @@ export function projectDesktopBrowserTaskActivity(
       status: task.status,
       connectCommand: `qm-host-broker connect ${publicWebUrl}`,
       actionAuthority: task.authorityId,
-      actions: [],
+      actions: task.status === "canceled_with_unknown_effects" ? ["recover"] : [],
     };
   }
   if (!registration) {

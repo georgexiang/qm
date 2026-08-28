@@ -58,6 +58,7 @@ export function createTurnMethods(
   | "desktopBrowserResolveRelayBinding"
   | "desktopBrowserPublishRelayConnection"
   | "desktopBrowserClearRelayConnection"
+  | "desktopBrowserReconcileDevice"
   | "desktopBrowserPrepareSessionStart"
   | "desktopBrowserConsumeSessionStartAccepted"
   | "desktopBrowserConsumeSessionStartResult"
@@ -636,6 +637,54 @@ export function createTurnMethods(
       if (!task || (!taskActor && !administrator)) {
         return { status: "refused", reason: "Desktop Browser Task not found" };
       }
+      if (action === "recover") {
+        const recovered = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+          await deps.identity.refresh();
+          const currentActor = deps.identity.classify(actor.id);
+          const members = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+          const currentAdministrator = await deps.admin?.canAdminister(currentActor, projectScopeId(task.projectId));
+          if (
+            project.orgId !== orgIdOf() ||
+            !deps.identity.isInternal(currentActor) ||
+            (!members.has(currentActor.id) && !currentAdministrator)
+          ) {
+            return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+          }
+          const recovery = await deps.desktopBrowserDeviceRegistry.deviceRecovery(task.id);
+          if (recovery.status === "refused") return recovery;
+          if (recovery.expiresAt <= Date.now()) return { status: "refused", reason: "browser_state_lost" } as const;
+          if (!deps.desktopBrowserRecover) return { status: "refused", reason: "Desktop Browser Relay is unavailable" } as const;
+          const session = await deps.sessions.get(task.sessionId);
+          if (!session) return { status: "refused", reason: "Desktop Browser Task session is unavailable" } as const;
+          const participants = await deps.sessions.participantsOf(session.id);
+          const { run } = await deps.runs.enqueue({
+            sessionId: task.threadRef,
+            request: {
+              surface: session.surface ?? "web",
+              actor: currentActor,
+              conversation: {
+                kind: session.type,
+                threadRef: task.threadRef,
+                channelRef: projectGroupRef(task.projectId),
+                audience: participants.map((id) => deps.identity.classify(id)),
+              },
+              origin: { kind: "human" },
+              text: "Recover the quarantined Desktop Browser session from current observation only.",
+              displayText: "Recover Desktop Browser session",
+              desktopBrowserRecoveryTaskId: task.id,
+              scopeVersion: String(project.updatedAt),
+              sessionParticipantIds: participants,
+              surfaceTools: true,
+            },
+            dedupKey: `desktop-browser-recovery:${task.id}`,
+            maxAttempts: deps.maxAttempts,
+          });
+          return { status: "ok", runId: run.id } as const;
+        });
+        if (!recovered) return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+        if (recovered.status === "refused") return recovered;
+        return drive(recovered.runId);
+      }
       if (action === "continue") {
         if (!taskActor) return { status: "refused", reason: "Desktop Browser Task not found" };
         const continued = await deps.projects?.withRosterLock(task.projectId, async (project) => {
@@ -944,6 +993,18 @@ export function createTurnMethods(
 
     async desktopBrowserClearRelayConnection(connectionId) {
       await deps.desktopBrowserDeviceRegistry.clearRelayConnection(connectionId);
+    },
+
+    async desktopBrowserReconcileDevice(input) {
+      await deps.desktopBrowserDeviceRegistry.reconcileDeviceIdentity(input);
+      await deps.auditLog.recordOnce?.(`desktop-browser-device-reconciled:${input.reconciliationId}`, {
+        at: input.confirmedAt,
+        principalId: "local-operator",
+        action: "desktop_browser.device.reconciled",
+        resource: input.reconciliationId,
+        scopeLabel: "device:local-reconciliation",
+        status: "ready",
+      });
     },
 
     async desktopBrowserPrepareSessionStart(taskId, authorityId) {

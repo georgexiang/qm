@@ -50,6 +50,7 @@ test("Ticket 10 Companion status is low-sensitivity, no-store, and consumes a re
       requestId: "request-status-1",
       brokerStatus: "ready",
       browserSkillStatus: "ready",
+      deviceStatus: "ready",
       currentTaskPresent: true,
       operationCategory: "browser_effect",
       elapsedMs: 2_500,

@@ -128,6 +128,7 @@ import { hashId } from "../util/crypto.ts";
 import { randomUUID } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import type { SkillResolution, GrantedSkillRef } from "../skills/skill-store.ts";
+import type { DesktopBrowserSanitizedObservationResult } from "qm-desktop-browser-contracts";
 import type { Orchestrator, OrchestratorDeps, OrchestratorInput } from "./orchestrator/types.ts";
 import { resolveModel } from "../model/pi-models.ts";
 import {
@@ -402,6 +403,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const coreReceivedAt = Date.now();
       let detectMs: number | undefined;
       let compactMs: number | undefined;
+      let desktopBrowserRecoveryObservation: DesktopBrowserSanitizedObservationResult | undefined;
       const turnTimezone = isValidCapabilityTimezone(input.timezone) ? input.timezone : undefined;
 
       if (!deps.identity.isInternal(actor)) {
@@ -480,6 +482,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           return deps.desktopBrowserOperations!.startForTask(input.desktopBrowserTaskId!);
         });
         if (started.status === "refused") return started;
+      }
+      if (input.desktopBrowserRecoveryTaskId) {
+        if (!deps.desktopBrowserOperations) return { status: "refused", reason: "Desktop Browser Relay is unavailable" };
+        const recovered = await deps.desktopBrowserOperations.recoverForTask(input.desktopBrowserRecoveryTaskId);
+        if (recovered.status === "refused") return recovered;
+        desktopBrowserRecoveryObservation = recovered.observation;
       }
 
       const resolution = await deps.resolution.resolve(conversation, actor);
@@ -831,6 +839,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (input.desktopBrowserTaskId) {
         systemPrompt +=
           "\n\nThis is an explicitly continued Desktop Browser Task. Execute only the unchanged user goal with the browser_task tool. Do not use another browser environment, broaden the goal, or resume a different Task. Explicitly finalize the Browser Task after session cleanup.";
+      }
+      if (desktopBrowserRecoveryObservation) {
+        systemPrompt += `\n\nA mandatory observation-first recovery has completed. Report and reason only from this sanitized current observation; do not perform another browser effect:\n${JSON.stringify(desktopBrowserRecoveryObservation)}`;
       }
       const scopeProfile = supportsScopeProfile(deps.sandbox)
         ? await deps.sandbox

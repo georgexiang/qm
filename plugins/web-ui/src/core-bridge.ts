@@ -334,7 +334,7 @@ export interface DesktopBrowserActivity {
     | "canceled_with_unknown_effects";
   connectCommand?: string;
   actionAuthority: string;
-  actions: Array<"confirm" | "continue" | "cancel" | "stop">;
+  actions: Array<"confirm" | "continue" | "recover" | "cancel" | "stop">;
   registration?: {
     registrationId: string;
     confirmationFingerprint: string;
@@ -390,7 +390,7 @@ export interface TurnOptions {
 export async function runDesktopBrowserTaskAction(
   taskId: string,
   authorityId: string,
-  action: "cancel" | "continue" | "stop",
+  action: "cancel" | "continue" | "recover" | "stop",
 ): Promise<{ desktopBrowserActivity?: DesktopBrowserActivity; reason?: string; newSubmission?: string }> {
   try {
     return await api(`/api/desktop-browser/tasks/${encodeURIComponent(taskId)}/actions`, {

@@ -335,6 +335,7 @@ export interface BuiltApp {
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   desktopBrowserStopReconciliation?: Sweeper;
   desktopBrowserAttemptReconciliation?: Sweeper;
+  desktopBrowserQuarantineReconciliation?: Sweeper;
   sessionStateBus: SessionStateBus;
   runtime: Runtime;
   config: ScopedConfigStore;
@@ -763,7 +764,7 @@ export function buildApp(
         tasks: desktopBrowserTasks,
         auditLog,
           claimDevice: (taskId) => desktopBrowserDeviceRegistry.claimDevice(taskId),
-          quarantineDevice: (taskId) => desktopBrowserDeviceRegistry.quarantineDevice!(taskId),
+          quarantineDevice: (taskId, input) => desktopBrowserDeviceRegistry.quarantineDevice!(taskId, input),
         releaseDevice: (taskId) => desktopBrowserDeviceRegistry.releaseDevice(taskId),
           consumeSessionStartResult: async (taskId, result) => {
             const task = await desktopBrowserTasks.get(taskId);
@@ -1214,7 +1215,10 @@ export function buildApp(
     tasks,
     desktopBrowserTasks,
     ...(desktopBrowserOperations
-      ? { desktopBrowserStart: (taskId: string) => desktopBrowserOperations.startForTask(taskId) }
+      ? {
+          desktopBrowserStart: (taskId: string) => desktopBrowserOperations.startForTask(taskId),
+          desktopBrowserRecover: (taskId: string) => desktopBrowserOperations.recoverForTask(taskId),
+        }
       : {}),
     ...(desktopBrowserRelayControl
       ? {
@@ -1279,6 +1283,19 @@ export function buildApp(
         () => reconcileDesktopBrowserAttempts(desktopBrowserTasks, desktopBrowserRelayControl, app),
         30_000,
         { label: "desktop browser Attempt reconciliation", immediate: true },
+      )
+    : undefined;
+  const desktopBrowserQuarantineReconciliation = desktopBrowserOperations
+    ? createSweeper(
+        async () => {
+          for (const taskId of await desktopBrowserDeviceRegistry.expireQuarantines()) {
+            if (await desktopBrowserOperations.cleanupQuarantinedTask(taskId)) {
+              await desktopBrowserDeviceRegistry.reconcileDevice(taskId);
+            }
+          }
+        },
+        30_000,
+        { label: "desktop browser quarantine reconciliation", immediate: true },
       )
     : undefined;
   const slackCore = createSlackCoreClient({
@@ -1528,6 +1545,7 @@ export function buildApp(
       wakeSweep.start();
       orphanedSignalSweeper.start();
       desktopBrowserAttemptReconciliation?.start();
+      desktopBrowserQuarantineReconciliation?.start();
       drain.start();
     },
     async releaseInFlightRuns() {
@@ -1550,6 +1568,7 @@ export function buildApp(
       await Promise.all(workers.map((w) => w.releaseInFlight()));
       desktopBrowserStopReconciliation?.stop();
       desktopBrowserAttemptReconciliation?.stop();
+      desktopBrowserQuarantineReconciliation?.stop();
       drain.stop();
       runs.close?.();
       void runSignals.close?.();
@@ -1575,6 +1594,7 @@ export function buildApp(
     desktopBrowserDeviceRegistry,
     ...(desktopBrowserStopReconciliation ? { desktopBrowserStopReconciliation } : {}),
     ...(desktopBrowserAttemptReconciliation ? { desktopBrowserAttemptReconciliation } : {}),
+    ...(desktopBrowserQuarantineReconciliation ? { desktopBrowserQuarantineReconciliation } : {}),
     sessionStateBus,
     runtime,
     config: configStore,

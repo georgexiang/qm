@@ -94,6 +94,7 @@ export interface OrchestratorInput extends Omit<
   sessionParticipantIds?: readonly string[];
   scopeVersion?: string;
   desktopBrowserTaskId?: string;
+  desktopBrowserRecoveryTaskId?: string;
 }
 
 export interface OrchestratorDeps {

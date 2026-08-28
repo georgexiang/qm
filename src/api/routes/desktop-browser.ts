@@ -20,10 +20,10 @@ async function taskAction(ctx: ApiCtx): Promise<void> {
   const principalId = ctx.capability?.actorId ?? requested;
   const authorityId = typeof body.authorityId === "string" ? body.authorityId : "";
   const action = body.action;
-  if (!principalId || (action !== "cancel" && action !== "continue" && action !== "stop")) {
+  if (!principalId || (action !== "cancel" && action !== "continue" && action !== "recover" && action !== "stop")) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
-      message: "principalId and cancel, continue, or stop action required",
+      message: "principalId and cancel, continue, recover, or stop action required",
     });
   }
   const result = await ctx.app.desktopBrowserTaskAction(ctx.params.id!, principalId, authorityId, action);
@@ -181,6 +181,26 @@ async function clearRelayConnection(ctx: ApiCtx): Promise<void> {
   ctx.res.end();
 }
 
+async function reconcileRelayDevice(ctx: ApiCtx): Promise<void> {
+  const body = isObj(ctx.body) ? ctx.body : {};
+  if (
+    typeof body.reconciliationId !== "string" ||
+    typeof body.devicePublicKey !== "string" ||
+    typeof body.browserInstanceId !== "string" ||
+    !Number.isSafeInteger(body.confirmedAt)
+  ) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "valid Device reconciliation required" });
+  }
+  await ctx.app.desktopBrowserReconcileDevice({
+    reconciliationId: body.reconciliationId,
+    devicePublicKey: body.devicePublicKey,
+    browserInstanceId: body.browserInstanceId,
+    confirmedAt: body.confirmedAt as number,
+  });
+  ctx.res.statusCode = 204;
+  ctx.res.end();
+}
+
 async function consumeRelayTerminalCallback(ctx: ApiCtx): Promise<void> {
   const body = isObj(ctx.body) ? ctx.body : {};
   const taskId = typeof body.taskId === "string" ? body.taskId : "";
@@ -233,6 +253,12 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
     path: "/v1/desktop-browser/relay/callbacks/local-stop",
     auth: "source",
     handle: consumeLocalStopCallback,
+  },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/relay/device-reconciliations",
+    auth: "source",
+    handle: reconcileRelayDevice,
   },
   { method: "POST", path: "/v1/desktop-browser/tasks/:id/actions", auth: "source", handle: taskAction },
   {

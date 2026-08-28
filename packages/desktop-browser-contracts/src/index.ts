@@ -238,6 +238,18 @@ export interface RelayLocalStopAckMessage {
   payload: { receiptId: string };
 }
 
+export interface HostDeviceReconciledMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "host.device-reconciled";
+  payload: { reconciliationId: string; processEpoch: number; confirmedAt: number };
+}
+
+export interface RelayDeviceReconcileAckMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "relay.device-reconcile-ack";
+  payload: { reconciliationId: string };
+}
+
 export interface DesktopBrowserRegistrationReservationTuple {
   registrationProtocolVersion: `${number}.${number}`;
   deploymentCanonicalId: string;
@@ -325,6 +337,8 @@ export type DesktopBrowserMessage =
   | HostResultMessage
   | HostLocalStopReceiptMessage
   | RelayLocalStopAckMessage
+  | HostDeviceReconciledMessage
+  | RelayDeviceReconcileAckMessage
   | CompanionStatusMessage;
 
 type DesktopBrowserMessageKind = DesktopBrowserMessage["kind"];
@@ -914,6 +928,18 @@ export const desktopBrowserMessageSchemas = {
   "relay.local-stop-ack": strictMessageSchema(
     "relay.local-stop-ack",
     strictObjectSchema(["receiptId"], { receiptId: canonicalLexicalStringSchema }),
+  ),
+  "host.device-reconciled": strictMessageSchema(
+    "host.device-reconciled",
+    strictObjectSchema(["reconciliationId", "processEpoch", "confirmedAt"], {
+      reconciliationId: canonicalLexicalStringSchema,
+      processEpoch: positiveIntegerSchema,
+      confirmedAt: positiveIntegerSchema,
+    }),
+  ),
+  "relay.device-reconcile-ack": strictMessageSchema(
+    "relay.device-reconcile-ack",
+    strictObjectSchema(["reconciliationId"], { reconciliationId: canonicalLexicalStringSchema }),
   ),
   "companion.status": messageSchema(
     "companion.status",

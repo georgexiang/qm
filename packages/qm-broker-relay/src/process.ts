@@ -288,6 +288,24 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
     });
     await requireOk(response);
   }
+
+  async reconcileDevice(input: {
+    reconciliationId: string;
+    devicePublicKey: string;
+    browserInstanceId: string;
+    confirmedAt: number;
+  }): Promise<void> {
+    const path = signedPath("/v1/desktop-browser/relay/device-reconciliations", this.config.sourceAuthSecret);
+    const body = JSON.stringify(input);
+    const response = await fetch(`${this.config.baseUrl}${path}`, {
+      method: "POST",
+      headers: signedRequestHeaders(this.config.sourceAuthSecret, "POST", path, body, {
+        "content-type": "application/json",
+      }),
+      body,
+    });
+    await requireOk(response);
+  }
 }
 
 export function createDesktopBrowserRelayRuntime(

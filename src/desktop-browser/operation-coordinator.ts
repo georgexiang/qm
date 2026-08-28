@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  buildDesktopBrowserObserveArgv,
   type DesktopBrowserSanitizedObservationResult,
   type HostAcceptedMessage,
   type HostResultMessage,
@@ -35,6 +36,11 @@ export interface DesktopBrowserRelayDispatcher {
 }
 
 export interface DesktopBrowserOperationCoordinator {
+  recoverForTask(taskId: string): Promise<
+    | { status: "ok"; observation?: DesktopBrowserSanitizedObservationResult }
+    | { status: "refused"; reason: string }
+  >;
+  cleanupQuarantinedTask(taskId: string): Promise<boolean>;
   startForTask(taskId: string): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   invokeForSession(input: {
     sessionId: string;
@@ -109,7 +115,7 @@ export function createDesktopBrowserOperationCoordinator(options: {
   dispatcher: DesktopBrowserRelayDispatcher;
   auditLog?: AuditLog;
   claimDevice?: (taskId: string) => Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
-  quarantineDevice?: (taskId: string) => Promise<void>;
+  quarantineDevice?: (taskId: string, input?: { ownershipVerified?: boolean }) => Promise<void>;
   releaseDevice?: (taskId: string) => Promise<void>;
   consumeSessionStartResult?: (
     taskId: string,
@@ -119,6 +125,85 @@ export function createDesktopBrowserOperationCoordinator(options: {
 }): DesktopBrowserOperationCoordinator {
   const createDispatchId = options.createDispatchId ?? randomUUID;
   return {
+    async cleanupQuarantinedTask(taskId) {
+      const task = await options.tasks.get(taskId);
+      if (!task?.browserSkillSessionId || task.browserSkillSessionStoppedAt !== undefined) return false;
+      const prepared = await options.tasks.prepareOperation(
+        task.id,
+        ["--json", "session", "stop", task.browserSkillSessionId],
+        { recoveryMode: "cleanup" },
+      );
+      if (prepared.status === "refused") return false;
+      const invocation: RelayInvocationMessage = {
+        protocolVersion: prepared.operation.authority.capabilitySet.protocolVersion,
+        kind: "relay.invoke",
+        payload: { dispatchId: createDispatchId(), requestHash: prepared.operation.requestHash, authority: prepared.operation.authority },
+      };
+      try {
+        const dispatched = await options.dispatcher.dispatch({
+          publicDeviceFingerprint: prepared.operation.authority.deviceId,
+          browserInstanceId: prepared.operation.authority.browserInstanceId,
+          invocation,
+        });
+        if (dispatched.kind !== "host.result" || dispatched.result.payload.outcome !== "completed") return false;
+        const accepted = await options.tasks.consumeOperationAccepted(task.id, dispatched.accepted);
+        if (accepted.status === "refused") return false;
+        const consumed = await options.tasks.consumeOperationResult(task.id, dispatched.result);
+        return consumed.status === "ok" && consumed.task.browserSkillSessionStoppedAt !== undefined;
+      } catch {
+        return false;
+      }
+    },
+    async recoverForTask(taskId) {
+      const task = await options.tasks.get(taskId);
+      if (
+        !task ||
+        task.status !== "canceled_with_unknown_effects" ||
+        !task.browserSkillSessionId ||
+        task.browserSkillSessionStoppedAt !== undefined
+      ) {
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      const prepared = await options.tasks.prepareOperation(
+        task.id,
+        buildDesktopBrowserObserveArgv(task.browserSkillSessionId),
+        { recoveryMode: "observe" },
+      );
+      if (prepared.status === "refused") return prepared;
+      const invocation: RelayInvocationMessage = {
+        protocolVersion: prepared.operation.authority.capabilitySet.protocolVersion,
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: createDispatchId(),
+          requestHash: prepared.operation.requestHash,
+          authority: prepared.operation.authority,
+        },
+      };
+      let dispatched: DesktopBrowserRelayDispatchResult;
+      try {
+        dispatched = await options.dispatcher.dispatch({
+          publicDeviceFingerprint: prepared.operation.authority.deviceId,
+          browserInstanceId: prepared.operation.authority.browserInstanceId,
+          invocation,
+        });
+      } catch {
+        await options.quarantineDevice?.(task.id, { ownershipVerified: false });
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      if (dispatched.kind !== "host.result") {
+        await options.quarantineDevice?.(task.id, { ownershipVerified: false });
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      const accepted = await options.tasks.consumeOperationAccepted(task.id, dispatched.accepted);
+      if (accepted.status === "refused") return accepted;
+      const consumed = await options.tasks.consumeOperationResult(task.id, dispatched.result);
+      if (consumed.status === "refused") return consumed;
+      if (dispatched.result.payload.outcome !== "completed" || !consumed.observation) {
+        await options.quarantineDevice?.(task.id, { ownershipVerified: false });
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      return { status: "ok", observation: consumed.observation };
+    },
     async startForTask(taskId) {
       const existing = await options.tasks.get(taskId);
       if (!existing || existing.status !== "waiting_for_broker" || existing.stopIntent) {
@@ -224,6 +309,7 @@ export function createDesktopBrowserOperationCoordinator(options: {
           prepared.operation.authority.operationId,
         );
         if (marked.status === "refused") return marked;
+        if (marked.task.status === "canceled_with_unknown_effects") await options.quarantineDevice?.(task.id);
         return { status: "refused", reason: "Desktop Browser Relay could not prove Host acceptance" };
       }
       const accepted = await options.tasks.consumeOperationAccepted(task.id, dispatched.accepted);
@@ -234,6 +320,7 @@ export function createDesktopBrowserOperationCoordinator(options: {
           : (dispatched.result ?? unknownResult(dispatched.accepted, dispatched.error));
       const consumed = await options.tasks.consumeOperationResult(task.id, result);
       if (consumed.status === "refused") return consumed;
+      if (consumed.task.status === "canceled_with_unknown_effects") await options.quarantineDevice?.(task.id);
       if (consumed.task.status === "canceled_with_unknown_effects") {
         return { status: "refused", reason: "Desktop Browser Task was stopped; browser effects may be unknown" };
       }

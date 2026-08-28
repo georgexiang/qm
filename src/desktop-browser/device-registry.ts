@@ -90,9 +90,19 @@ interface DesktopBrowserProjectHeadRecord {
 interface DesktopBrowserDeviceRegistryState {
   registrations: Record<string, DesktopBrowserRegistrationRecord>;
   taskClaims: Record<string, DesktopBrowserTaskClaimRecord>;
-  deviceClaims?: Record<string, { waitingTaskId: string; state?: "active" | "quarantined"; claimedAt: number }>;
+  deviceClaims?: Record<
+    string,
+    {
+      waitingTaskId: string;
+      state?: "active" | "quarantined" | "cleanup_pending" | "needs_local_reconciliation";
+      claimedAt: number;
+      quarantineExpiresAt?: number;
+      ownershipVerified?: boolean;
+    }
+  >;
   projectHeads: Record<string, DesktopBrowserProjectHeadRecord>;
   relayConnections: Record<string, DesktopBrowserRelayConnectionProjection>;
+  reconciliations?: Record<string, number>;
 }
 
 export interface DesktopBrowserDeviceRegistryBacking {
@@ -137,7 +147,21 @@ export interface DesktopBrowserDeviceRegistry {
   get(registrationId: string): Promise<DesktopBrowserRegistrationRecord | null>;
   taskRegistration(waitingTaskId: string): Promise<DesktopBrowserTaskRegistrationProjection | null>;
   claimDevice(waitingTaskId: string): Promise<{ status: "ok" } | DesktopBrowserRegistryRefusal>;
-  quarantineDevice?(waitingTaskId: string): Promise<void>;
+  quarantineDevice?(waitingTaskId: string, input?: { ownershipVerified?: boolean }): Promise<void>;
+  deviceRecovery(
+    waitingTaskId: string,
+  ): Promise<
+    | { status: "quarantined"; expiresAt: number }
+    | { status: "refused"; reason: "browser_state_lost" | "device_released" }
+  >;
+  expireQuarantines(): Promise<string[]>;
+  reconcileDevice(waitingTaskId: string): Promise<void>;
+  reconcileDeviceIdentity(input: {
+    reconciliationId: string;
+    devicePublicKey: string;
+    browserInstanceId: string;
+    confirmedAt: number;
+  }): Promise<void>;
   releaseDevice(waitingTaskId: string): Promise<void>;
   stagedConfirmation(registrationId: string): Promise<{
     browserRuntimeStatus: "ready" | "offline";
@@ -224,6 +248,7 @@ function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBr
     deviceClaims: { ...state.deviceClaims },
     projectHeads: { ...state.projectHeads },
     relayConnections: { ...state.relayConnections },
+    reconciliations: { ...state.reconciliations },
   };
 }
 
@@ -768,12 +793,88 @@ export function createDesktopBrowserDeviceRegistry(
       });
     },
 
-    async quarantineDevice(waitingTaskId) {
+    async quarantineDevice(waitingTaskId, input = {}) {
       await updateState((state) => {
         state.deviceClaims ??= {};
         for (const [key, claim] of Object.entries(state.deviceClaims)) {
-          if (claim.waitingTaskId === waitingTaskId) state.deviceClaims[key] = { ...claim, state: "quarantined" };
+          if (claim.waitingTaskId === waitingTaskId) {
+            state.deviceClaims[key] = {
+              ...claim,
+              state: input.ownershipVerified === false ? "needs_local_reconciliation" : "quarantined",
+              quarantineExpiresAt: now() + 15 * 60_000,
+              ownershipVerified: input.ownershipVerified ?? true,
+            };
+          }
         }
+      });
+    },
+
+    async deviceRecovery(waitingTaskId) {
+      const claim = Object.values((await readState()).deviceClaims ?? {}).find(
+        (candidate) => candidate.waitingTaskId === waitingTaskId,
+      );
+      if (!claim) return { status: "refused", reason: "device_released" };
+      if (
+        claim.state === "needs_local_reconciliation" ||
+        claim.state === "cleanup_pending" ||
+        claim.ownershipVerified === false
+      ) {
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      if (claim.state !== "quarantined" || claim.quarantineExpiresAt === undefined) {
+        return { status: "refused", reason: "device_released" };
+      }
+      return { status: "quarantined", expiresAt: claim.quarantineExpiresAt };
+    },
+
+    async expireQuarantines() {
+      return updateState((state) => {
+        const expired: string[] = [];
+        state.deviceClaims ??= {};
+        for (const [key, claim] of Object.entries(state.deviceClaims)) {
+          if (claim.state === "quarantined" && (claim.quarantineExpiresAt ?? 0) <= now()) {
+            state.deviceClaims[key] = { ...claim, state: "cleanup_pending" };
+          }
+          if (state.deviceClaims[key]?.state === "cleanup_pending") {
+            expired.push(claim.waitingTaskId);
+          }
+        }
+        return expired.sort();
+      });
+    },
+
+    async reconcileDevice(waitingTaskId) {
+      await updateState((state) => {
+        state.deviceClaims ??= {};
+        for (const [key, claim] of Object.entries(state.deviceClaims)) {
+          if (
+            claim.waitingTaskId === waitingTaskId &&
+            (claim.state === "needs_local_reconciliation" || claim.state === "cleanup_pending")
+          ) {
+            delete state.deviceClaims[key];
+          }
+        }
+      });
+    },
+
+    async reconcileDeviceIdentity(input) {
+      await updateState((state) => {
+        state.reconciliations ??= {};
+        if (state.reconciliations[input.reconciliationId] !== undefined) return;
+        const registrations = Object.values(state.registrations).filter(
+          (registration) =>
+            registration.publicIdentity.devicePublicKey === input.devicePublicKey &&
+            registration.registrationTuple.browserInstanceId === input.browserInstanceId,
+        );
+        state.deviceClaims ??= {};
+        for (const registration of registrations) {
+          const key = deviceClaimKey(registration);
+          const claim = state.deviceClaims[key];
+          if (claim && (claim.state === "needs_local_reconciliation" || claim.state === "cleanup_pending")) {
+            delete state.deviceClaims[key];
+          }
+        }
+        state.reconciliations[input.reconciliationId] = input.confirmedAt;
       });
     },
 

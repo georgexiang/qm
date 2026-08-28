@@ -99,6 +99,18 @@ test("Desktop Browser Continue reaches Core with the signed-in WebUI principal",
   assert.deepEqual(call?.body, { principalId: "alice", authorityId: "turn-authority", action: "continue" });
 });
 
+test("Desktop Browser Recover reaches Core without caller-supplied argv", async () => {
+  const response = await fetch(`${base}/api/desktop-browser/tasks/task-recover/actions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "recover", authorityId: "turn-authority", argv: ["unsafe"] }),
+  });
+
+  assert.equal(response.status, 200);
+  const call = calls.find((candidate) => candidate.url.includes("task-recover/actions"));
+  assert.deepEqual(call?.body, { principalId: "alice", authorityId: "turn-authority", action: "recover" });
+});
+
 test("Desktop Browser registration confirmation binds the signed-in WebUI principal", async () => {
   const response = await fetch(`${base}/api/desktop-browser/registrations/reg-1/confirm`, {
     method: "POST",

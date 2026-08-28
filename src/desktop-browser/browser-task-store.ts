@@ -142,6 +142,7 @@ export interface DesktopBrowserTask {
   browserInstanceId?: string;
   agentWindowId?: number;
   continuationRunId?: string;
+  recoveryExpiresAt?: number;
 }
 
 interface CreateDesktopBrowserTaskInput {
@@ -191,6 +192,7 @@ export interface DesktopBrowserTaskStore {
   prepareOperation(
     id: string,
     argv: unknown,
+    options?: { recoveryMode?: "observe" | "cleanup" },
   ): Promise<{ status: "ok"; operation: DesktopBrowserPreparedOperation } | { status: "refused"; reason: string }>;
   consumeOperationAccepted(
     id: string,
@@ -513,7 +515,9 @@ export function createDesktopBrowserTaskStore(
         const terminal = task.status !== "waiting_for_broker" || task.outcome !== undefined;
         const next: DesktopBrowserTask = {
           ...task,
-          ...(!terminal ? { status: "canceled_with_unknown_effects" as const } : {}),
+          ...(!terminal
+            ? { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: now() + 15 * 60_000 }
+            : {}),
           localStopReceipts: [...(task.localStopReceipts ?? []), structuredClone(message)],
           ...(terminal
             ? { auditWarnings: [...(task.auditWarnings ?? []), "Local Stop arrived after terminal Task outcome"] }
@@ -778,6 +782,9 @@ export function createDesktopBrowserTaskStore(
           }
           bound = {
             ...task,
+            ...(result.payload.outcome === "unknown"
+              ? { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }
+              : {}),
             execution: {
               ...execution,
               attemptStatus,
@@ -861,10 +868,23 @@ export function createDesktopBrowserTaskStore(
       if (!bound) return { status: "refused", reason: "Desktop Browser Task not found" };
       return { status: "ok", task: copy(bound) };
     },
-    async prepareOperation(taskId, rawArgv) {
+    async prepareOperation(taskId, rawArgv, prepareOptions = {}) {
       const current = await backing.get(taskId);
       if (!current) return { status: "refused", reason: "Desktop Browser Task not found" };
-      if (current.status !== "waiting_for_broker" || current.outcome) {
+      const recoveryMode = prepareOptions.recoveryMode;
+      const terminalRecovery = recoveryMode !== undefined;
+      if (
+        recoveryMode === "observe" &&
+        (current.status !== "canceled_with_unknown_effects" ||
+          current.recoveryExpiresAt === undefined ||
+          current.recoveryExpiresAt <= now())
+      ) {
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      if (recoveryMode === "cleanup" && current.status !== "canceled_with_unknown_effects") {
+        return { status: "refused", reason: "browser_state_lost" };
+      }
+      if (!terminalRecovery && (current.status !== "waiting_for_broker" || current.outcome)) {
         return { status: "refused", reason: "Desktop Browser Task already has a terminal outcome" };
       }
       if (current.browserSkillSessionStoppedAt !== undefined) {
@@ -889,6 +909,12 @@ export function createDesktopBrowserTaskStore(
       if (argv[1] === "session" && argv[2] === "start") {
         return { status: "refused", reason: "Desktop Browser Task already has a Task-owned session" };
       }
+      if (recoveryMode === "observe" && argv[1] !== "observe") {
+        return { status: "refused", reason: "Desktop Browser recovery must observe the Task-owned session first" };
+      }
+      if (recoveryMode === "cleanup" && !(argv[1] === "session" && argv[2] === "stop")) {
+        return { status: "refused", reason: "Desktop Browser recovery must observe or clean up the Task-owned session" };
+      }
       if (!supportsTicket06(current.execution.operation.authority.capabilitySet.protocolVersion)) {
         return { status: "refused", reason: "Desktop Browser connection does not support Ticket 06 operations" };
       }
@@ -896,7 +922,20 @@ export function createDesktopBrowserTaskStore(
       let prepared: DesktopBrowserPreparedOperation | null = null;
       let refusal: string | null = null;
       await backing.update(taskId, (task) => {
-        if (task.outcome || task.status !== "waiting_for_broker") {
+        if (
+          recoveryMode === "observe" &&
+          (task.status !== "canceled_with_unknown_effects" ||
+            task.recoveryExpiresAt === undefined ||
+            task.recoveryExpiresAt <= now())
+        ) {
+          refusal = "browser_state_lost";
+          return task;
+        }
+        if (recoveryMode === "cleanup" && task.status !== "canceled_with_unknown_effects") {
+          refusal = "browser_state_lost";
+          return task;
+        }
+        if (!terminalRecovery && (task.outcome || task.status !== "waiting_for_broker")) {
           refusal = "Desktop Browser Task already has a terminal outcome";
           return task;
         }
@@ -918,7 +957,7 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Task already has an operation in progress";
           return task;
         }
-        if (last?.status === "unknown") {
+        if (!terminalRecovery && last?.status === "unknown") {
           refusal = "Desktop Browser Task has an unknown browser effect";
           return task;
         }
@@ -935,7 +974,7 @@ export function createDesktopBrowserTaskStore(
           retryOfOperationId = last.operation.authority.operationId;
         }
         const at = now();
-        if (task.authorityExpiresAt <= at) {
+        if (!terminalRecovery && task.authorityExpiresAt <= at) {
           refusal = "Desktop Browser Turn authority expired; start a new Turn";
           return task;
         }
@@ -1107,6 +1146,9 @@ export function createDesktopBrowserTaskStore(
           completedResult && "schemaVersion" in completedResult && completedResult.command === "session.stop";
         recorded = {
           ...task,
+          ...(status === "unknown"
+            ? { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }
+            : {}),
           operations,
           ...(observation ? { latestObservation: structuredClone(observation) } : {}),
           ...(stopped ? { browserSkillSessionStoppedAt: at } : {}),
@@ -1145,8 +1187,16 @@ export function createDesktopBrowserTaskStore(
           return task;
         }
         const operations = [...task.operations];
-        operations[index] = { ...operation, status: "unknown", resultRecordedAt: now() };
-        recorded = { ...task, operations, updatedAt: now() };
+        const at = now();
+        operations[index] = { ...operation, status: "unknown", resultRecordedAt: at };
+        recorded = {
+          ...task,
+          ...(operation.operation.authority.effectClass === "observation"
+            ? {}
+            : { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }),
+          operations,
+          updatedAt: at,
+        };
         return recorded;
       });
       if (refusal) return { status: "refused", reason: refusal };

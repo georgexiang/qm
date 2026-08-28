@@ -48,6 +48,12 @@ export interface DesktopBrowserRelayRegistryAdapter {
   }): Promise<DesktopBrowserRelayBinding | null>;
   publishConnection(projection: DesktopBrowserRelayProjection): Promise<void>;
   clearConnection(connectionId: string): Promise<void>;
+  reconcileDevice?(input: {
+    reconciliationId: string;
+    devicePublicKey: string;
+    browserInstanceId: string;
+    confirmedAt: number;
+  }): Promise<void>;
 }
 
 export interface DesktopBrowserRelayClock {
@@ -889,6 +895,28 @@ export class DesktopBrowserRelayService {
     if (message.kind === "relay.invoke") throw new Error("unexpected relay.invoke frame from host");
     if (message.kind === "relay.local-stop-ack") {
       throw new Error("unexpected relay.local-stop-ack frame from host");
+    }
+    if (message.kind === "relay.device-reconcile-ack") {
+      throw new Error("unexpected relay.device-reconcile-ack frame from host");
+    }
+    if (message.kind === "host.device-reconciled") {
+      if (!this.options.registry.reconcileDevice) {
+        throw new Error("desktop browser Device reconciliation is unavailable");
+      }
+      await this.options.registry.reconcileDevice({
+        reconciliationId: message.payload.reconciliationId,
+        devicePublicKey: connection.binding!.devicePublicKey,
+        browserInstanceId: connection.binding!.browserInstanceId,
+        confirmedAt: message.payload.confirmedAt,
+      });
+      connection.socket.send(
+        encodeDesktopBrowserMessage({
+          protocolVersion: message.protocolVersion,
+          kind: "relay.device-reconcile-ack",
+          payload: { reconciliationId: message.payload.reconciliationId },
+        }),
+      );
+      return;
     }
     if (message.kind === "host.local-stop-receipt") {
       if (!this.operationStore) throw new Error("desktop browser durable Local Stop storage is unavailable");

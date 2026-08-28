@@ -712,9 +712,10 @@ test("Ticket 06 coordinator never redispatches navigate after ambiguous Relay de
   });
   assert.deepEqual(await coordinator.invokeForSession(input), {
     status: "refused",
-    reason: "Desktop Browser Task has an unknown browser effect",
+    reason: "No active Desktop Browser Task belongs to this Agent session",
   });
   assert.equal(dispatches, 1);
+  assert.equal((await store.get("task-ambiguous"))?.status, "canceled_with_unknown_effects");
 });
 
 test("Ticket 08 coordinator does not return a late Host completion after Stop wins", async () => {
@@ -1050,6 +1051,158 @@ test("Ticket 11 concurrent Local Stop Receipt and Core finalization preserve one
   assert.ok(settled?.status === "completed" || settled?.status === "canceled_with_unknown_effects");
   assert.equal(settled?.localStopReceipts?.length, 1);
   if (settled?.status === "completed") assert.equal(settled.outcome?.summary, "Concurrent completion");
+});
+
+test("Ticket 12 recovery dispatches observation first without reviving the terminal Task", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-observation-recovery", "operation-observation-recovery-start");
+  task.status = "canceled_with_unknown_effects";
+  task.recoveryExpiresAt = 22_000 + 15 * 60_000;
+  await backing.put(task.id, task);
+  const ids = ["operation-recovery-observe", "nonce-recovery-observe"];
+  const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => 22_000 });
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    dispatcher: {
+      async dispatch(input) {
+        assert.deepEqual(input.invocation.payload.authority.argv, ["--json", "observe", "--session", task.browserSkillSessionId]);
+        const operation = input.invocation.payload;
+        return {
+          kind: "host.result" as const,
+          accepted: acceptedFor(operation, operation.dispatchId),
+          result: {
+            protocolVersion: "1.3",
+            kind: "host.result" as const,
+            payload: {
+              dispatchId: operation.dispatchId,
+              operationId: operation.authority.operationId,
+              outcome: "completed" as const,
+              resultHash: "sha256:recovery-observation",
+              result: {
+                schemaVersion: "1.0" as const,
+                command: "observe" as const,
+                completedAt: "2036-08-27T12:00:22.000Z",
+                data: { tab_id: 7, text: "Recovered state", ref_count: 1, truncated: false },
+              },
+            },
+          },
+        };
+      },
+    },
+  });
+
+  assert.equal((await coordinator.recoverForTask(task.id)).status, "ok");
+  const recovered = await store.get(task.id);
+  assert.equal(recovered?.status, "canceled_with_unknown_effects");
+  assert.equal(recovered?.latestObservation?.data.text, "Recovered state");
+});
+
+test("Ticket 12 quarantine timeout cleans only the Task-owned session", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-timeout-cleanup", "operation-timeout-cleanup-start");
+  task.status = "canceled_with_unknown_effects";
+  task.recoveryExpiresAt = 21_999;
+  await backing.put(task.id, task);
+  const ids = ["operation-timeout-cleanup", "nonce-timeout-cleanup"];
+  const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => 22_000 });
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    dispatcher: {
+      async dispatch(input) {
+        assert.deepEqual(input.invocation.payload.authority.argv, [
+          "--json",
+          "session",
+          "stop",
+          task.browserSkillSessionId,
+        ]);
+        const operation = input.invocation.payload;
+        return {
+          kind: "host.result" as const,
+          accepted: acceptedFor(operation, operation.dispatchId),
+          result: {
+            protocolVersion: "1.3",
+            kind: "host.result" as const,
+            payload: {
+              dispatchId: operation.dispatchId,
+              operationId: operation.authority.operationId,
+              outcome: "completed" as const,
+              resultHash: "sha256:timeout-cleanup",
+              result: {
+                schemaVersion: "1.0" as const,
+                command: "session.stop" as const,
+                completedAt: "2036-08-27T12:00:22.000Z",
+                data: { returned_tab_ids: [7], return_failures: [] },
+              },
+            },
+          },
+        };
+      },
+    },
+  });
+
+  assert.equal(await coordinator.cleanupQuarantinedTask(task.id), true);
+  const cleaned = await store.get(task.id);
+  assert.equal(cleaned?.status, "canceled_with_unknown_effects");
+  assert.equal(cleaned?.browserSkillSessionStoppedAt, 22_000);
+});
+
+test("Ticket 12 authorized recovery creates a Run before observation", async () => {
+  const task = readyTask("task-recovery-run", "operation-recovery-run-start");
+  task.status = "canceled_with_unknown_effects";
+  task.recoveryExpiresAt = Date.now() + 15 * 60_000;
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing);
+  const enqueued: Array<Record<string, unknown>> = [];
+  let recoverCalls = 0;
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (id: string) => ({ id, type: "internal" }),
+        isInternal: () => true,
+      },
+      projects: {
+        withRosterLock: async (_id: string, fn: (project: unknown) => Promise<unknown>) =>
+          fn({ id: task.projectId, orgId: "default-org", ownerId: task.actorId, memberIds: [], updatedAt: 42 }),
+      },
+      admin: { canAdminister: async () => false },
+      desktopBrowserTasks: store,
+      desktopBrowserDeviceRegistry: {
+        deviceRecovery: async () => ({ status: "quarantined", expiresAt: task.recoveryExpiresAt! }),
+      },
+      desktopBrowserRecover: async () => {
+        recoverCalls += 1;
+        return { status: "ok" };
+      },
+      sessions: {
+        get: async () => ({ id: task.sessionId, type: "group", threadRef: task.threadRef, surface: "web" }),
+        participantsOf: async () => [task.actorId],
+      },
+      runs: {
+        enqueue: async (input: Record<string, unknown>) => {
+          enqueued.push(input);
+          return { run: { id: "run-recovery" }, deduped: false };
+        },
+      },
+      maxAttempts: 3,
+    } as any,
+    { drive: async (runId: string) => ({ status: "queued", runId }) } as any,
+    {} as any,
+  );
+
+  assert.deepEqual(await app.desktopBrowserTaskAction(task.id, task.actorId, task.authorityId, "recover"), {
+    status: "queued",
+    runId: "run-recovery",
+  });
+  assert.equal(recoverCalls, 0);
+  const recoveryRun = enqueued[0]!;
+  assert.equal((recoveryRun.request as { desktopBrowserRecoveryTaskId?: string }).desktopBrowserRecoveryTaskId, task.id);
+  assert.equal(recoveryRun.dedupKey, `desktop-browser-recovery:${task.id}`);
+  assert.deepEqual(await app.desktopBrowserTaskAction(task.id, "outsider", task.authorityId, "recover"), {
+    status: "refused",
+    reason: "Desktop Browser Task not found",
+  });
 });
 
 test("Ticket 08 Stop during initial Host acceptance records unknown effects", async () => {

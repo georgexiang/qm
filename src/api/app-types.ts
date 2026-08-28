@@ -26,6 +26,7 @@ import type { RunActivityEntry, RunActivityStore } from "../runs/run-activity-st
 import type { RunSignal, RunSignalStore } from "../runs/run-signal-store.ts";
 import type { TaskStore, TaskStatus } from "../tasks/task-store.ts";
 import type { DesktopBrowserTaskStore } from "../desktop-browser/browser-task-store.ts";
+import type { DesktopBrowserOperationCoordinator } from "../desktop-browser/operation-coordinator.ts";
 import type {
   DesktopBrowserDeviceRegistry,
   DesktopBrowserTaskRegistrationProjection,
@@ -253,7 +254,7 @@ export interface App {
     taskId: string,
     principalId: string,
     authorityId: string,
-    action: "cancel" | "continue" | "stop",
+    action: "cancel" | "continue" | "recover" | "stop",
   ): Promise<TurnResult>;
   desktopBrowserReserveRegistration(
     taskId: string,
@@ -317,6 +318,12 @@ export interface App {
   }): Promise<{ status: "ok"; binding: DesktopBrowserRelayRegistryBinding } | { status: "refused"; reason: string }>;
   desktopBrowserPublishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
   desktopBrowserClearRelayConnection(connectionId: string): Promise<void>;
+  desktopBrowserReconcileDevice(input: {
+    reconciliationId: string;
+    devicePublicKey: string;
+    browserInstanceId: string;
+    confirmedAt: number;
+  }): Promise<void>;
   desktopBrowserPrepareSessionStart(
     taskId: string,
     authorityId: string,
@@ -622,6 +629,9 @@ export interface AppDeps {
   desktopBrowserStart?: (
     taskId: string,
   ) => Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
+  desktopBrowserRecover?: (
+    taskId: string,
+  ) => ReturnType<DesktopBrowserOperationCoordinator["recoverForTask"]>;
   desktopBrowserRevoke?: (input: {
     publicDeviceFingerprint: string;
     browserInstanceId: string;

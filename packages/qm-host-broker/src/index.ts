@@ -17,12 +17,13 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawn } from "node:child_process";
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
 import { isIP } from "node:net";
 import { dirname, isAbsolute, join } from "node:path";
 import {
@@ -105,6 +106,13 @@ export interface HostBrokerStateSnapshot {
   publicDeviceFingerprint: string | null;
   confirmationFingerprint: string | null;
   notice: string;
+  deviceStatus?: "ready" | "needs_local_reconciliation";
+  localReconciliation?: {
+    reconciliationId: string;
+    processEpoch: number;
+    confirmedAt: number;
+    status: "prepared" | "completed";
+  } | null;
 }
 
 export interface RegistrationConfirmationPreview {
@@ -158,6 +166,7 @@ export interface HostBrokerConnectionOptions {
   onStateChange?: (state: HostBrokerStateSnapshot) => void;
   writeObserver?: HostBrokerWriteObserver;
   localControl?: HostBrokerLocalControl;
+  deviceStatus?: "ready" | "needs_local_reconciliation";
 }
 
 export interface HostBrokerWriteObserver {
@@ -315,6 +324,7 @@ const DEVICE_KEY_FILE = "device-key.json";
 const STATE_FILE = "state.json";
 const OPERATIONS_DIR = "operations";
 const SESSIONS_DIR = "sessions";
+const ACTIVE_PROCESS_FILE = "active-process.json";
 const DEFAULT_RUNTIME: BrowserRuntimeMetadata = {
   browserInstanceId: "unbound",
   browserSkillStatus: "offline",
@@ -428,6 +438,49 @@ function stateFilePath(dataDir: string): string {
   return join(dataDir, STATE_FILE);
 }
 
+function activeProcessPath(dataDir: string): string {
+  return join(dataDir, ACTIVE_PROCESS_FILE);
+}
+
+function activeHostProcess(dataDir: string): boolean {
+  const record = readJsonFile<{ pid?: unknown }>(activeProcessPath(dataDir));
+  if (!record || !Number.isSafeInteger(record.pid)) return false;
+  try {
+    process.kill(record.pid as number, 0);
+    return true;
+  } catch {
+    unlinkSync(activeProcessPath(dataDir));
+    return false;
+  }
+}
+
+function claimActiveHostProcess(dataDir: string, processEpoch: number): string {
+  const path = activeProcessPath(dataDir);
+  const ownerId = randomUUID();
+  assertSafeDirectory(dirname(path));
+  if (activeHostProcess(dataDir)) throw new Error("Host Broker is already active");
+  const fd = openSync(
+    path,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+    SAFE_FILE_MODE,
+  );
+  try {
+    writeFileSync(fd, `${JSON.stringify({ pid: process.pid, processEpoch, ownerId })}\n`, "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  return ownerId;
+}
+
+function releaseActiveHostProcess(dataDir: string, processEpoch: number, ownerId: string): void {
+  const path = activeProcessPath(dataDir);
+  if (!existsSync(path)) return;
+  const record = readJsonFile<{ pid?: unknown; processEpoch?: unknown; ownerId?: unknown }>(path);
+  if (record?.pid !== process.pid || record.processEpoch !== processEpoch || record.ownerId !== ownerId) return;
+  unlinkSync(path);
+}
+
 function localRecordPath(dataDir: string, directory: string, identity: string): string {
   const digest = createHash("sha256").update(identity).digest("hex");
   return join(dataDir, directory, `${digest}.json`);
@@ -450,6 +503,68 @@ function deleteSessionOwnership(dataDir: string, taskId: string): void {
     fsyncSync(dirFd);
   } finally {
     closeSync(dirFd);
+  }
+}
+
+function hostDeviceStatus(dataDir: string): "ready" | "needs_local_reconciliation" {
+  const directory = join(dataDir, SESSIONS_DIR);
+  if (!existsSync(directory)) return "ready";
+  try {
+    assertSafeDirectory(directory);
+    for (const name of readdirSync(directory)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) return "needs_local_reconciliation";
+      const record = readJsonFile<HostSessionOwnershipRecord>(join(directory, name));
+      if (
+        !record ||
+        typeof record.taskId !== "string" ||
+        typeof record.attemptId !== "string" ||
+        typeof record.operationId !== "string" ||
+        typeof record.sessionId !== "string" ||
+        sessionOwnershipPath(dataDir, record.taskId) !== join(directory, name)
+      ) {
+        return "needs_local_reconciliation";
+      }
+    }
+    return "ready";
+  } catch {
+    return "needs_local_reconciliation";
+  }
+}
+
+function durableHostDeviceStatus(
+  dataDir: string,
+  stored: BrokerStateFile | null,
+): "ready" | "needs_local_reconciliation" {
+  if (stored?.deviceStatus === "needs_local_reconciliation") return "needs_local_reconciliation";
+  return hostDeviceStatus(dataDir);
+}
+
+function hostSessionOwnershipEmpty(dataDir: string): boolean {
+  const directory = join(dataDir, SESSIONS_DIR);
+  if (!existsSync(directory)) return true;
+  try {
+    assertSafeDirectory(directory);
+    return readdirSync(directory).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+function clearHostSessionOwnership(dataDir: string): void {
+  const directory = join(dataDir, SESSIONS_DIR);
+  if (!existsSync(directory)) return;
+  assertSafeDirectory(directory);
+  for (const name of readdirSync(directory)) {
+    if (!/^[a-f0-9]{64}\.json$/.test(name)) throw new Error("Host session ownership filename is unsafe");
+    const path = join(directory, name);
+    assertSafeFile(path, SAFE_FILE_MODE);
+    unlinkSync(path);
+  }
+  const fd = openSync(directory, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -1603,6 +1718,7 @@ export class HostBrokerConnection {
       processEpoch: options.processEpoch ?? null,
       connectionEpoch: options.connectionEpoch ?? null,
     });
+    this.snapshotState.deviceStatus = options.deviceStatus ?? "ready";
     this.localControl?.setBrokerState({
       brokerStatus: this.snapshotState.brokerStatus,
       browserSkillStatus: this.snapshotState.browserSkillStatus,
@@ -1633,6 +1749,9 @@ export class HostBrokerConnection {
     const decoded = decodeDesktopBrowserMessage(input.raw, input.protocolVersion, input.policyGrammarVersion);
     if (decoded.kind !== "relay.invoke") throw new Error("expected relay.invoke message");
     if (!this.dataDir) throw new Error("host operation state directory is not configured");
+    if (this.snapshotState.deviceStatus === "needs_local_reconciliation") {
+      throw new Error("browser_state_lost");
+    }
     assertOperationAuthorityBindings(
       decoded.payload.authority,
       this.deviceId,
@@ -1871,6 +1990,7 @@ export class HostBrokerConnection {
       let settled = false;
       let challenged = false;
       const outstandingReceiptIds = new Set<string>();
+      let outstandingReconciliationId: string | null = null;
       let negotiatedProtocolVersion: `${number}.${number}` | null = null;
       let negotiatedPolicyGrammarVersion: string | null = null;
       let handshakeComplete = false;
@@ -1928,6 +2048,22 @@ export class HostBrokerConnection {
                 throw new Error("Local Stop acknowledgement does not match an outstanding receipt");
               }
               deleteHostBrokerLocalStopReceipt(this.dataDir, acknowledgement.payload.receiptId);
+              return;
+            }
+            if (rawEnvelope.kind === "relay.device-reconcile-ack") {
+              if (!negotiatedProtocolVersion || !this.dataDir) {
+                throw new Error("Device reconciliation acknowledgement arrived before Host registration");
+              }
+              const acknowledgement = decodeDesktopBrowserMessage(raw, negotiatedProtocolVersion);
+              if (
+                acknowledgement.kind !== "relay.device-reconcile-ack" ||
+                acknowledgement.payload.reconciliationId !== outstandingReconciliationId
+              ) {
+                throw new Error("Device reconciliation acknowledgement does not match outstanding confirmation");
+              }
+              outstandingReconciliationId = null;
+              this.snapshotState.localReconciliation = null;
+              this.emitState();
               return;
             }
             if (rawEnvelope.kind === "relay.invoke") {
@@ -2009,6 +2145,20 @@ export class HostBrokerConnection {
                   }),
                 );
               }
+            }
+            if (this.snapshotState.localReconciliation?.status === "completed") {
+              outstandingReconciliationId = this.snapshotState.localReconciliation.reconciliationId;
+              socket.send(
+                encodeDesktopBrowserMessage({
+                  protocolVersion: message.protocolVersion,
+                  kind: "host.device-reconciled",
+                  payload: {
+                    reconciliationId: this.snapshotState.localReconciliation.reconciliationId,
+                    processEpoch: this.snapshotState.localReconciliation.processEpoch,
+                    confirmedAt: this.snapshotState.localReconciliation.confirmedAt,
+                  },
+                }),
+              );
             }
             return;
           }
@@ -2178,7 +2328,15 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
   if (!command) throw new Error("expected a qm-host-broker command");
   const json = takeFlag(rest, "--json");
   const identity = await loadOrCreateDeviceIdentity(deps.dataDir);
-  const stored = loadState(deps.dataDir);
+  let stored = loadState(deps.dataDir);
+  if (stored?.localReconciliation?.status === "prepared" && hostSessionOwnershipEmpty(deps.dataDir)) {
+    stored = {
+      ...stored,
+      deviceStatus: "ready",
+      localReconciliation: { ...stored.localReconciliation, status: "completed" },
+    };
+    saveState(deps.dataDir, stored);
+  }
   const brokerInstanceId = nextBrokerInstanceId(deps.brokerInstanceId ?? stored?.brokerInstanceId ?? null);
   const runtime = deps.runtime ?? DEFAULT_RUNTIME;
   const scheduler = deps.scheduler ?? DEFAULT_SCHEDULER;
@@ -2201,8 +2359,62 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         processEpoch: storedProcessEpoch,
         connectionEpoch: null,
       });
-    writeOutput(deps.stdout, json, state);
+    const deviceStatus = durableHostDeviceStatus(deps.dataDir, stored);
+    if (stored && stored.deviceStatus !== deviceStatus) saveState(deps.dataDir, { ...stored, deviceStatus });
+    writeOutput(deps.stdout, json, { ...state, deviceStatus });
     return 0;
+  }
+
+  if (command === "reconcile") {
+    const confirmed = takeFlag(rest, "--confirm");
+    ensureNoExtraArgs(rest);
+    if (!confirmed) throw new Error("reconcile requires --confirm after local browser inspection");
+    const reconcileEpoch = storedProcessEpoch ?? 1;
+    let reconcileOwnerId: string;
+    try {
+      reconcileOwnerId = claimActiveHostProcess(deps.dataDir, reconcileEpoch);
+    } catch {
+      throw new Error("reconcile requires the Host Broker to be stopped");
+    }
+    const confirmedAt = scheduler.now();
+    const localReconciliation = {
+      reconciliationId: `device-reconciliation-${confirmedAt}-${randomUUID()}`,
+      processEpoch: storedProcessEpoch ?? 1,
+      confirmedAt,
+      status: "prepared" as const,
+    };
+    const reconciledState = {
+      ...(stored ??
+        createInitialState({
+          qmUrl: null,
+          relayUrl: null,
+          deploymentCanonicalId: null,
+          brokerInstanceId,
+          browserInstanceId: runtime.browserInstanceId,
+          browserSkillStatus: runtime.browserSkillStatus,
+          devicePublicKey: identity.devicePublicKey,
+          publicDeviceFingerprint: null,
+          confirmationFingerprint: null,
+          processEpoch: storedProcessEpoch,
+          connectionEpoch: null,
+        })),
+      deviceStatus: "needs_local_reconciliation" as const,
+      localReconciliation,
+    };
+    try {
+      saveState(deps.dataDir, reconciledState);
+      clearHostSessionOwnership(deps.dataDir);
+      const completedState = {
+        ...reconciledState,
+        deviceStatus: "ready" as const,
+        localReconciliation: { ...localReconciliation, status: "completed" as const },
+      };
+      saveState(deps.dataDir, completedState);
+      writeOutput(deps.stdout, json, completedState);
+      return 0;
+    } finally {
+      releaseActiveHostProcess(deps.dataDir, reconcileEpoch, reconcileOwnerId);
+    }
   }
 
   if (command === "confirmation") {
@@ -2282,7 +2494,8 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
     const relayUrl = deps.resolveRelayUrl ? deps.resolveRelayUrl(qmUrl) : resolveRelayUrlDefault(qmUrl);
     normalizeBrowserSkillExecutable(deps.browserSkillExecutable, deps.sessionRunner);
     const processEpoch = nextProcessEpoch(stored?.processEpoch ?? null, scheduler);
-    const initialState = createInitialState({
+    const initialState: HostBrokerStateSnapshot = {
+      ...createInitialState({
       qmUrl,
       relayUrl,
       deploymentCanonicalId: stored?.deploymentCanonicalId ?? null,
@@ -2294,14 +2507,19 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
       confirmationFingerprint: stored?.confirmationFingerprint ?? null,
       processEpoch,
       connectionEpoch: stored?.connectionEpoch ?? null,
-    });
+      }),
+      ...(stored?.localReconciliation ? { localReconciliation: stored.localReconciliation } : {}),
+      deviceStatus: durableHostDeviceStatus(deps.dataDir, stored),
+    };
     const localControl =
       deps.companionPort === undefined
         ? null
         : createHostBrokerLocalControl({ dataDir: deps.dataDir, processEpoch, now: scheduler.now });
+      localControl?.setDeviceStatus(initialState.deviceStatus ?? "ready");
     const companionServer = localControl
       ? createHostBrokerCompanionServer({ control: localControl, port: deps.companionPort })
       : null;
+    let activeProcessOwnerId: string | null = null;
     const createConnection = (state: HostBrokerStateSnapshot): HostBrokerConnection =>
       new HostBrokerConnection({
         qmUrl,
@@ -2325,11 +2543,13 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         signal: deps.signal,
         scheduler,
         localControl: localControl ?? undefined,
+        deviceStatus: state.deviceStatus,
         onStateChange(nextState) {
           saveState(deps.dataDir, withLatestConfirmationPreview(deps.dataDir, { ...state, ...nextState }));
         },
       });
     try {
+      activeProcessOwnerId = claimActiveHostProcess(deps.dataDir, processEpoch);
       await companionServer?.listen();
       saveState(deps.dataDir, initialState);
       if (!json) deps.stdout.write(`${renderHumanState(initialState)}\n`);
@@ -2366,6 +2586,7 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
       return 1;
     } finally {
       await companionServer?.close();
+      if (activeProcessOwnerId) releaseActiveHostProcess(deps.dataDir, processEpoch, activeProcessOwnerId);
     }
   }
 

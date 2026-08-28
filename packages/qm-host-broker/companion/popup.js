@@ -3,6 +3,8 @@ const brokerStatus = document.querySelector("#broker-status");
 const browserStatus = document.querySelector("#browser-status");
 const brokerSignal = document.querySelector("#broker-signal");
 const browserSignal = document.querySelector("#browser-signal");
+const deviceSignal = document.querySelector("#device-signal");
+const deviceStatus = document.querySelector("#device-status");
 const operation = document.querySelector("#operation");
 const operationCategory = document.querySelector("#operation-category");
 const elapsed = document.querySelector("#elapsed");
@@ -53,6 +55,9 @@ async function refresh() {
     browserStatus.textContent = status.browserSkillStatus === "ready" ? "Ready" : "Offline";
     brokerSignal.classList.toggle("ready", status.brokerStatus === "ready");
     browserSignal.classList.toggle("ready", status.browserSkillStatus === "ready");
+    const deviceReady = status.deviceStatus !== "needs_local_reconciliation";
+    deviceStatus.textContent = deviceReady ? "Ready" : "Inspect locally";
+    deviceSignal.classList.toggle("ready", deviceReady);
     operation.hidden = !status.currentTaskPresent;
     idle.hidden = status.currentTaskPresent;
     stopNonce = status.stopNonce ?? null;

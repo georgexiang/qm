@@ -7,6 +7,7 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   statSync,
@@ -522,6 +523,70 @@ test("Ticket 11 Host replays a Local Stop Receipt after reconnect until Relay ac
   await waitFor(() => (listHostBrokerLocalStopReceipts(dir).length === 0 ? true : undefined), "receipt acknowledgement");
   second.socket.close(1000, "done");
   await second.running;
+});
+
+test("Ticket 12 Host CLI requires local confirmation before clearing stale session ownership", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-local-reconciliation-"));
+  const sessionsDir = join(dir, "sessions");
+  mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(sessionsDir, `${"a".repeat(64)}.json`), "{invalid", { mode: 0o600 });
+  const output: string[] = [];
+  const deps = {
+    dataDir: dir,
+    stdout: { write: (chunk: string) => output.push(chunk) },
+    stderr: { write: () => undefined },
+    runtime: runtime(),
+  };
+
+  assert.equal(await runHostBrokerCli(["status", "--json"], deps), 0);
+  assert.equal(JSON.parse(output.at(-1)!).deviceStatus, "needs_local_reconciliation");
+  await assert.rejects(runHostBrokerCli(["reconcile"], deps), /--confirm/);
+  assert.equal(readdirSync(sessionsDir).length, 1);
+  assert.equal(await runHostBrokerCli(["reconcile", "--confirm", "--json"], deps), 0);
+  assert.equal(readdirSync(sessionsDir).length, 0);
+  const completed = JSON.parse(output.at(-1)!);
+  assert.equal(completed.deviceStatus, "ready");
+  writeFileSync(
+    join(dir, "state.json"),
+    JSON.stringify({
+      ...completed,
+      deviceStatus: "needs_local_reconciliation",
+      localReconciliation: { ...completed.localReconciliation, status: "prepared" },
+    }),
+    { mode: 0o600 },
+  );
+  assert.equal(await runHostBrokerCli(["status", "--json"], deps), 0);
+  const recovered = JSON.parse(output.at(-1)!);
+  assert.equal(recovered.localReconciliation.status, "completed");
+  assert.equal(recovered.deviceStatus, "ready");
+  writeFileSync(
+    join(sessionsDir, `${createHash("sha256").update("task-still-owned").digest("hex")}.json`),
+    JSON.stringify({
+      taskId: "task-still-owned",
+      attemptId: "attempt-still-owned",
+      operationId: "operation-still-owned",
+      requestHash: "sha256:still-owned",
+      sessionId: "session-still-owned",
+      browserInstanceId: "browser-primary",
+      agentWindowId: 7,
+      latestOperationSequence: 1,
+      latestLeaseVersion: 1,
+    }),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(dir, "state.json"),
+    JSON.stringify({
+      ...recovered,
+      deviceStatus: "needs_local_reconciliation",
+      localReconciliation: { ...recovered.localReconciliation, status: "prepared" },
+    }),
+    { mode: 0o600 },
+  );
+  assert.equal(await runHostBrokerCli(["status", "--json"], deps), 0);
+  const partial = JSON.parse(output.at(-1)!);
+  assert.equal(partial.localReconciliation.status, "prepared");
+  assert.equal(partial.deviceStatus, "needs_local_reconciliation");
 });
 
 test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered output", async () => {
@@ -3180,6 +3245,7 @@ test("connect handshake sends shared hello and signed challenge response through
     publicDeviceFingerprint: null,
     confirmationFingerprint: null,
     notice: HOST_BROKER_CONTROL_NOTICE,
+    deviceStatus: "ready",
   });
 
   socket.close(1000, "done");

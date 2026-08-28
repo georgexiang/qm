@@ -149,6 +149,7 @@ class FakeRegistryAdapter implements DesktopBrowserRelayRegistryAdapter {
   readonly published = new Map<string, DesktopBrowserRelayProjection>();
   readonly cleared: string[] = [];
   readonly bindings = new Map<string, DesktopBrowserRelayBinding>();
+  readonly reconciliations: Array<Record<string, unknown>> = [];
 
   async resolveBinding(input: {
     devicePublicKey: string;
@@ -164,6 +165,10 @@ class FakeRegistryAdapter implements DesktopBrowserRelayRegistryAdapter {
   async clearConnection(connectionId: string): Promise<void> {
     this.cleared.push(connectionId);
     this.published.delete(connectionId);
+  }
+
+  async reconcileDevice(input: Record<string, unknown>): Promise<void> {
+    this.reconciliations.push(input);
   }
 
   setBinding(
@@ -849,6 +854,33 @@ test("Ticket 11 Relay persists a Local Stop Receipt before acknowledging the Hos
   });
   assert.deepEqual(await operationStore.localStopReceipts(), [{ message: receipt, receivedAt: 25_000 }]);
   await service.drain();
+});
+
+test("Ticket 12 Relay reconciles the authenticated Device before acknowledging the Host", async () => {
+  const { adapter, service, socket } = await createRegisteredTicket05Relay({ protocolVersion: "1.3" });
+  const projection = service.snapshots()[0]!;
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.3",
+      kind: "host.device-reconciled",
+      payload: { reconciliationId: "device-reconciliation-1", processEpoch: 9, confirmedAt: 25_000 },
+    }),
+  );
+  await flushMessages();
+
+  assert.deepEqual(adapter.reconciliations, [
+    {
+      reconciliationId: "device-reconciliation-1",
+      devicePublicKey: adapter.bindings.values().next().value!.devicePublicKey,
+      browserInstanceId: projection.browserInstanceId,
+      confirmedAt: 25_000,
+    },
+  ]);
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), {
+    protocolVersion: "1.3",
+    kind: "relay.device-reconcile-ack",
+    payload: { reconciliationId: "device-reconciliation-1" },
+  });
 });
 
 test("Ticket 08 busy cross-Task dispatch cannot replace the active revoke Lease", async () => {

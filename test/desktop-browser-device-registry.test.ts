@@ -208,6 +208,60 @@ test("Ticket 09 one Device accepts only one Task claim without disclosing its ow
   assert.deepEqual(await registry.claimDevice("task-2"), { status: "ok" });
 });
 
+test("Ticket 12 quarantine preserves exclusivity and requires local reconciliation when ownership is lost", async () => {
+  const { registry, tick } = createRegistry();
+  const { devicePublicKey, signEnvelope } = createKeyMaterial();
+  const reserved = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-quarantine",
+      actorId: "owner",
+      projectId: "project-quarantine",
+      membershipEpoch: 42,
+      authorityId: "authority-quarantine",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey,
+      brokerInstanceId: "broker-1",
+      browserInstanceId: "browser-1",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  assert.equal(
+    (
+      await registry.confirm({
+        registrationId: reserved.reservation.registrationTuple.registrationId,
+        authorityId: "authority-quarantine",
+        browserRuntimeStatus: "ready",
+        envelope: confirmationEnvelope(reserved.reservation, signEnvelope),
+      })
+    ).status,
+    "ok",
+  );
+  assert.deepEqual(await registry.claimDevice("task-quarantine"), { status: "ok" });
+  await registry.quarantineDevice!("task-quarantine", { ownershipVerified: true });
+  assert.deepEqual(await registry.deviceRecovery("task-quarantine"), {
+    status: "quarantined",
+    expiresAt: 1_725_000_900_000,
+  });
+
+  tick(15 * 60_000 + 1);
+  assert.deepEqual(await registry.expireQuarantines(), ["task-quarantine"]);
+  assert.deepEqual(await registry.deviceRecovery("task-quarantine"), {
+    status: "refused",
+    reason: "browser_state_lost",
+  });
+
+  const reconciliation = {
+    reconciliationId: "device-reconciliation-quarantine",
+    devicePublicKey,
+    browserInstanceId: "browser-1",
+    confirmedAt: 1_725_000_900_001,
+  };
+  await registry.reconcileDeviceIdentity(reconciliation);
+  await registry.reconcileDeviceIdentity(reconciliation);
+  assert.deepEqual(await registry.deviceRecovery("task-quarantine"), { status: "refused", reason: "device_released" });
+});
+
 test("duplicate reserve for the same tuple is deterministic and one-time even under concurrency", async () => {
   const { registry } = createRegistry();
   const { devicePublicKey } = createKeyMaterial();

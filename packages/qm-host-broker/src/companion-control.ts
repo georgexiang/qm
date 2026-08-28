@@ -38,6 +38,7 @@ export interface HostBrokerLocalStatus {
   brokerStatus: "ready" | "paused" | "disconnected";
   browserSkillStatus: "ready" | "offline";
   currentTaskPresent: boolean;
+  deviceStatus?: "ready" | "needs_local_reconciliation";
   operationCategory?: HostBrokerOperationCategory;
   elapsedMs?: number;
   stopNonce?: string;
@@ -62,6 +63,7 @@ export interface HostBrokerLocalControl {
     brokerStatus: HostBrokerLocalStatus["brokerStatus"];
     browserSkillStatus: HostBrokerLocalStatus["browserSkillStatus"];
   }): void;
+  setDeviceStatus(status: "ready" | "needs_local_reconciliation"): void;
   beginOperation(operation: ActiveLocalOperation): void;
   endOperation(operationId: string): void;
   status(origin: string): HostBrokerLocalStatus;
@@ -190,6 +192,7 @@ export function createHostBrokerLocalControl(options: {
   const createNonce = options.createNonce ?? randomUUID;
   let brokerStatus: HostBrokerLocalStatus["brokerStatus"] = "disconnected";
   let browserSkillStatus: HostBrokerLocalStatus["browserSkillStatus"] = "offline";
+  let deviceStatus: NonNullable<HostBrokerLocalStatus["deviceStatus"]> = "ready";
   const active = new Map<string, ActiveLocalOperation>();
   const stopNonces = new Map<
     string,
@@ -207,6 +210,9 @@ export function createHostBrokerLocalControl(options: {
       brokerStatus = state.brokerStatus;
       browserSkillStatus = state.browserSkillStatus;
     },
+    setDeviceStatus(status) {
+      deviceStatus = status;
+    },
     beginOperation(operation) {
       active.set(operation.operationId, operation);
     },
@@ -214,18 +220,19 @@ export function createHostBrokerLocalControl(options: {
       active.delete(operationId);
     },
     status(origin) {
-      if (active.size === 0) return { brokerStatus, browserSkillStatus, currentTaskPresent: false };
+      if (active.size === 0) return { brokerStatus, browserSkillStatus, deviceStatus, currentTaskPresent: false };
       const operation = active.size === 1 ? active.values().next().value! : null;
       const at = now();
       for (const [nonce, binding] of stopNonces) {
         if (binding.expiresAt <= at) stopNonces.delete(nonce);
       }
       if (stopNonces.size >= 10_000) throw new Error("local Stop nonce capacity exceeded");
-      if (!operation) return { brokerStatus, browserSkillStatus, currentTaskPresent: true };
+      if (!operation) return { brokerStatus, browserSkillStatus, deviceStatus, currentTaskPresent: true };
       if (!operation.cancel || operation.stopping) {
         return {
           brokerStatus,
           browserSkillStatus,
+          deviceStatus,
           currentTaskPresent: true,
           operationCategory: operation.category,
           elapsedMs: Math.max(0, at - operation.startedAt),
@@ -243,6 +250,7 @@ export function createHostBrokerLocalControl(options: {
       return {
         brokerStatus,
         browserSkillStatus,
+        deviceStatus,
         currentTaskPresent: true,
         operationCategory: operation.category,
         elapsedMs: Math.max(0, at - operation.startedAt),
