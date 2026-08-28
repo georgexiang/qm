@@ -5,6 +5,7 @@ import {
   confirmDesktopBrowserRegistration,
   desktopBrowserActivityEntry,
   entriesToMessages,
+  runDesktopBrowserTaskAction,
   type AssistantWork,
   type DesktopBrowserActivity,
 } from "../src/core-bridge.ts";
@@ -132,4 +133,25 @@ test("registration confirmation calls the dedicated WebUI route", async () => {
       confirmationFingerprint: "4f8c52de91a3b10c",
     },
   });
+});
+
+test("expired Continue returns the original goal as a new submission", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        error: "not_accepted",
+        message: "Desktop Browser Turn authority expired",
+        newSubmission: "/desktop-browser open the dashboard",
+      }),
+      { status: 409, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+  try {
+    assert.deepEqual(await runDesktopBrowserTaskAction("task-1", "expired-authority", "continue"), {
+      reason: "Desktop Browser Turn authority expired",
+      newSubmission: "/desktop-browser open the dashboard",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

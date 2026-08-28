@@ -14,7 +14,7 @@ export interface DesktopBrowserActivityProjection {
     | "canceled_with_unknown_effects";
   connectCommand?: string;
   actionAuthority: string;
-  actions: Array<"confirm" | "cancel" | "stop">;
+  actions: Array<"confirm" | "continue" | "cancel" | "stop">;
   registration?: {
     registrationId: string;
     confirmationFingerprint: string;
@@ -46,6 +46,7 @@ export function projectDesktopBrowserTaskActivity(
     | "browserSkillSessionStoppedAt"
     | "browserInstanceId"
     | "agentWindowId"
+    | "continuationRunId"
     | "latestObservation"
   >,
   publicWebUrl: string | undefined,
@@ -69,7 +70,12 @@ export function projectDesktopBrowserTaskActivity(
       },
     };
   }
-  if (task.status === "waiting_for_broker" && task.browserSkillSessionId && !task.browserSkillSessionStoppedAt) {
+  if (
+    task.status === "waiting_for_broker" &&
+    task.browserSkillSessionId &&
+    !task.browserSkillSessionStoppedAt &&
+    task.continuationRunId
+  ) {
     return {
       taskId: task.id,
       status: "running",
@@ -100,7 +106,7 @@ export function projectDesktopBrowserTaskActivity(
     status: registration.status === "confirmed" ? "registration_confirmed" : "waiting_for_local_confirmation",
     connectCommand: `qm-host-broker connect ${publicWebUrl}`,
     actionAuthority: task.authorityId,
-    actions: registration.status === "confirmed" ? ["cancel"] : ["confirm", "cancel"],
+    actions: registration.status === "confirmed" ? ["continue", "cancel"] : ["confirm", "cancel"],
     registration: {
       registrationId: registration.registrationId,
       confirmationFingerprint: registration.confirmationFingerprint,
@@ -123,7 +129,7 @@ export function projectDesktopBrowserActivityReply(activity: DesktopBrowserActiv
     return `No Host Broker is connected. Start it on the customer desktop:\n\n${activity.connectCommand}`;
   }
   if (activity.status === "registration_confirmed") {
-    return "Desktop Browser registration confirmed. Continue stays disabled until Ticket09.";
+    return "Desktop Browser registration confirmed. Continue when you are ready to run the original goal.";
   }
   return activity.registration?.confirmReady
     ? "Desktop Browser registration is ready to confirm. Match the fingerprint with the Host Broker preview, then confirm it here."

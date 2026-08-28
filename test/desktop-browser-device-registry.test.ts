@@ -171,6 +171,43 @@ test("confirm verifies the shared canonical bytes with Ed25519, spends the reser
   assert.equal(await registry.challengeBinding(reserved.reservation.registrationTuple.registrationId), null);
 });
 
+test("Ticket 09 one Device accepts only one Task claim without disclosing its owner", async () => {
+  const { registry } = createRegistry();
+  const { devicePublicKey, signEnvelope } = createKeyMaterial();
+  const reserveFor = async (taskId: string, connectionEpoch: number, brokerInstanceId = "broker-1") => {
+    const reserved = assertReserved(
+      await registry.reserve({
+        waitingTaskId: taskId,
+        actorId: "owner",
+        projectId: `project-${taskId}`,
+        membershipEpoch: 42,
+        authorityId: `authority-${taskId}`,
+        authorityExpiresAt: 1_725_000_600_000,
+        devicePublicKey,
+        brokerInstanceId,
+        browserInstanceId: "browser-1",
+        connectionEpoch,
+        operatingSystem: "macos-arm64",
+      }),
+    );
+    const confirmed = await registry.confirm({
+      registrationId: reserved.reservation.registrationTuple.registrationId,
+      authorityId: `authority-${taskId}`,
+      browserRuntimeStatus: "ready",
+      envelope: confirmationEnvelope(reserved.reservation, signEnvelope),
+    });
+    assert.equal(confirmed.status, "ok");
+  };
+  await reserveFor("task-1", 7);
+  assert.deepEqual(await registry.claimDevice("task-1"), { status: "ok" });
+  await registry.quarantineDevice!("task-1");
+  await reserveFor("task-2", 8, "broker-2");
+
+  assert.deepEqual(await registry.claimDevice("task-2"), { status: "refused", reason: "device_busy" });
+  await registry.releaseDevice("task-1");
+  assert.deepEqual(await registry.claimDevice("task-2"), { status: "ok" });
+});
+
 test("duplicate reserve for the same tuple is deterministic and one-time even under concurrency", async () => {
   const { registry } = createRegistry();
   const { devicePublicKey } = createKeyMaterial();

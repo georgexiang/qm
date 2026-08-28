@@ -139,6 +139,7 @@ export interface DesktopBrowserTask {
   browserSkillSessionStoppedAt?: number;
   browserInstanceId?: string;
   agentWindowId?: number;
+  continuationRunId?: string;
 }
 
 interface CreateDesktopBrowserTaskInput {
@@ -167,6 +168,7 @@ export interface DesktopBrowserTaskStore {
   listPendingStops(): Promise<DesktopBrowserTask[]>;
   markStopAudited(id: string): Promise<DesktopBrowserTask>;
   markStopRevocationDelivered(id: string): Promise<DesktopBrowserTask>;
+  markContinuationRun(id: string, runId: string): Promise<DesktopBrowserTask>;
   prepareSessionStart(
     id: string,
   ): Promise<
@@ -444,6 +446,16 @@ export function createDesktopBrowserTaskStore(
         return { ...current, stopIntent: { ...current.stopIntent, revocationStatus: "delivered" }, updatedAt: now() };
       });
       if (!task?.stopIntent) throw new Error("Desktop Browser Task Stop intent not found");
+      return copy(task);
+    },
+    async markContinuationRun(taskId, runId) {
+      const task = await backing.update?.(taskId, (current) => {
+        if (current.continuationRunId && current.continuationRunId !== runId) return current;
+        return { ...current, continuationRunId: runId, updatedAt: now() };
+      });
+      if (!task || task.continuationRunId !== runId) {
+        throw new Error("Desktop Browser Task Continue Run could not be recorded");
+      }
       return copy(task);
     },
     async prepareSessionStart(taskId) {

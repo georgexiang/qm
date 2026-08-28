@@ -467,6 +467,21 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         }
       }
 
+      if (input.desktopBrowserTaskId) {
+        if (!deps.desktopBrowserOperations) {
+          return { status: "refused", reason: "Desktop Browser Relay is unavailable" };
+        }
+        const started = await withManagedRosterVersion(async () => {
+          await deps.identity.refresh();
+          const currentActor = deps.identity.classify(actor.id);
+          if (!deps.identity.isInternal(currentActor)) {
+            return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+          }
+          return deps.desktopBrowserOperations!.startForTask(input.desktopBrowserTaskId!);
+        });
+        if (started.status === "refused") return started;
+      }
+
       const resolution = await deps.resolution.resolve(conversation, actor);
       const scopeId = deps.resolution.scopeFor(conversation, actor);
       let participantHistorySeqs: Set<number> | undefined;
@@ -813,6 +828,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       }
       const sharedCore = applyPromptVars(SHARED_CORE_MD, { botName, orgName });
       let systemPrompt = `${modeFrame}\n\n${resolution.systemPrompt}\n\n${sharedCore}\n\n${renderSecurityPolicyPrompt(securityPolicy)}`;
+      if (input.desktopBrowserTaskId) {
+        systemPrompt +=
+          "\n\nThis is an explicitly continued Desktop Browser Task. Execute only the unchanged user goal with the browser_task tool. Do not use another browser environment, broaden the goal, or resume a different Task. Explicitly finalize the Browser Task after session cleanup.";
+      }
       const scopeProfile = supportsScopeProfile(deps.sandbox)
         ? await deps.sandbox
             .profileFor(memoryScopeId)

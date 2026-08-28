@@ -194,6 +194,8 @@ test("waiting task activity replays reservation fingerprint and staged confirmat
   );
   assert.equal(confirmed.status, "ok");
   assert.equal(confirmed.desktopBrowserActivity?.status, "registration_confirmed");
+  assert.deepEqual(confirmed.desktopBrowserActivity?.actions, ["continue", "cancel"]);
+  assert.deepEqual(await built.runs.list(), []);
 });
 
 test("desktop browser routing stays explicit and current Project authorization fails closed", async () => {

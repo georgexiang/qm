@@ -90,6 +90,7 @@ interface DesktopBrowserProjectHeadRecord {
 interface DesktopBrowserDeviceRegistryState {
   registrations: Record<string, DesktopBrowserRegistrationRecord>;
   taskClaims: Record<string, DesktopBrowserTaskClaimRecord>;
+  deviceClaims?: Record<string, { waitingTaskId: string; state?: "active" | "quarantined"; claimedAt: number }>;
   projectHeads: Record<string, DesktopBrowserProjectHeadRecord>;
   relayConnections: Record<string, DesktopBrowserRelayConnectionProjection>;
 }
@@ -135,6 +136,9 @@ export interface DesktopBrowserDeviceRegistry {
   challengeBinding(registrationId: string): Promise<DesktopBrowserChallengeBinding | null>;
   get(registrationId: string): Promise<DesktopBrowserRegistrationRecord | null>;
   taskRegistration(waitingTaskId: string): Promise<DesktopBrowserTaskRegistrationProjection | null>;
+  claimDevice(waitingTaskId: string): Promise<{ status: "ok" } | DesktopBrowserRegistryRefusal>;
+  quarantineDevice?(waitingTaskId: string): Promise<void>;
+  releaseDevice(waitingTaskId: string): Promise<void>;
   stagedConfirmation(registrationId: string): Promise<{
     browserRuntimeStatus: "ready" | "offline";
     envelope: DesktopBrowserRegistrationConfirmationEnvelope;
@@ -162,7 +166,7 @@ export interface DesktopBrowserDeviceRegistry {
     devicePublicKey: string;
     brokerInstanceId: string;
   }): Promise<DesktopBrowserRelayRegistryBinding | null>;
-  publishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<void>;
+  publishRelayConnection(projection: DesktopBrowserRelayConnectionProjection): Promise<string[]>;
   clearRelayConnection(connectionId: string): Promise<void>;
   sessionStartAuthority(waitingTaskId: string): Promise<DesktopBrowserSessionStartAuthoritySnapshot | null>;
   sessionStartAuthorityState(
@@ -189,6 +193,18 @@ function iso(at: number): string {
   return new Date(at).toISOString();
 }
 
+function deviceClaimKey(record: DesktopBrowserRegistrationRecord): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        deploymentCanonicalId: record.publicIdentity.deploymentCanonicalId,
+        devicePublicKey: record.publicIdentity.devicePublicKey,
+        browserInstanceId: record.publicIdentity.browserInstanceId,
+      }),
+    )
+    .digest("hex");
+}
+
 export type DesktopBrowserConfirmMutationPoint =
   | "afterTaskClaimWrite"
   | "afterCurrentRegistrationInstall"
@@ -198,13 +214,14 @@ export type DesktopBrowserConfirmMutationPoint =
 const REGISTRY_STATE_ID = "desktop-browser-device-registry";
 
 function emptyRegistryState(): DesktopBrowserDeviceRegistryState {
-  return { registrations: {}, taskClaims: {}, projectHeads: {}, relayConnections: {} };
+  return { registrations: {}, taskClaims: {}, deviceClaims: {}, projectHeads: {}, relayConnections: {} };
 }
 
 function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBrowserDeviceRegistryState {
   return {
     registrations: { ...state.registrations },
     taskClaims: { ...state.taskClaims },
+    deviceClaims: { ...state.deviceClaims },
     projectHeads: { ...state.projectHeads },
     relayConnections: { ...state.relayConnections },
   };
@@ -733,6 +750,42 @@ export function createDesktopBrowserDeviceRegistry(
       return registrations[0] ? taskRegistrationProjection(registrations[0]) : null;
     },
 
+    async claimDevice(waitingTaskId) {
+      return updateState((state) => {
+        const taskClaim = claimForTask(state, waitingTaskId);
+        const registration = taskClaim ? state.registrations[taskClaim.registrationId] : undefined;
+        if (!registration || registration.status !== "online") {
+          return { status: "refused", reason: "desktop browser device is not ready" } as const;
+        }
+        state.deviceClaims ??= {};
+        const key = deviceClaimKey(registration);
+        const existing = state.deviceClaims[key];
+        if (existing && existing.waitingTaskId !== waitingTaskId) {
+          return { status: "refused", reason: "device_busy" } as const;
+        }
+        state.deviceClaims[key] = { waitingTaskId, state: existing?.state ?? "active", claimedAt: existing?.claimedAt ?? now() };
+        return { status: "ok" } as const;
+      });
+    },
+
+    async quarantineDevice(waitingTaskId) {
+      await updateState((state) => {
+        state.deviceClaims ??= {};
+        for (const [key, claim] of Object.entries(state.deviceClaims)) {
+          if (claim.waitingTaskId === waitingTaskId) state.deviceClaims[key] = { ...claim, state: "quarantined" };
+        }
+      });
+    },
+
+    async releaseDevice(waitingTaskId) {
+      await updateState((state) => {
+        state.deviceClaims ??= {};
+        for (const [key, claim] of Object.entries(state.deviceClaims)) {
+          if (claim.waitingTaskId === waitingTaskId) delete state.deviceClaims[key];
+        }
+      });
+    },
+
     async stagedConfirmation(registrationId) {
       const at = now();
       const state = await readState();
@@ -935,8 +988,17 @@ export function createDesktopBrowserDeviceRegistry(
     },
 
     async publishRelayConnection(projection) {
-      await updateState((state) => {
+      return updateState((state) => {
         state.relayConnections[projection.connectionId] = { ...projection };
+        return Object.values(state.registrations)
+          .filter(
+            (registration) =>
+              registration.status === "online" &&
+              registration.publicDeviceFingerprint === projection.publicDeviceFingerprint &&
+              registration.registrationTuple.browserInstanceId === projection.browserInstanceId,
+          )
+          .map((registration) => registration.waitingTaskId)
+          .sort();
       });
     },
 

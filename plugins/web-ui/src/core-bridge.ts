@@ -334,7 +334,7 @@ export interface DesktopBrowserActivity {
     | "canceled_with_unknown_effects";
   connectCommand?: string;
   actionAuthority: string;
-  actions: Array<"confirm" | "cancel" | "stop">;
+  actions: Array<"confirm" | "continue" | "cancel" | "stop">;
   registration?: {
     registrationId: string;
     confirmationFingerprint: string;
@@ -390,12 +390,25 @@ export interface TurnOptions {
 export async function runDesktopBrowserTaskAction(
   taskId: string,
   authorityId: string,
-  action: "cancel" | "stop",
-): Promise<{ desktopBrowserActivity?: DesktopBrowserActivity; reason?: string }> {
-  return api(`/api/desktop-browser/tasks/${encodeURIComponent(taskId)}/actions`, {
-    method: "POST",
-    body: JSON.stringify({ authorityId, action }),
-  });
+  action: "cancel" | "continue" | "stop",
+): Promise<{ desktopBrowserActivity?: DesktopBrowserActivity; reason?: string; newSubmission?: string }> {
+  try {
+    return await api(`/api/desktop-browser/tasks/${encodeURIComponent(taskId)}/actions`, {
+      method: "POST",
+      body: JSON.stringify({ authorityId, action }),
+    });
+  } catch (error) {
+    if (error instanceof ApiError) {
+      const body = error.body as { message?: unknown; newSubmission?: unknown };
+      if (typeof body.newSubmission === "string") {
+        return {
+          reason: typeof body.message === "string" ? body.message : error.message,
+          newSubmission: body.newSubmission,
+        };
+      }
+    }
+    throw error;
+  }
 }
 
 export async function confirmDesktopBrowserRegistration(

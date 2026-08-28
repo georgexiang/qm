@@ -93,6 +93,7 @@ export interface OrchestratorInput extends Omit<
   queueMs?: number;
   sessionParticipantIds?: readonly string[];
   scopeVersion?: string;
+  desktopBrowserTaskId?: string;
 }
 
 export interface OrchestratorDeps {

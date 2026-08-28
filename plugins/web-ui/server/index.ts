@@ -1630,11 +1630,11 @@ const apiRoutes: readonly WebRoute[] = [
       const { req, res, user } = c;
       const id = c.params.id!;
       if (!id || id.includes("/")) return json(res, 404, { error: "not_found" });
-      let action: "cancel" | "stop" | undefined;
+      let action: "cancel" | "continue" | "stop" | undefined;
       let authorityId = "";
       try {
         const body = JSON.parse(await readBody(req)) as { action?: unknown; authorityId?: unknown };
-        if (body.action === "cancel" || body.action === "stop") action = body.action;
+        if (body.action === "cancel" || body.action === "continue" || body.action === "stop") action = body.action;
         if (typeof body.authorityId === "string") authorityId = body.authorityId;
       } catch (error) {
         if (error instanceof PayloadTooLargeError) throw error;

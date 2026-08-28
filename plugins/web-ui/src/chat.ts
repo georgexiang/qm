@@ -2043,13 +2043,18 @@ export function createChatSurface(
       work.activity = [...work.activity];
       ctx.chat.redraw();
     };
-    const taskAction = async (action: "cancel" | "stop"): Promise<void> => {
+    const taskAction = async (action: "cancel" | "continue" | "stop"): Promise<void> => {
       const before = task.actions;
       activity.payload = { ...task, actions: [] };
       work.activity = [...work.activity];
       ctx.chat.redraw();
       try {
         const result = await runDesktopBrowserTaskAction(task.taskId, task.actionAuthority, action);
+        if (result.newSubmission) {
+          ctx.composer.state.draft = result.newSubmission;
+          saveDraft(chatState.threadRef ?? "", result.newSubmission);
+          ctx.composer.focusComposerEnd();
+        }
         activity.payload = result.desktopBrowserActivity ?? {
           ...task,
           actions: before,
@@ -2065,10 +2070,17 @@ export function createChatSurface(
       work.activity = [...work.activity];
       ctx.chat.redraw();
     };
-    let statusLabel = "Canceled";
-    if (task.status === "waiting_for_broker") statusLabel = "Waiting for Host Broker";
-    else if (task.status === "waiting_for_local_confirmation") statusLabel = "Waiting for local confirmation";
-    else if (task.status === "registration_confirmed") statusLabel = "Registration confirmed";
+    const statusLabels: Record<DesktopBrowserActivity["status"], string> = {
+      waiting_for_broker: "Waiting for Host Broker",
+      waiting_for_local_confirmation: "Waiting for local confirmation",
+      registration_confirmed: "Registration confirmed",
+      running: "Running",
+      completed: "Completed",
+      failed: "Failed",
+      canceled: "Canceled",
+      canceled_with_unknown_effects: "Canceled with unknown effects",
+    };
+    const statusLabel = statusLabels[task.status];
     let statusClass = "ready";
     if (waiting) statusClass = "waiting";
     else if (task.status === "canceled") statusClass = "canceled";
@@ -2079,7 +2091,7 @@ export function createChatSurface(
         <span class="desktop-browser-task-status ${statusClass}">${statusLabel}</span>
       </div>
       ${
-        task.status !== "canceled"
+        task.connectCommand
           ? html`<div class="desktop-browser-command">
               <code>${task.connectCommand}</code>
               <button
@@ -2111,14 +2123,15 @@ export function createChatSurface(
       ${
         task.status !== "canceled"
           ? html`<div class="desktop-browser-task-actions">
-              <button
-                type="button"
-                class="desktop-browser-continue"
-                title="Continue stays disabled until Ticket09 implements resume"
-                disabled
-              >
-                ${icon(Play, 14)}<span>Continue</span>
-              </button>
+              ${task.actions.includes("continue")
+                ? html`<button
+                    type="button"
+                    class="desktop-browser-continue"
+                    @click=${() => void taskAction("continue")}
+                  >
+                    ${icon(Play, 14)}<span>Continue</span>
+                  </button>`
+                : nothing}
               ${
                 task.actions.includes("confirm")
                   ? html`<button

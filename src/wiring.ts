@@ -760,6 +760,18 @@ export function buildApp(
     ? createDesktopBrowserOperationCoordinator({
         tasks: desktopBrowserTasks,
         auditLog,
+          claimDevice: (taskId) => desktopBrowserDeviceRegistry.claimDevice(taskId),
+          quarantineDevice: (taskId) => desktopBrowserDeviceRegistry.quarantineDevice!(taskId),
+        releaseDevice: (taskId) => desktopBrowserDeviceRegistry.releaseDevice(taskId),
+          consumeSessionStartResult: async (taskId, result) => {
+            const task = await desktopBrowserTasks.get(taskId);
+            if (!task?.execution) return { status: "refused", reason: "Desktop Browser Task has no prepared session start" };
+            return desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+              taskId,
+              task.execution.operation,
+              (currentAuthority) => desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority),
+            );
+          },
         dispatcher: desktopBrowserRelayControl,
       })
     : undefined;
@@ -1199,6 +1211,9 @@ export function buildApp(
     signals: runSignals,
     tasks,
     desktopBrowserTasks,
+    ...(desktopBrowserOperations
+      ? { desktopBrowserStart: (taskId: string) => desktopBrowserOperations.startForTask(taskId) }
+      : {}),
     ...(desktopBrowserRelayControl
       ? {
           desktopBrowserRevoke: (input: {

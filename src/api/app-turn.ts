@@ -8,7 +8,7 @@ import type { OrchestratorInput } from "../core/orchestrator.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
 import { isTerminal, leaseLapsed } from "../runs/run-store.ts";
 import { turnModelOptions, validateWebTurnModelOptions, webTurnRuntimeModelRefusal } from "../core/turn-options.ts";
-import { isProjectGroupRef, projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
+import { isProjectGroupRef, projectGroupRef, projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
 import {
   defaultModelForHarness,
   isHarnessId,
@@ -635,6 +635,93 @@ export function createTurnMethods(
       if (!task || (!taskActor && !administrator)) {
         return { status: "refused", reason: "Desktop Browser Task not found" };
       }
+      if (action === "continue") {
+        if (!taskActor) return { status: "refused", reason: "Desktop Browser Task not found" };
+        const continued = await deps.projects?.withRosterLock(task.projectId, async (project) => {
+          await deps.identity.refresh();
+          const currentTask = await deps.desktopBrowserTasks.get(task.id);
+          const currentActor = deps.identity.classify(actor.id);
+          const currentMembers = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+          if (
+            !currentTask ||
+            currentTask.status !== "waiting_for_broker" ||
+            project.orgId !== orgIdOf() ||
+            String(project.updatedAt) !== currentTask.projectMembershipVersion ||
+            !deps.identity.isInternal(currentActor) ||
+            !currentMembers.has(currentActor.id)
+          ) {
+            return { status: "refused", reason: "Desktop Browser Task authorization is no longer current" } as const;
+          }
+          if (currentTask.continuationRunId) {
+            return { status: "ok", runId: currentTask.continuationRunId } as const;
+          }
+          if (currentTask.authorityExpiresAt <= Date.now()) {
+            const newSubmission = `/desktop-browser ${currentTask.goal}`;
+            return {
+              status: "refused",
+              reason: `Desktop Browser Turn authority expired; submit a new Turn with: ${newSubmission}`,
+              newSubmission,
+            } as const;
+          }
+          const registration = await deps.desktopBrowserDeviceRegistry.taskRegistration(currentTask.id);
+          if (registration?.status !== "confirmed") {
+            return { status: "refused", reason: "Desktop Browser Device is not ready" } as const;
+          }
+          if (currentTask.execution) {
+            return { status: "refused", reason: "Desktop Browser Task is not ready to Continue" } as const;
+          }
+          if (!deps.desktopBrowserStart) {
+            return { status: "refused", reason: "Desktop Browser Relay is unavailable" } as const;
+          }
+          const session = await deps.sessions.get(currentTask.sessionId);
+          if (!session || session.threadRef !== currentTask.threadRef) {
+            return { status: "refused", reason: "Desktop Browser Task session is unavailable" } as const;
+          }
+          const participants = await deps.sessions.participantsOf(session.id);
+          const request: OrchestratorInput = {
+            surface: session.surface ?? "web",
+            authorityId: currentTask.authorityId,
+            authorityExpiresAt: currentTask.authorityExpiresAt,
+            actor: currentActor,
+            conversation: {
+              kind: session.type,
+              threadRef: session.threadRef,
+              channelRef: projectGroupRef(currentTask.projectId),
+              ...(session.channelName ? { channelName: session.channelName } : {}),
+              audience: participants.map((id) => deps.identity.classify(id)),
+            },
+            origin: { kind: "human" },
+            text: currentTask.goal,
+            displayText: currentTask.goal,
+            scopeVersion: currentTask.projectMembershipVersion,
+            desktopBrowserTaskId: currentTask.id,
+            sessionParticipantIds: participants,
+            surfaceTools: true,
+          };
+          const { run } = await deps.runs.enqueue({
+            sessionId: currentTask.threadRef,
+            request,
+            dedupKey: `desktop-browser-continue:${currentTask.id}`,
+            maxAttempts: deps.maxAttempts,
+          });
+          await deps.desktopBrowserTasks.markContinuationRun(currentTask.id, run.id);
+          return { status: "ok", runId: run.id } as const;
+        });
+        if (!continued || continued.status === "refused") {
+          return continued ?? { status: "refused", reason: "Desktop Browser Task authorization is no longer current" };
+        }
+        const result = await drive(continued.runId);
+        const latestTask = await deps.desktopBrowserTasks.get(task.id);
+        if (!latestTask) return result;
+        return {
+          ...result,
+          desktopBrowserActivity: projectDesktopBrowserTaskActivity(
+            latestTask,
+            deps.publicWebUrl,
+            await deps.desktopBrowserDeviceRegistry.taskRegistration(latestTask.id),
+          ),
+        };
+      }
       if (action === "stop") {
         const stopped = await deps.projects?.withRosterLock(task.projectId, async (project) => {
           await deps.identity.refresh();
@@ -663,6 +750,7 @@ export function createTurnMethods(
         }
         try {
           await deliverDesktopBrowserStop(deps.desktopBrowserTasks, deps.auditLog, deps.desktopBrowserRevoke, stopped.task);
+          await deps.desktopBrowserDeviceRegistry?.quarantineDevice?.(stopped.task.id);
         } catch {
           return { status: "refused", reason: "Desktop Browser Stop recorded; Relay delivery not confirmed" };
         }
@@ -826,8 +914,30 @@ export function createTurnMethods(
     },
 
     async desktopBrowserPublishRelayConnection(projection) {
-      await deps.desktopBrowserDeviceRegistry.publishRelayConnection(
+      const taskIds = await deps.desktopBrowserDeviceRegistry.publishRelayConnection(
         projection as DesktopBrowserRelayConnectionProjection,
+      );
+      await Promise.all(
+        taskIds.map(async (taskId) => {
+          const task = await deps.desktopBrowserTasks.get(taskId);
+          if (!task || task.status !== "waiting_for_broker" || task.continuationRunId) return;
+          const leaseAttempt = await deps.sessions.acquireLease(task.sessionId, "turn");
+          if (!leaseAttempt.lease) return;
+          try {
+            const activity = projectDesktopBrowserTaskActivity(
+              task,
+              deps.publicWebUrl,
+              await deps.desktopBrowserDeviceRegistry.taskRegistration(task.id),
+            );
+            await deps.sessions.append(leaseAttempt.lease, {
+              type: "assistant",
+              payload: { text: projectDesktopBrowserActivityReply(activity), desktopBrowserActivity: activity },
+              scopeLabel: projectScopeId(task.projectId),
+            });
+          } finally {
+            await deps.sessions.releaseLease(leaseAttempt.lease);
+          }
+        }),
       );
     },
 
@@ -908,10 +1018,25 @@ export function createTurnMethods(
         ? await deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted)
         : await deps.desktopBrowserTasks.consumeOperationAccepted(taskId, accepted);
       if (acceptedResult.status === "refused") return acceptedResult;
-      const terminalResult = sessionStart
-        ? await deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result)
-        : await deps.desktopBrowserTasks.consumeOperationResult(taskId, result);
+      let terminalResult;
+      try {
+        terminalResult = sessionStart
+          ? await deps.desktopBrowserDeviceRegistry.withValidatedSessionStartAuthority(
+              taskId,
+              task.execution!.operation,
+              (currentAuthority) =>
+                deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result, currentAuthority),
+            )
+          : await deps.desktopBrowserTasks.consumeOperationResult(taskId, result);
+      } catch (error) {
+        if (sessionStart) await deps.desktopBrowserDeviceRegistry.quarantineDevice?.(taskId);
+        throw error;
+      }
       if (terminalResult.status === "refused") return terminalResult;
+      if (sessionStart && !terminalResult.task.browserSkillSessionId) {
+        if (result.payload.outcome === "failed") await deps.desktopBrowserDeviceRegistry.releaseDevice(taskId);
+        else await deps.desktopBrowserDeviceRegistry.quarantineDevice?.(taskId);
+      }
       return { status: "ok" };
     },
 
@@ -925,9 +1050,17 @@ export function createTurnMethods(
         taskId,
         authorityId,
         async () => {
+          const currentTask = await deps.desktopBrowserTasks.get(taskId);
+          if (!currentTask || currentTask.browserSkillSessionStoppedAt === undefined) {
+            return {
+              status: "refused",
+              reason: "Desktop Browser Task session cleanup is required before finalization",
+            } as const;
+          }
           const finalized = await deps.desktopBrowserTasks.finalize(taskId, input);
           if (finalized.status === "ok") {
             await persistDesktopBrowserFinalizationAudit(deps.desktopBrowserTasks, deps.auditLog, finalized.task);
+            await deps.desktopBrowserDeviceRegistry?.releaseDevice(taskId);
           }
           return finalized;
         },

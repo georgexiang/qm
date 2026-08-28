@@ -35,6 +35,7 @@ export interface DesktopBrowserRelayDispatcher {
 }
 
 export interface DesktopBrowserOperationCoordinator {
+  startForTask(taskId: string): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   invokeForSession(input: {
     sessionId: string;
     actorId: string;
@@ -73,7 +74,7 @@ function scopedTask(
       task.actorId === input.actorId &&
       projectScopeId(task.projectId) === input.projectScopeLabel &&
       task.projectMembershipVersion === input.projectMembershipVersion &&
-      task.status !== "canceled" &&
+      task.status === "waiting_for_broker" &&
       task.browserSkillSessionId !== undefined,
   );
   return matches.length === 1 ? matches[0]! : null;
@@ -107,10 +108,97 @@ export function createDesktopBrowserOperationCoordinator(options: {
   tasks: DesktopBrowserTaskStore;
   dispatcher: DesktopBrowserRelayDispatcher;
   auditLog?: AuditLog;
+  claimDevice?: (taskId: string) => Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
+  quarantineDevice?: (taskId: string) => Promise<void>;
+  releaseDevice?: (taskId: string) => Promise<void>;
+  consumeSessionStartResult?: (
+    taskId: string,
+    result: HostResultMessage,
+  ) => ReturnType<DesktopBrowserTaskStore["consumeSessionStartResult"]>;
   createDispatchId?: () => string;
 }): DesktopBrowserOperationCoordinator {
   const createDispatchId = options.createDispatchId ?? randomUUID;
   return {
+    async startForTask(taskId) {
+      const existing = await options.tasks.get(taskId);
+      if (!existing || existing.status !== "waiting_for_broker" || existing.stopIntent) {
+        return { status: "refused", reason: "Desktop Browser Task is no longer waiting" };
+      }
+      if (existing?.browserSkillSessionId && existing.browserSkillSessionStoppedAt === undefined) {
+        return { status: "ok" };
+      }
+      const claimed = await options.claimDevice?.(taskId);
+      if (claimed?.status === "refused") return claimed;
+      let prepared: Awaited<ReturnType<DesktopBrowserTaskStore["prepareSessionStart"]>>;
+      try {
+        prepared = await options.tasks.prepareSessionStart(taskId);
+      } catch (error) {
+        await options.quarantineDevice?.(taskId);
+        throw error;
+      }
+      if (prepared.status === "refused") {
+        await options.releaseDevice?.(taskId);
+        return prepared;
+      }
+      const invocation: RelayInvocationMessage = {
+        protocolVersion: prepared.operation.authority.capabilitySet.protocolVersion,
+        kind: "relay.invoke",
+        payload: {
+          dispatchId: createDispatchId(),
+          requestHash: prepared.operation.requestHash,
+          authority: prepared.operation.authority,
+        },
+      };
+      let dispatched: DesktopBrowserRelayDispatchResult;
+      try {
+        dispatched = await options.dispatcher.dispatch({
+          publicDeviceFingerprint: prepared.operation.authority.deviceId,
+          browserInstanceId: prepared.operation.authority.browserInstanceId,
+          invocation,
+        });
+      } catch (error) {
+        await options.quarantineDevice?.(taskId);
+        throw error;
+      }
+      if (dispatched.kind === "not_accepted_or_unknown") {
+        await options.quarantineDevice?.(taskId);
+        return { status: "refused", reason: "Desktop Browser Relay could not prove Host acceptance" };
+      }
+      let accepted: Awaited<ReturnType<DesktopBrowserTaskStore["consumeSessionStartAccepted"]>>;
+      try {
+        accepted = await options.tasks.consumeSessionStartAccepted(taskId, dispatched.accepted);
+      } catch (error) {
+        await options.quarantineDevice?.(taskId);
+        throw error;
+      }
+      if (accepted.status === "refused") {
+        await options.quarantineDevice?.(taskId);
+        return accepted;
+      }
+      const result =
+        dispatched.kind === "host.result"
+          ? dispatched.result
+          : (dispatched.result ?? unknownResult(dispatched.accepted, dispatched.error));
+      let consumed: Awaited<ReturnType<DesktopBrowserTaskStore["consumeSessionStartResult"]>>;
+      try {
+        consumed = options.consumeSessionStartResult
+          ? await options.consumeSessionStartResult(taskId, result)
+          : await options.tasks.consumeSessionStartResult(taskId, result);
+      } catch (error) {
+        await options.quarantineDevice?.(taskId);
+        throw error;
+      }
+      if (consumed.status === "refused") {
+        await options.quarantineDevice?.(taskId);
+        return consumed;
+      }
+      if (!consumed.task.browserSkillSessionId) {
+        if (result.payload.outcome === "failed") await options.releaseDevice?.(taskId);
+        else await options.quarantineDevice?.(taskId);
+        return { status: "refused", reason: "Desktop Browser Host did not establish a usable session" };
+      }
+      return { status: "ok" };
+    },
     async invokeForSession(input) {
       const task = activeTask(await options.tasks.listForSession(input.sessionId), input);
       if (!task) return { status: "refused", reason: "No active Desktop Browser Task belongs to this Agent session" };
@@ -160,9 +248,15 @@ export function createDesktopBrowserOperationCoordinator(options: {
       if (!options.auditLog) return { status: "refused", reason: "Desktop Browser finalization audit is unavailable" };
       const task = scopedTask(await options.tasks.listForSession(input.sessionId), input);
       if (!task) return { status: "refused", reason: "No active Desktop Browser Task belongs to this Agent session" };
+      if (task.browserSkillSessionStoppedAt === undefined) {
+        return { status: "refused", reason: "Desktop Browser Task session cleanup is required before finalization" };
+      }
       const finalized = await options.tasks.finalize(task.id, { outcome: input.outcome, summary: input.summary });
       if (finalized.status === "refused") return finalized;
       await persistDesktopBrowserFinalizationAudit(options.tasks, options.auditLog, finalized.task);
+      if (finalized.task.browserSkillSessionStoppedAt !== undefined) {
+        await options.releaseDevice?.(finalized.task.id);
+      }
       return { status: "ok", taskId: task.id };
     },
   };

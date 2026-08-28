@@ -253,7 +253,7 @@ export interface App {
     taskId: string,
     principalId: string,
     authorityId: string,
-    action: "cancel" | "stop",
+    action: "cancel" | "continue" | "stop",
   ): Promise<TurnResult>;
   desktopBrowserReserveRegistration(
     taskId: string,
@@ -616,6 +616,9 @@ export interface AppDeps {
   signals?: RunSignalStore;
   tasks?: TaskStore;
   desktopBrowserTasks: DesktopBrowserTaskStore;
+  desktopBrowserStart?: (
+    taskId: string,
+  ) => Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   desktopBrowserRevoke?: (input: {
     publicDeviceFingerprint: string;
     browserInstanceId: string;

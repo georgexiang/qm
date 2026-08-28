@@ -523,6 +523,154 @@ test("Ticket 06 coordinator returns observation to the current Task-scoped Agent
   assert.deepEqual(ids, []);
 });
 
+test("Ticket 09 coordinator starts and binds the Task-owned BrowserSkill session", async () => {
+  const task = readyTask("task-continue-start", "old-start");
+  const previousAuthority = task.execution!.operation.authority;
+  task.execution = undefined;
+  task.browserSkillSessionId = undefined;
+  task.browserInstanceId = undefined;
+  task.agentWindowId = undefined;
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const ids = ["attempt-continue", "lease-continue", "operation-continue", "nonce-continue"];
+  const store = createDesktopBrowserTaskStore(backing, {
+    id: () => ids.shift()!,
+    now: () => Date.parse("2036-08-27T12:00:10.000Z"),
+    sessionStartAuthority: async () => ({
+      registration: {
+        deploymentCanonicalId: previousAuthority.deploymentCanonicalId,
+        registrationId: "registration-continue",
+        waitingTaskId: task.id,
+        actorId: task.actorId,
+        projectId: task.projectId,
+        membershipEpoch: 42,
+        authorityId: task.authorityId,
+        authorityExpiresAt: task.authorityExpiresAt,
+        publicDeviceFingerprint: previousAuthority.deviceId,
+        browserInstanceId: previousAuthority.browserInstanceId,
+        status: "online",
+        browserRuntimeStatus: "ready",
+      },
+      relayConnection: {
+        connectionId: "connection-continue",
+        publicDeviceFingerprint: previousAuthority.deviceId,
+        brokerInstanceId: "broker-continue",
+        browserInstanceId: previousAuthority.browserInstanceId,
+        connectionEpoch: 8,
+        registrationState: "registered",
+        protocolVersion: previousAuthority.capabilitySet.protocolVersion,
+        policyGrammarVersion: previousAuthority.capabilitySet.policyGrammarVersion,
+        brokerVersion: "2.0.0",
+        bskVersion: previousAuthority.capabilitySet.bskVersion,
+        extensionVersion: previousAuthority.capabilitySet.extensionVersion,
+        cliShapeHash: previousAuthority.capabilitySet.cliShapeHash,
+        lastSeenAt: "2036-08-27T12:00:09.000Z",
+      },
+    }),
+  });
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    createDispatchId: () => "dispatch-continue-start",
+    dispatcher: {
+      async dispatch(input) {
+        const operation = input.invocation.payload;
+        return {
+          kind: "host.result" as const,
+          accepted: acceptedFor(operation, operation.dispatchId),
+          result: {
+            protocolVersion: operation.authority.capabilitySet.protocolVersion,
+            kind: "host.result" as const,
+            payload: {
+              dispatchId: operation.dispatchId,
+              operationId: operation.authority.operationId,
+              outcome: "completed" as const,
+              resultHash: "sha256:continue-start",
+              result: {
+                session_id: "browser-session-continue",
+                browser_instance_id: "browser-primary",
+                agent_window_id: 77,
+              },
+            },
+          },
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(await coordinator.startForTask(task.id), { status: "ok" });
+  const started = await store.get(task.id);
+  assert.equal(started?.execution?.attemptId, "attempt-continue");
+  assert.equal(started?.browserSkillSessionId, "browser-session-continue");
+  assert.equal(started?.agentWindowId, 77);
+});
+
+test("Ticket 09 coordinator refuses device_busy before creating an Attempt", async () => {
+  const task = readyTask("task-device-busy", "old-device-busy");
+  task.execution = undefined;
+  task.browserSkillSessionId = undefined;
+  task.browserInstanceId = undefined;
+  task.agentWindowId = undefined;
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing);
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    claimDevice: async () => ({ status: "refused", reason: "device_busy" }),
+    dispatcher: { dispatch: async () => assert.fail("busy Device must not dispatch") },
+  });
+
+  assert.deepEqual(await coordinator.startForTask(task.id), { status: "refused", reason: "device_busy" });
+  assert.equal((await store.get(task.id))?.execution, undefined);
+});
+
+test("Ticket 09 an enqueued Continue cannot start after Stop wins", async () => {
+  const task = readyTask("task-stopped-before-continue", "old-stopped-before-continue");
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 15_000 });
+  await store.requestStop(task.id, { requestedBy: task.actorId, reason: "webui" });
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    claimDevice: async () => assert.fail("stopped Task must not claim a Device"),
+    dispatcher: { dispatch: async () => assert.fail("stopped Task must not dispatch") },
+  });
+
+  assert.deepEqual(await coordinator.startForTask(task.id), {
+    status: "refused",
+    reason: "Desktop Browser Task is no longer waiting",
+  });
+});
+
+test("Ticket 09 finalization releases the Device only after session cleanup", async () => {
+  const task = readyTask("task-release-device", "start-release-device");
+  task.browserSkillSessionStoppedAt = 12_000;
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 13_000 });
+  const released: string[] = [];
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    dispatcher: { dispatch: async () => assert.fail("finalize must not dispatch") },
+    auditLog: { recordOnce: async () => undefined } as any,
+    releaseDevice: async (taskId) => {
+      released.push(taskId);
+    },
+  });
+
+  assert.deepEqual(
+    await coordinator.finalizeForSession({
+      sessionId: task.sessionId,
+      actorId: task.actorId,
+      projectScopeLabel: "group:web-project-project-1",
+      projectMembershipVersion: task.projectMembershipVersion,
+      outcome: "completed",
+      summary: "Original goal completed",
+    }),
+    { status: "ok", taskId: task.id },
+  );
+  assert.deepEqual(released, [task.id]);
+});
+
 test("Ticket 06 coordinator never redispatches navigate after ambiguous Relay delivery", async () => {
   const backing = createMemoryMap<DesktopBrowserTask>();
   await backing.put("task-ambiguous", readyTask("task-ambiguous", "start-ambiguous"));
@@ -866,4 +1014,93 @@ test("Ticket 08 project administrator Stop is acknowledged only after Relay revo
   assert.equal(stopped?.stopIntent?.reason, "admin");
   assert.equal(stopped?.stopIntent?.auditStatus, "pending");
   assert.equal(stopped?.stopIntent?.revocationStatus, "delivered");
+});
+
+test("Ticket 09 Continue creates one Run from the immutable original goal", async () => {
+  const task = readyTask("task-continue", "start-continue");
+  task.execution = undefined;
+  task.browserSkillSessionId = undefined;
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing);
+  const enqueued: Array<Record<string, unknown>> = [];
+  const started: string[] = [];
+  const app = createTurnMethods(
+    {
+      identity: {
+        refresh: async () => undefined,
+        classify: (id: string) => ({ id, type: "internal" }),
+        isInternal: () => true,
+      },
+      projects: {
+        withRosterLock: async (_projectId: string, fn: (project: unknown) => Promise<unknown>) =>
+          fn({
+            id: "project-1",
+            orgId: "default-org",
+            ownerId: "actor-1",
+            memberIds: [],
+            channelMemberIds: [],
+            updatedAt: 42,
+          }),
+      },
+      desktopBrowserTasks: store,
+      desktopBrowserDeviceRegistry: {
+        taskRegistration: async () => ({
+          registrationId: "registration-continue",
+          confirmationFingerprint: "4f8c52de91a3b10c",
+          expiresAt: "2036-08-27T13:00:00.000Z",
+          status: "confirmed",
+        }),
+        claimDevice: async () => ({ status: "ok" }),
+        releaseDevice: async () => undefined,
+      },
+      desktopBrowserStart: async (taskId: string) => {
+        started.push(taskId);
+        return { status: "ok" };
+      },
+      sessions: {
+        get: async () => ({
+          id: task.sessionId,
+          type: "group",
+          scopeId: "group:web-project-project-1",
+          threadRef: task.threadRef,
+          surface: "web",
+          createdAt: 1,
+        }),
+        participantsOf: async () => ["actor-1"],
+      },
+      runs: {
+        async enqueue(input: Record<string, unknown>) {
+          enqueued.push(input);
+          return { run: { id: "run-continue" }, deduped: false };
+        },
+      },
+      maxAttempts: 3,
+      admin: { canAdminister: async () => false },
+    } as any,
+    { drive: async (runId: string) => ({ status: "queued", runId }) } as any,
+    {} as any,
+  );
+
+  const continued = await app.desktopBrowserTaskAction(task.id, "actor-1", task.authorityId, "continue");
+  assert.equal(continued.status, "queued");
+  assert.equal(continued.runId, "run-continue");
+  assert.equal(continued.desktopBrowserActivity?.taskId, task.id);
+  assert.equal(enqueued.length, 1);
+  assert.deepEqual(started, []);
+  const enqueuedRequest = enqueued[0]!;
+  assert.equal(enqueuedRequest.dedupKey, `desktop-browser-continue:${task.id}`);
+  assert.equal((enqueuedRequest.request as { desktopBrowserTaskId?: string }).desktopBrowserTaskId, task.id);
+  assert.equal((enqueuedRequest.request as { text?: string }).text, task.goal);
+  assert.equal((enqueuedRequest.request as { displayText?: string }).displayText, task.goal);
+  assert.deepEqual((enqueuedRequest.request as { sessionParticipantIds?: string[] }).sessionParticipantIds, ["actor-1"]);
+  assert.equal((await store.get(task.id))?.continuationRunId, "run-continue");
+
+  await backing.put(task.id, { ...task, authorityExpiresAt: 1 });
+  assert.deepEqual(await app.desktopBrowserTaskAction(task.id, "actor-1", task.authorityId, "continue"), {
+    status: "refused",
+    reason: `Desktop Browser Turn authority expired; submit a new Turn with: /desktop-browser ${task.goal}`,
+    newSubmission: `/desktop-browser ${task.goal}`,
+  });
+  assert.equal(enqueued.length, 1);
 });

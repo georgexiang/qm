@@ -493,4 +493,5 @@ export interface TurnResult {
   sourceUserSeq?: number;
   sourceAssistantEntrySeq?: number;
   desktopBrowserActivity?: DesktopBrowserActivityProjection;
+  newSubmission?: string;
 }
