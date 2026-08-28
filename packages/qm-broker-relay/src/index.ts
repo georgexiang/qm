@@ -17,6 +17,7 @@ import {
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 import type { WebSocket, WebSocketServer } from "ws";
+import { type DesktopBrowserRelayOperationStore } from "./operation-store.ts";
 
 type RelayConnectionStage = "awaiting_hello" | "awaiting_challenge_response" | "pending" | "registered" | "closing";
 
@@ -73,6 +74,7 @@ export type RelayDispatchResult =
   | {
       kind: "accepted_unknown";
       accepted: HostAcceptedMessage;
+      result?: HostResultMessage;
       error: DesktopBrowserHostFailure;
     };
 
@@ -93,6 +95,7 @@ export interface DesktopBrowserRelayServiceOptions {
   settledDispatchHistoryTtlMs?: number;
   createNonce?: () => string;
   createConnectionId?: () => string;
+  operationStore?: DesktopBrowserRelayOperationStore;
 }
 
 interface RelayConnectionState {
@@ -248,6 +251,7 @@ export class DesktopBrowserRelayService {
   private readonly settledDispatchOrder: string[] = [];
   private readonly dispatchTombstonesById = new Map<string, RelayDispatchTombstone>();
   private readonly dispatchTombstoneOrder: string[] = [];
+  private readonly operationStore: DesktopBrowserRelayOperationStore | null;
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -269,6 +273,7 @@ export class DesktopBrowserRelayService {
       createNonce: options.createNonce ?? (() => randomUUID()),
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
     };
+    this.operationStore = options.operationStore ?? null;
     if (this.options.supportedProtocolVersions.length === 0) {
       throw new Error("at least one supported protocol version is required");
     }
@@ -454,6 +459,22 @@ export class DesktopBrowserRelayService {
     ) {
       throw new Error("desktop browser invocation capability set does not match the registered host");
     }
+    if (this.operationStore) {
+      const prepared = await this.operationStore.prepare(decoded);
+      if (prepared.status === "existing" && prepared.checkpoint.deliveryState === "started") {
+        return {
+          kind: "not_accepted_or_unknown",
+          dispatchId: decoded.payload.dispatchId,
+          operationId: authority.operationId,
+          requestHash: canonicalRequestHash,
+          error: this.relayDeliveryUnknown(
+            prepared.checkpoint.state === "accepted"
+              ? "Host acceptance is durable but the terminal result is unavailable"
+              : "Prior wire delivery may have reached the Host and cannot be repeated",
+          ),
+        };
+      }
+    }
     this.pruneDispatchTracking(this.options.clock.now());
     this.assertOperationRequestHash(authority.operationId, canonicalRequestHash);
     this.assertDispatchIdAvailable(decoded.payload.dispatchId);
@@ -481,7 +502,47 @@ export class DesktopBrowserRelayService {
         resolve,
       };
       try {
-        connection.socket.send(encodeDesktopBrowserMessage(decoded));
+        if (!this.operationStore) {
+          connection.socket.send(encodeDesktopBrowserMessage(decoded));
+          return;
+        }
+        void this.operationStore
+          .markDeliveryStarted(authority.attemptId, decoded.payload.dispatchId)
+          .then(
+            async () => {
+              if (
+                !this.connections.has(connection.connectionId) ||
+                connection.stage === "closing" ||
+                connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId
+              ) {
+                await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
+                return;
+              }
+              try {
+                connection.socket.send(encodeDesktopBrowserMessage(decoded));
+              } catch (error) {
+                await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
+                this.options.clock.clearTimeout(timeout);
+                connection.pendingDispatch = null;
+                this.dropDispatchTracking(decoded.payload.dispatchId);
+                reject(error instanceof Error ? error : new Error(String(error)));
+              }
+            },
+            (error) => {
+              this.options.clock.clearTimeout(timeout);
+              connection.pendingDispatch = null;
+              this.dropDispatchTracking(decoded.payload.dispatchId);
+              reject(error instanceof Error ? error : new Error(String(error)));
+            },
+          )
+          .catch((error) => {
+            if (connection.pendingDispatch?.dispatchId === decoded.payload.dispatchId) {
+              this.options.clock.clearTimeout(timeout);
+              connection.pendingDispatch = null;
+              this.dropDispatchTracking(decoded.payload.dispatchId);
+              reject(error instanceof Error ? error : new Error(String(error)));
+            }
+          });
       } catch (error) {
         this.options.clock.clearTimeout(timeout);
         connection.pendingDispatch = null;
@@ -787,6 +848,7 @@ export class DesktopBrowserRelayService {
       }
       const history = this.dispatchHistoryById.get(pending.dispatchId);
       if (history) history.state = "accepted";
+      if (this.operationStore) await this.operationStore.recordAccepted(message);
       pending.accepted = message;
       return;
     }
@@ -794,18 +856,46 @@ export class DesktopBrowserRelayService {
       const pending = connection.pendingDispatch;
       if (!pending) throw new Error("unexpected host.result without an in-flight invocation");
       if (message.payload.dispatchId !== pending.dispatchId) {
-        if (this.isKnownStaleSequentialResult(pending, message)) return;
+        if (this.operationStore) {
+          try {
+            await this.operationStore.recordTerminal(message);
+            return;
+          } catch {
+            throw new Error("host.result dispatch does not match a durable Relay operation");
+          }
+        }
+        if (this.isKnownStaleSequentialResult(pending, message)) {
+          return;
+        }
         if (!pending.accepted) {
           throw new Error("host.result arrived before host.accepted");
         }
         throw new Error("host.result dispatch does not match the accepted invocation");
       }
       if (!pending.accepted) {
-        throw new Error("host.result arrived before host.accepted");
+        if (!this.operationStore) {
+          throw new Error("host.result arrived before host.accepted");
+        }
+        if (message.payload.operationId !== pending.operationId) {
+          throw new Error("host.result operation does not match the in-flight invocation");
+        }
+        pending.accepted = {
+          protocolVersion: message.protocolVersion,
+          kind: "host.accepted",
+          payload: {
+            dispatchId: pending.dispatchId,
+            operationId: pending.operationId,
+            requestHash: pending.requestHash,
+          },
+        };
+        await this.operationStore.recordAccepted(pending.accepted);
+        const history = this.dispatchHistoryById.get(pending.dispatchId);
+        if (history) history.state = "accepted";
       }
       if (message.payload.operationId !== pending.accepted.payload.operationId) {
         throw new Error("host.result operation does not match the accepted invocation");
       }
+      if (this.operationStore) await this.operationStore.recordTerminal(message);
       connection.pendingDispatch = null;
       this.options.clock.clearTimeout(pending.timeout);
       this.settleDispatch(pending.dispatchId, "terminal");
@@ -1015,11 +1105,20 @@ export class DesktopBrowserRelayService {
             ? "desktop browser host connection closed after host.accepted before host.result"
             : "desktop browser host connection closed before host.accepted"),
       );
+      let acceptedUnknownResult: HostResultMessage | undefined;
+      if (pending.accepted && this.operationStore) {
+        try {
+          acceptedUnknownResult = await this.operationStore.recordAcceptedUnknown(pending.accepted);
+        } catch {
+          console.error(`[qm-broker-relay] failed to persist accepted-unknown operationId=${pending.operationId}`);
+        }
+      }
       pending.resolve(
         pending.accepted
           ? {
               kind: "accepted_unknown",
               accepted: pending.accepted,
+              ...(acceptedUnknownResult ? { result: acceptedUnknownResult } : {}),
               error,
             }
           : {

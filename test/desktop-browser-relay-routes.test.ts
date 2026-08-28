@@ -12,7 +12,11 @@ import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
 import { projectGroupRef } from "../src/projects/project-store.ts";
 import { testConfig } from "./support/test-config.ts";
-import { desktopBrowserRelayConnectionProjectionFixture } from "qm-desktop-browser-contracts/fixtures";
+import {
+  desktopBrowserRelayConnectionProjectionFixture,
+  desktopBrowserSessionStartAcceptedFixture,
+  desktopBrowserSessionStartCompletedResultFixture,
+} from "qm-desktop-browser-contracts/fixtures";
 
 const SECRET = "desktop-browser-relay-route-secret".repeat(2);
 
@@ -135,6 +139,38 @@ test("relay registry routes resolve pending bindings and accept low-sensitivity 
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await built.runtime.stop();
+  }
+});
+
+test("relay terminal callback route authenticates and consumes acceptance before result", async () => {
+  const calls: string[] = [];
+  const app = {
+    async desktopBrowserConsumeRelayTerminalCallback(taskId: string, accepted: unknown, result: unknown) {
+      calls.push(`accepted:${taskId}:${(accepted as { kind: string }).kind}`);
+      calls.push(`result:${taskId}:${(result as { kind: string }).kind}`);
+      return { status: "ok" };
+    },
+  };
+  const server = createServer(app as any, { signingSecret: SECRET });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const path = "/v1/desktop-browser/relay/callbacks/terminal";
+  const body = JSON.stringify({
+    taskId: "task-1",
+    accepted: desktopBrowserSessionStartAcceptedFixture,
+    result: desktopBrowserSessionStartCompletedResultFixture,
+  });
+
+  try {
+    const response = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: signed("POST", path, body),
+      body,
+    });
+    assert.equal(response.status, 204);
+    assert.deepEqual(calls, ["accepted:task-1:host.accepted", "result:task-1:host.result"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 

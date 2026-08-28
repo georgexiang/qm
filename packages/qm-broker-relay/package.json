@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "qm-broker-relay": "./src/bin/qm-broker-relay.ts"
+    "qm-broker-relay": "./src/bin/qm-broker-relay.ts",
+    "qm-broker-relay-migrate": "./src/bin/qm-broker-relay-migrate.ts"
   },
   "exports": {
     ".": "./src/index.ts",
@@ -12,6 +13,7 @@
     "./server": "./src/server.ts"
   },
   "dependencies": {
+    "pg": "^8.13.1",
     "qm-desktop-browser-contracts": "file:../desktop-browser-contracts",
     "ws": "^8.21.1"
   },

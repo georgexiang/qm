@@ -63,6 +63,7 @@ export function createTurnMethods(
   | "desktopBrowserPrepareOperation"
   | "desktopBrowserConsumeOperationAccepted"
   | "desktopBrowserConsumeOperationResult"
+  | "desktopBrowserConsumeRelayTerminalCallback"
   | "desktopBrowserFinalizeTask"
   | "getApproval"
   | "subscribeSessionStates"
@@ -856,6 +857,21 @@ export function createTurnMethods(
       const task = await deps.desktopBrowserTasks.get(taskId);
       if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
       return deps.desktopBrowserTasks.consumeOperationResult(taskId, result as HostResultMessage);
+    },
+
+    async desktopBrowserConsumeRelayTerminalCallback(taskId, accepted, result) {
+      const task = await deps.desktopBrowserTasks.get(taskId);
+      if (!task) return { status: "refused", reason: "Desktop Browser Task not found" };
+      const sessionStart = task.execution?.operation.authority.operationId === accepted.payload.operationId;
+      const acceptedResult = sessionStart
+        ? await deps.desktopBrowserTasks.consumeSessionStartAccepted(taskId, accepted)
+        : await deps.desktopBrowserTasks.consumeOperationAccepted(taskId, accepted);
+      if (acceptedResult.status === "refused") return acceptedResult;
+      const terminalResult = sessionStart
+        ? await deps.desktopBrowserTasks.consumeSessionStartResult(taskId, result)
+        : await deps.desktopBrowserTasks.consumeOperationResult(taskId, result);
+      if (terminalResult.status === "refused") return terminalResult;
+      return { status: "ok" };
     },
 
     async desktopBrowserFinalizeTask(taskId, principalId, authorityId, input) {

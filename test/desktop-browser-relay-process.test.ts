@@ -8,6 +8,7 @@ import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
+  computeDesktopBrowserRequestHash,
   encodeHostChallengeResponseSigningBytes,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
@@ -22,7 +23,9 @@ import {
 import {
   CoreHttpDesktopBrowserRelayRegistryAdapter,
   createDesktopBrowserRelayRuntime,
+  deliverDesktopBrowserRelayCallbacks,
   loadDesktopBrowserRelayConfig,
+  waitForDesktopBrowserRelayShutdown,
 } from "../packages/qm-broker-relay/src/process.ts";
 import {
   createDesktopBrowserRelayServer,
@@ -31,7 +34,15 @@ import {
 import { canonicalPayload } from "../src/api/http.ts";
 import { createSourceAuth } from "../src/auth/source-auth.ts";
 import { signedRequestHeaders } from "../src/auth/source-auth-sign.ts";
-import { desktopBrowserRelayInvocationFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
+import {
+  createDesktopBrowserRelayOperationStore,
+  createMemoryDesktopBrowserRelayOperationBacking,
+} from "../packages/qm-broker-relay/src/operation-store.ts";
+import {
+  desktopBrowserRelayInvocationFixture,
+  desktopBrowserSessionStartAcceptedFixture,
+  desktopBrowserSessionStartCompletedResultFixture,
+} from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
 
 class Probe implements DesktopBrowserRelayReadinessProbe {
@@ -115,8 +126,13 @@ function relayProcessEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     QM_RELAY_CORE_API_URL: "http://127.0.0.1:8080",
     QM_RELAY_SOURCE_AUTH_SECRET: "relay-source-auth-secret-for-tests-0001",
     QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
+    QM_RELAY_DATABASE_URL: "postgres://relay:relay@127.0.0.1/qm_relay",
     ...overrides,
   };
+}
+
+function memoryOperationStore() {
+  return createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
 }
 
 function challengeResponse(
@@ -450,6 +466,148 @@ test("Core Relay dispatcher rejects unsafe URLs, crossed responses, redirects, a
   await assert.rejects(redirected.dispatch(input), /status 302/);
 });
 
+test("Relay callback worker retains failures and acknowledges one signed terminal delivery", async () => {
+  let now = 10_000;
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => now,
+  });
+  await store.prepare(desktopBrowserRelayInvocationFixture);
+  await store.markDeliveryStarted(
+    desktopBrowserRelayInvocationFixture.payload.authority.attemptId,
+    desktopBrowserRelayInvocationFixture.payload.dispatchId,
+  );
+  await store.recordAccepted(desktopBrowserSessionStartAcceptedFixture);
+  await store.recordTerminal(desktopBrowserSessionStartCompletedResultFixture);
+  const config = {
+    coreApiUrl: "https://core.example.test",
+    sourceAuthSecret: "relay-source-auth-secret-for-tests-0001",
+  };
+  await deliverDesktopBrowserRelayCallbacks(store, config, async () => new Response("unavailable", { status: 503 }), {
+    now: () => now,
+    owner: "worker-1",
+  });
+  assert.equal((await store.pendingCallbacks()).length, 1);
+  now += 1_000;
+  let deliveries = 0;
+  await deliverDesktopBrowserRelayCallbacks(
+    store,
+    config,
+    async (url, init) => {
+      deliveries += 1;
+      assert.ok(init?.signal);
+      const parsed = new URL(String(url));
+      const body = String(init?.body ?? "");
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const auth = createSourceAuth({ signingSecret: config.sourceAuthSecret });
+      const verified = await auth.verify({
+        signature: String(headers["x-signature"]),
+        timestamp: Number(headers["x-timestamp"]),
+        body: canonicalPayload("POST", `${parsed.pathname}${parsed.search}`, body),
+        eventId: String(headers["x-signature"]),
+      });
+      assert.equal(verified.ok, true);
+      assert.deepEqual(JSON.parse(body), {
+        taskId: desktopBrowserRelayInvocationFixture.payload.authority.taskId,
+        accepted: desktopBrowserSessionStartAcceptedFixture,
+        result: desktopBrowserSessionStartCompletedResultFixture,
+      });
+      return new Response(null, { status: 204 });
+    },
+    { now: () => now, owner: "worker-2" },
+  );
+  assert.equal(deliveries, 1);
+  assert.deepEqual(await store.pendingCallbacks(), []);
+});
+
+test("Relay callback worker continues past poison entries and dead-letters after 24 hours", async () => {
+  let now = 0;
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => now,
+  });
+  const prepareTerminal = async (suffix: string) => {
+    const authority = {
+      ...desktopBrowserRelayInvocationFixture.payload.authority,
+      taskId: `task-${suffix}`,
+      attemptId: `attempt-${suffix}`,
+      operationId: `operation-${suffix}`,
+      nonce: `nonce-${suffix}`,
+    };
+    const invocation = {
+      ...desktopBrowserRelayInvocationFixture,
+      payload: {
+        dispatchId: `dispatch-${suffix}`,
+        requestHash: computeDesktopBrowserRequestHash(authority),
+        authority,
+      },
+    };
+    const accepted = {
+      ...desktopBrowserSessionStartAcceptedFixture,
+      payload: {
+        dispatchId: invocation.payload.dispatchId,
+        operationId: authority.operationId,
+        requestHash: invocation.payload.requestHash,
+      },
+    };
+    const result = {
+      ...desktopBrowserSessionStartCompletedResultFixture,
+      payload: {
+        ...desktopBrowserSessionStartCompletedResultFixture.payload,
+        dispatchId: invocation.payload.dispatchId,
+        operationId: authority.operationId,
+        resultHash: `sha256:result-${suffix}`,
+      },
+    };
+    await store.prepare(invocation);
+    await store.markDeliveryStarted(authority.attemptId, invocation.payload.dispatchId);
+    await store.recordAccepted(accepted);
+    await store.recordTerminal(result);
+  };
+  await prepareTerminal("poison");
+  await prepareTerminal("healthy");
+  const config = {
+    coreApiUrl: "https://core.example.test",
+    sourceAuthSecret: "relay-source-auth-secret-for-tests-0001",
+  };
+  const deliveredTasks: string[] = [];
+  await deliverDesktopBrowserRelayCallbacks(
+    store,
+    config,
+    async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { taskId: string };
+      if (body.taskId === "task-poison") return new Response("unavailable", { status: 503 });
+      deliveredTasks.push(body.taskId);
+      return new Response(null, { status: 204 });
+    },
+    { now: () => now, owner: "worker-poison" },
+  );
+  assert.deepEqual(deliveredTasks, ["task-healthy"]);
+  assert.deepEqual(
+    (await store.pendingCallbacks()).map((entry) => entry.taskId),
+    ["task-poison"],
+  );
+
+  now = 24 * 60 * 60_000;
+  await deliverDesktopBrowserRelayCallbacks(
+    store,
+    config,
+    async () => new Response("still unavailable", { status: 503 }),
+    { now: () => now, owner: "worker-dead-letter" },
+  );
+  assert.deepEqual(await store.pendingCallbacks(), []);
+  assert.deepEqual(
+    (await store.deadLetters()).map((entry) => entry.taskId),
+    ["task-poison"],
+  );
+});
+
+test("Relay shutdown returns at the configured deadline when cleanup stalls", async () => {
+  const startedAt = Date.now();
+  await waitForDesktopBrowserRelayShutdown(new Promise(() => undefined), 20);
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed >= 15);
+  assert.ok(elapsed < 500);
+});
+
 test("relay shutdown drains an upgraded websocket session with 1012", async () => {
   const registry = new MemoryRegistry();
   const identity = createDeviceIdentity();
@@ -529,12 +687,15 @@ test("relay process runtime loads dedicated config and starts independently", as
       QM_RELAY_CORE_API_URL: base,
       QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
       QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
+      QM_RELAY_DATABASE_URL: "postgres://relay:relay@127.0.0.1/qm_relay",
       QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2,1.0",
       QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
       QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
     });
     assert.equal(config.wssPath, DESKTOP_BROWSER_RELAY_WSS_PATH);
-    const runtime = createDesktopBrowserRelayRuntime(config);
+    const runtime = createDesktopBrowserRelayRuntime(config, {
+      operationStore: memoryOperationStore(),
+    });
     await runtime.start();
     const port = (runtime.server.server.address() as AddressInfo).port;
     const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
@@ -558,6 +719,23 @@ test("relay process config defaults to the shared Phase F protocol and policy gr
   ]);
   assert.equal(config.maxSettledDispatchHistory, 1_024);
   assert.equal(config.settledDispatchHistoryTtlMs, 300_000);
+  assert.equal(config.databaseUrl, "postgres://relay:relay@127.0.0.1/qm_relay");
+  assert.equal(config.databaseSchema, "qm_broker_relay");
+});
+
+test("relay process requires its own durable database and validates the isolated schema", () => {
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_DATABASE_URL: "" })),
+    /QM_RELAY_DATABASE_URL is required/,
+  );
+  assert.throws(
+    () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_DATABASE_SCHEMA: "public;drop" })),
+    /QM_RELAY_DATABASE_SCHEMA/,
+  );
+  assert.equal(
+    loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_DATABASE_SCHEMA: "desktop_relay" })).databaseSchema,
+    "desktop_relay",
+  );
 });
 
 test("relay process config accepts explicit settled dispatch history bounds", () => {
@@ -644,12 +822,15 @@ test("relay process runtime preserves an explicit websocket path override", asyn
       QM_RELAY_CORE_API_URL: base,
       QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
       QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
+      QM_RELAY_DATABASE_URL: "postgres://relay:relay@127.0.0.1/qm_relay",
       QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2,1.0",
       QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
       QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
     });
     assert.equal(config.wssPath, "/relay");
-    const runtime = createDesktopBrowserRelayRuntime(config);
+    const runtime = createDesktopBrowserRelayRuntime(config, {
+      operationStore: memoryOperationStore(),
+    });
     await runtime.start();
     const port = (runtime.server.server.address() as AddressInfo).port;
     const ws = new WebSocket(`ws://127.0.0.1:${port}/relay`);
@@ -704,10 +885,12 @@ test("relay process readiness fails when source auth is rejected or the readines
         QM_RELAY_CORE_API_URL: rejectingBase,
         QM_RELAY_SOURCE_AUTH_SECRET: "relay-source-auth-secret-for-tests-9999",
         QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
+        QM_RELAY_DATABASE_URL: "postgres://relay:relay@127.0.0.1/qm_relay",
         QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2",
         QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
         QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
       }),
+      { operationStore: memoryOperationStore() },
     );
     await badSecretRuntime.start();
     const badSecretPort = (badSecretRuntime.server.server.address() as AddressInfo).port;
@@ -729,10 +912,12 @@ test("relay process readiness fails when source auth is rejected or the readines
         QM_RELAY_CORE_API_URL: missingRouteBase,
         QM_RELAY_SOURCE_AUTH_SECRET: sourceAuthSecret,
         QM_RELAY_CORE_AUTH_SECRET: "relay-core-auth-secret-for-tests-0000001",
+        QM_RELAY_DATABASE_URL: "postgres://relay:relay@127.0.0.1/qm_relay",
         QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS: "1.2",
         QM_RELAY_SUPPORTED_POLICY_GRAMMAR_VERSIONS: "1.1",
         QM_RELAY_SHUTDOWN_DRAIN_MS: "50",
       }),
+      { operationStore: memoryOperationStore() },
     );
     await missingRouteRuntime.start();
     const missingRoutePort = (missingRouteRuntime.server.server.address() as AddressInfo).port;

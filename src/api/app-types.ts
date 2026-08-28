@@ -342,6 +342,11 @@ export interface App {
     taskId: string,
     result: HostResultMessage,
   ): ReturnType<DesktopBrowserTaskStore["consumeOperationResult"]>;
+  desktopBrowserConsumeRelayTerminalCallback(
+    taskId: string,
+    accepted: HostAcceptedMessage,
+    result: HostResultMessage,
+  ): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   desktopBrowserFinalizeTask(
     taskId: string,
     principalId: string,

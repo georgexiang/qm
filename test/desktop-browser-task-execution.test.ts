@@ -338,9 +338,7 @@ test("the application prepares the registered task from the current Relay projec
       requestHash: first.operation.requestHash,
     },
   };
-  const acceptedResult = await built.app.desktopBrowserConsumeSessionStartAccepted(taskId, accepted);
-  assert.equal(acceptedResult.status, "ok");
-  const completed = await built.app.desktopBrowserConsumeSessionStartResult(taskId, {
+  const result: HostResultMessage = {
     protocolVersion: DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
     kind: "host.result",
     payload: {
@@ -354,12 +352,13 @@ test("the application prepares the registered task from the current Relay projec
         agent_window_id: 71,
       },
     },
-  });
-  assert.equal(completed.status, "ok");
-  if (completed.status !== "ok") return;
-  assert.equal(completed.task.browserSkillSessionId, "browser-skill-session-current");
-  assert.equal(completed.task.browserInstanceId, "browser-primary");
-  assert.equal(completed.task.agentWindowId, 71);
+  };
+  const callback = await built.app.desktopBrowserConsumeRelayTerminalCallback(taskId, accepted, result);
+  assert.equal(callback.status, "ok");
+  const completed = await built.desktopBrowserTasks.get(taskId);
+  assert.equal(completed?.browserSkillSessionId, "browser-skill-session-current");
+  assert.equal(completed?.browserInstanceId, "browser-primary");
+  assert.equal(completed?.agentWindowId, 71);
 });
 
 test("a completed Host result atomically binds frozen browser ownership to its prepared task", async () => {

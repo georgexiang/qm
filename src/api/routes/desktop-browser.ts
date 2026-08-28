@@ -5,6 +5,8 @@ import {
   parseDesktopBrowserRelayConnectionPublishRequest,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRelayConnectionProjection,
+  type HostAcceptedMessage,
+  type HostResultMessage,
 } from "qm-desktop-browser-contracts";
 
 async function taskAction(ctx: ApiCtx): Promise<void> {
@@ -171,8 +173,34 @@ async function clearRelayConnection(ctx: ApiCtx): Promise<void> {
   ctx.res.end();
 }
 
+async function consumeRelayTerminalCallback(ctx: ApiCtx): Promise<void> {
+  const body = isObj(ctx.body) ? ctx.body : {};
+  const taskId = typeof body.taskId === "string" ? body.taskId : "";
+  const accepted = isObj(body.accepted) ? body.accepted : null;
+  const result = isObj(body.result) ? body.result : null;
+  if (!taskId || !accepted || !result) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "taskId, accepted, and result required" });
+  }
+  const callbackResult = await ctx.app.desktopBrowserConsumeRelayTerminalCallback(
+    taskId,
+    accepted as unknown as HostAcceptedMessage,
+    result as unknown as HostResultMessage,
+  );
+  if (callbackResult.status === "refused") {
+    return sendJson(ctx.res, 409, { error: "conflict", message: callbackResult.reason });
+  }
+  ctx.res.statusCode = 204;
+  ctx.res.end();
+}
+
 export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "source", handle: relayReady },
+  {
+    method: "POST",
+    path: "/v1/desktop-browser/relay/callbacks/terminal",
+    auth: "source",
+    handle: consumeRelayTerminalCallback,
+  },
   { method: "POST", path: "/v1/desktop-browser/tasks/:id/actions", auth: "source", handle: taskAction },
   {
     method: "POST",

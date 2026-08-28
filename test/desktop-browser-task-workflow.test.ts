@@ -218,6 +218,9 @@ test("Ticket 06 returns sanitized observation and only explicit Core finalize co
     observed.observation,
     observeResult.payload.outcome === "completed" ? observeResult.payload.result : null,
   );
+  assert.deepEqual(await app.desktopBrowserConsumeRelayTerminalCallback(task.id, observeAccepted, observeResult), {
+    status: "ok",
+  });
 
   currentTime += 1_000;
   const stop = await app.desktopBrowserPrepareOperation(

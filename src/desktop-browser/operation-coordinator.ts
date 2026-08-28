@@ -15,6 +15,7 @@ export type DesktopBrowserRelayDispatchResult =
   | {
       kind: "accepted_unknown";
       accepted: HostAcceptedMessage;
+      result?: HostResultMessage;
       error: { code: string; message: string };
     }
   | {
@@ -140,7 +141,9 @@ export function createDesktopBrowserOperationCoordinator(options: {
       const accepted = await options.tasks.consumeOperationAccepted(task.id, dispatched.accepted);
       if (accepted.status === "refused") return accepted;
       const result =
-        dispatched.kind === "host.result" ? dispatched.result : unknownResult(dispatched.accepted, dispatched.error);
+        dispatched.kind === "host.result"
+          ? dispatched.result
+          : (dispatched.result ?? unknownResult(dispatched.accepted, dispatched.error));
       const consumed = await options.tasks.consumeOperationResult(task.id, result);
       if (consumed.status === "refused") return consumed;
       return {

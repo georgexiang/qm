@@ -4,6 +4,7 @@ import type {
   DesktopBrowserRelayConnectionPublishRequest,
   DesktopBrowserRelayRegistryBinding,
 } from "qm-desktop-browser-contracts";
+import { randomUUID } from "node:crypto";
 import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
@@ -16,6 +17,8 @@ import {
 } from "./index.ts";
 import { createDesktopBrowserRelayServer, type DesktopBrowserRelayReadinessProbe } from "./server.ts";
 import { signedRequestHeaders, withSourceAuthNonce } from "../../../plugins/chassis/src/core-client.ts";
+import type { DesktopBrowserRelayOperationStore } from "./operation-store.ts";
+import { createPostgresDesktopBrowserRelayOperationStore } from "./operation-postgres.ts";
 
 const MIN_SOURCE_AUTH_SECRET_LENGTH = 32;
 
@@ -28,6 +31,8 @@ export interface DesktopBrowserRelayRuntimeConfig {
   coreApiUrl: string;
   sourceAuthSecret: string;
   coreAuthSecret: string;
+  databaseUrl: string;
+  databaseSchema: string;
   supportedProtocolVersions: string[];
   supportedPolicyGrammarVersions: string[];
   maxSettledDispatchHistory: number;
@@ -82,6 +87,11 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
   if (coreAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
     throw new Error(`QM_RELAY_CORE_AUTH_SECRET must be at least ${MIN_SOURCE_AUTH_SECRET_LENGTH} characters`);
   }
+  const databaseUrl = requireEnv("QM_RELAY_DATABASE_URL", env.QM_RELAY_DATABASE_URL);
+  const databaseSchema = env.QM_RELAY_DATABASE_SCHEMA ?? "qm_broker_relay";
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(databaseSchema)) {
+    throw new Error("QM_RELAY_DATABASE_SCHEMA must be a lowercase PostgreSQL identifier");
+  }
   return {
     host: env.QM_RELAY_HOST ?? "127.0.0.1",
     port: parseInteger("QM_RELAY_PORT", env.QM_RELAY_PORT, 8091),
@@ -91,6 +101,8 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
     coreApiUrl: requireEnv("QM_RELAY_CORE_API_URL", env.QM_RELAY_CORE_API_URL).replace(/\/$/, ""),
     sourceAuthSecret,
     coreAuthSecret,
+    databaseUrl,
+    databaseSchema,
     supportedProtocolVersions: parseList(env.QM_RELAY_SUPPORTED_PROTOCOL_VERSIONS, [
       ...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
     ]),
@@ -119,6 +131,56 @@ async function requireOk(response: Response): Promise<void> {
   if (response.ok) return;
   const body = await response.text();
   throw new Error(`core request failed with ${response.status}: ${body || response.statusText}`);
+}
+
+export async function deliverDesktopBrowserRelayCallbacks(
+  store: DesktopBrowserRelayOperationStore,
+  config: Pick<DesktopBrowserRelayRuntimeConfig, "coreApiUrl" | "sourceAuthSecret">,
+  fetchImpl: typeof fetch = fetch,
+  options: { now?: () => number; owner?: string; signal?: AbortSignal } = {},
+): Promise<void> {
+  const owner = options.owner ?? randomUUID();
+  const now = options.now ?? Date.now;
+  for (const entry of await store.claimCallbacks(owner, 25, 30_000)) {
+    try {
+      const path = signedPath("/v1/desktop-browser/relay/callbacks/terminal", config.sourceAuthSecret);
+      const body = JSON.stringify({ taskId: entry.taskId, accepted: entry.accepted, result: entry.result });
+      const response = await fetchImpl(`${config.coreApiUrl}${path}`, {
+        method: "POST",
+        headers: signedRequestHeaders(config.sourceAuthSecret, "POST", path, body, {
+          "content-type": "application/json",
+        }),
+        body,
+        signal: options.signal
+          ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)])
+          : AbortSignal.timeout(20_000),
+      });
+      await requireOk(response);
+      await store.markCallbackDelivered(entry.operationId, entry.callbackType, owner);
+    } catch {
+      const at = now();
+      const deadLetter = at >= entry.createdAt + 24 * 60 * 60_000;
+      const retryDelay = Math.min(5 * 60_000, 1_000 * 2 ** Math.min(entry.attempts - 1, 8));
+      await store.releaseCallback(entry.operationId, entry.callbackType, owner, at + retryDelay, deadLetter);
+      if (deadLetter) {
+        console.error(
+          `[qm-broker-relay] terminal callback dead-lettered operationId=${entry.operationId} attempts=${entry.attempts}`,
+        );
+      }
+    }
+  }
+}
+
+export async function waitForDesktopBrowserRelayShutdown(work: Promise<unknown>, deadlineMs: number): Promise<void> {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work,
+    new Promise<void>((resolve) => {
+      deadline = setTimeout(resolve, deadlineMs);
+      deadline.unref?.();
+    }),
+  ]);
+  if (deadline) clearTimeout(deadline);
 }
 
 export class CoreHttpDesktopBrowserRelayRegistryAdapter
@@ -189,15 +251,28 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
   }
 }
 
-class NoopReadinessProbe implements DesktopBrowserRelayReadinessProbe {
-  async check(): Promise<void> {}
-}
-
-export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRuntimeConfig): DesktopBrowserRelayRuntime {
+export function createDesktopBrowserRelayRuntime(
+  config: DesktopBrowserRelayRuntimeConfig,
+  deps: { operationStore?: DesktopBrowserRelayOperationStore } = {},
+): DesktopBrowserRelayRuntime {
   const registry = new CoreHttpDesktopBrowserRelayRegistryAdapter({
     baseUrl: config.coreApiUrl,
     sourceAuthSecret: config.sourceAuthSecret,
   });
+  const operationStore =
+    deps.operationStore ??
+    createPostgresDesktopBrowserRelayOperationStore({
+      connectionString: config.databaseUrl,
+      schema: config.databaseSchema,
+    });
+  const operationCheck =
+    typeof (operationStore as { check?: unknown }).check === "function"
+      ? () => (operationStore as unknown as { check(): Promise<void> }).check()
+      : async () => undefined;
+  const operationClose =
+    typeof (operationStore as { close?: unknown }).close === "function"
+      ? () => (operationStore as unknown as { close(): Promise<void> }).close()
+      : async () => undefined;
   const service = new DesktopBrowserRelayService({
     relayInstanceId: config.relayInstanceId,
     deploymentCanonicalId: config.deploymentCanonicalId,
@@ -206,6 +281,7 @@ export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRunt
     maxSettledDispatchHistory: config.maxSettledDispatchHistory,
     settledDispatchHistoryTtlMs: config.settledDispatchHistoryTtlMs,
     registry,
+    operationStore,
   });
   const server = createDesktopBrowserRelayServer({
     host: config.host,
@@ -213,10 +289,18 @@ export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRunt
     path: config.wssPath,
     service,
     adapterReadiness: registry,
-    storageReadiness: new NoopReadinessProbe(),
+    storageReadiness: { check: operationCheck },
     coreAuthSecret: config.coreAuthSecret,
     shutdownDrainMs: config.shutdownDrainMs,
   });
+  let callbackTimer: ReturnType<typeof setInterval> | null = null;
+  let callbackDelivery = Promise.resolve();
+  const callbackAbort = new AbortController();
+  const deliverCallbacks = () => {
+    callbackDelivery = callbackDelivery
+      .then(() => deliverDesktopBrowserRelayCallbacks(operationStore, config, fetch, { signal: callbackAbort.signal }))
+      .catch(() => undefined);
+  };
 
   return {
     config,
@@ -226,10 +310,16 @@ export function createDesktopBrowserRelayRuntime(config: DesktopBrowserRelayRunt
 
     async start() {
       await server.listen();
+      deliverCallbacks();
+      callbackTimer = setInterval(deliverCallbacks, 1_000);
     },
 
     async shutdown() {
-      await server.shutdown();
+      if (callbackTimer) clearInterval(callbackTimer);
+      callbackTimer = null;
+      callbackAbort.abort();
+      const work = Promise.allSettled([server.shutdown(), callbackDelivery, operationClose()]);
+      await waitForDesktopBrowserRelayShutdown(work, config.shutdownDrainMs);
     },
   };
 }

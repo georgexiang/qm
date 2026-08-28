@@ -489,16 +489,16 @@ export function createDesktopBrowserTaskStore(
           refusal = capabilitySetRefusal();
           return task;
         }
-        if (execution.hostResult) {
-          refusal = "Desktop Browser Task already recorded a Host result";
-          return task;
-        }
         if (execution.hostAccepted) {
           if (sameAccepted(execution.hostAccepted, accepted)) {
             recorded = task;
             return task;
           }
           refusal = "Desktop Browser Task already recorded Host acceptance";
+          return task;
+        }
+        if (execution.hostResult) {
+          refusal = "Desktop Browser Task already recorded a Host result";
           return task;
         }
         const at = now();
@@ -820,16 +820,16 @@ export function createDesktopBrowserTaskStore(
           refusal = "Desktop Browser Host acceptance does not match the prepared operation";
           return task;
         }
-        if (operation.hostResult) {
-          refusal = "Desktop Browser Task operation already recorded a Host result";
-          return task;
-        }
         if (operation.hostAccepted) {
           if (sameAccepted(operation.hostAccepted, accepted)) {
             recorded = task;
             return task;
           }
           refusal = "Desktop Browser Task operation already recorded Host acceptance";
+          return task;
+        }
+        if (operation.hostResult) {
+          refusal = "Desktop Browser Task operation already recorded a Host result";
           return task;
         }
         const operations = [...task.operations];

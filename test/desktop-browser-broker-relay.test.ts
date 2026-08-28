@@ -26,6 +26,12 @@ import {
   type RelayDispatchResult,
   type DesktopBrowserRelaySocket,
 } from "../packages/qm-broker-relay/src/index.ts";
+import {
+  createDesktopBrowserRelayOperationStore,
+  createMemoryDesktopBrowserRelayOperationBacking,
+  type DesktopBrowserRelayOperationBacking,
+  type DesktopBrowserRelayOperationStore,
+} from "../packages/qm-broker-relay/src/operation-store.ts";
 
 class ManualClock implements DesktopBrowserRelayClock {
   private nowMs = 1_725_000_000_000;
@@ -372,6 +378,7 @@ async function createRegisteredTicket05Relay(
     protocolVersion?: `${number}.${number}`;
     maxSettledDispatchHistory?: number;
     settledDispatchHistoryTtlMs?: number;
+    operationStore?: DesktopBrowserRelayOperationStore;
   } = {},
 ) {
   const protocolVersion = options.protocolVersion ?? "1.2";
@@ -400,6 +407,7 @@ async function createRegisteredTicket05Relay(
     invocationTimeoutMs: options.invocationTimeoutMs,
     maxSettledDispatchHistory: options.maxSettledDispatchHistory,
     settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs,
+    operationStore: options.operationStore,
   });
   const socket = new FakeSocket();
   service.acceptSocket(socket);
@@ -429,6 +437,222 @@ async function createRegisteredTicket05Relay(
   await flushMessages();
   return { adapter, clock, identity, service, socket };
 }
+
+test("Ticket 07 restart never redelivers an effectful operation after wire delivery started", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const firstStore = createDesktopBrowserRelayOperationStore(backing);
+  const first = await createRegisteredTicket05Relay({ operationStore: firstStore });
+  const firstInvocation = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: { ...desktopBrowserRelayInvocationFixture.payload, dispatchId: "dispatch-before-restart" },
+  };
+  const firstResult = first.service.dispatchInvocation({
+    devicePublicKey: first.identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: firstInvocation,
+  });
+  await flushMessages();
+  assert.equal(first.socket.sent.length, 2);
+  first.socket.close(1006, "relay restart");
+  assert.equal((await firstResult).kind, "not_accepted_or_unknown");
+
+  const restartedStore = createDesktopBrowserRelayOperationStore(backing);
+  const restarted = await createRegisteredTicket05Relay({ operationStore: restartedStore });
+  const replayed = await restarted.service.dispatchInvocation({
+    devicePublicKey: restarted.identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: {
+      ...desktopBrowserRelayInvocationFixture,
+      payload: { ...desktopBrowserRelayInvocationFixture.payload, dispatchId: "dispatch-after-restart" },
+    },
+  });
+
+  assert.equal(replayed.kind, "not_accepted_or_unknown");
+  assert.equal(restarted.socket.sent.length, 1);
+});
+
+test("Ticket 07 rolls delivery back to not_started when the socket closes before send", async () => {
+  const memory = createMemoryDesktopBrowserRelayOperationBacking();
+  let transactions = 0;
+  let releaseDelivery!: () => void;
+  const deliveryGate = new Promise<void>((resolve) => {
+    releaseDelivery = resolve;
+  });
+  const backing: DesktopBrowserRelayOperationBacking = {
+    async transaction(update) {
+      transactions += 1;
+      if (transactions === 2) await deliveryGate;
+      return memory.transaction(update);
+    },
+    snapshot: () => memory.snapshot(),
+  };
+  const operationStore = createDesktopBrowserRelayOperationStore(backing);
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.close(1006, "closed before durable delivery start");
+  assert.equal((await pending).kind, "not_accepted_or_unknown");
+  releaseDelivery();
+  await flushMessages();
+
+  const checkpoint = await operationStore.checkpoint(desktopBrowserRelayInvocationFixture.payload.authority.attemptId);
+  assert.equal(checkpoint?.deliveryState, "not_started");
+  assert.equal(checkpoint?.dispatchId, undefined);
+  assert.equal(socket.sent.length, 1);
+});
+
+test("Ticket 07 recovers a Host fence missing Relay Accepted Evidence as accepted terminal without rerun", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const operationStore = createDesktopBrowserRelayOperationStore(backing);
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  assert.equal(socket.sent.length, 2);
+
+  socket.message(JSON.stringify(desktopBrowserSessionStartCompletedResultFixture));
+  const recovered = await pending;
+
+  assert.equal(recovered.kind, "host.result");
+  if (recovered.kind !== "host.result") assert.fail("Host terminal result was not recovered");
+  assert.equal(
+    recovered.accepted.payload.operationId,
+    desktopBrowserSessionStartCompletedResultFixture.payload.operationId,
+  );
+  assert.equal(
+    recovered.result.payload.resultHash,
+    desktopBrowserSessionStartCompletedResultFixture.payload.resultHash,
+  );
+  assert.equal((await operationStore.acceptedEvidence()).length, 1);
+  assert.equal((await operationStore.terminalEvidence()).length, 1);
+  assert.equal((await operationStore.pendingCallbacks()).length, 1);
+  assert.equal(socket.sent.length, 2);
+});
+
+test("Ticket 07 persists accepted disconnect as unknown terminal evidence before resolving", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const operationStore = createDesktopBrowserRelayOperationStore(backing);
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+  await flushMessages();
+  socket.close(1006, "lost after acceptance");
+
+  assert.equal((await pending).kind, "accepted_unknown");
+  assert.equal((await operationStore.terminalEvidence()).at(-1)?.outcome, "unknown");
+  assert.equal((await operationStore.pendingCallbacks()).at(-1)?.result.payload.outcome, "unknown");
+});
+
+test("Ticket 07 terminal persistence failure settles the dispatch as accepted unknown", async () => {
+  const durable = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const operationStore: DesktopBrowserRelayOperationStore = {
+    ...durable,
+    async recordTerminal() {
+      throw new Error("terminal storage unavailable");
+    },
+  };
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+  socket.message(JSON.stringify(desktopBrowserSessionStartCompletedResultFixture));
+
+  assert.equal((await pending).kind, "accepted_unknown");
+  assert.equal(socket.closeCode, 1008);
+});
+
+test("Ticket 07 appends a late terminal without replacing the newer current checkpoint", async () => {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const operationStore = createDesktopBrowserRelayOperationStore(backing);
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const first = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+  socket.message(JSON.stringify(desktopBrowserSessionStartCompletedResultFixture));
+  assert.equal((await first).kind, "host.result");
+
+  const nextAuthority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    operationId: "operation-next",
+    operationSequence: 2,
+    nonce: "nonce-next",
+  };
+  const nextInvocation: RelayInvocationMessage = {
+    ...desktopBrowserRelayInvocationFixture,
+    payload: {
+      dispatchId: "dispatch-next",
+      requestHash: computeDesktopBrowserRequestHash(nextAuthority),
+      authority: nextAuthority,
+    },
+  };
+  const next = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: nextInvocation,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartCompletedResultFixture));
+  await flushMessages();
+  assert.equal(socket.closeCode, undefined);
+
+  const nextAccepted: HostAcceptedMessage = {
+    protocolVersion: "1.2",
+    kind: "host.accepted",
+    payload: {
+      dispatchId: nextInvocation.payload.dispatchId,
+      operationId: nextAuthority.operationId,
+      requestHash: nextInvocation.payload.requestHash,
+    },
+  };
+  const nextResult: HostResultMessage = {
+    protocolVersion: "1.2",
+    kind: "host.result",
+    payload: {
+      dispatchId: nextInvocation.payload.dispatchId,
+      operationId: nextAuthority.operationId,
+      outcome: "completed",
+      resultHash: "sha256:next-result",
+      result: {
+        session_id: "session-next",
+        browser_instance_id: "browser-primary",
+        agent_window_id: 43,
+      },
+    },
+  };
+  socket.message(JSON.stringify(nextAccepted));
+  socket.message(JSON.stringify(nextResult));
+  assert.equal((await next).kind, "host.result");
+  assert.equal((await operationStore.checkpoint(nextAuthority.attemptId))?.operationId, nextAuthority.operationId);
+  assert.equal((await operationStore.terminalEvidence()).length, 2);
+});
 
 test("Ticket 06 relay dispatches protocol 1.3 navigate and returns the sanitized Host result", async () => {
   const { identity, service, socket } = await createRegisteredTicket05Relay({

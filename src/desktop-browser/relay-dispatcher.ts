@@ -125,7 +125,29 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
         ) {
           throw new Error("Desktop Browser Relay response does not match the submitted operation");
         }
-        return { kind: "accepted_unknown", accepted, error: { code: error.code, message: error.message } };
+        let result;
+        if (record.result !== undefined) {
+          const decodedResult = decodeDesktopBrowserMessage(
+            JSON.stringify(record.result),
+            protocolVersion,
+            policyGrammarVersion,
+          );
+          if (
+            decodedResult.kind !== "host.result" ||
+            decodedResult.payload.dispatchId !== expectedDispatchId ||
+            decodedResult.payload.operationId !== expectedOperationId ||
+            decodedResult.payload.outcome !== "unknown"
+          ) {
+            throw new Error("Desktop Browser Relay response does not match the submitted operation");
+          }
+          result = decodedResult;
+        }
+        return {
+          kind: "accepted_unknown",
+          accepted,
+          ...(result ? { result } : {}),
+          error: { code: error.code, message: error.message },
+        };
       }
       if (record.kind === "not_accepted_or_unknown") {
         const dispatchId = record.dispatchId;
