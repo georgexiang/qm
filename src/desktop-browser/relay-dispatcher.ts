@@ -5,7 +5,7 @@ import type { DesktopBrowserRelayDispatcher, DesktopBrowserRelayDispatchResult }
 
 export interface DesktopBrowserRelayControl extends DesktopBrowserRelayDispatcher {
   attemptStatus(attemptId: string): Promise<{
-    checkpoint: { attemptId: string; operationId: string; state: string };
+    checkpoint: { attemptId: string; operationId: string; state: string; deliveryState?: string };
     accepted?: import("qm-desktop-browser-contracts").HostAcceptedMessage;
     result?: import("qm-desktop-browser-contracts").HostResultMessage;
   } | null>;
@@ -96,7 +96,8 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
       if (
         checkpointRecord.attemptId !== attemptId ||
         typeof checkpointRecord.operationId !== "string" ||
-        typeof checkpointRecord.state !== "string"
+        typeof checkpointRecord.state !== "string" ||
+        (checkpointRecord.deliveryState !== undefined && typeof checkpointRecord.deliveryState !== "string")
       ) {
         throw new Error("Desktop Browser Relay Attempt checkpoint does not match request");
       }
@@ -120,7 +121,16 @@ export function createHttpDesktopBrowserRelayDispatcher(options: {
         }
         result = decoded;
       }
-      return { checkpoint: checkpointRecord as { attemptId: string; operationId: string; state: string }, ...(accepted ? { accepted } : {}), ...(result ? { result } : {}) };
+      return {
+        checkpoint: checkpointRecord as {
+          attemptId: string;
+          operationId: string;
+          state: string;
+          deliveryState?: string;
+        },
+        ...(accepted ? { accepted } : {}),
+        ...(result ? { result } : {}),
+      };
     },
     async revoke(input) {
       const body = JSON.stringify(input);

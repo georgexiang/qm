@@ -31,6 +31,37 @@ test("Ticket 06 navigate argv is canonical and bound to the Task-owned session",
   );
 });
 
+test("Ticket 16 navigate rejects local, active-content, credentialed, and browser-internal URLs", () => {
+  for (const target of [
+    "file:///Users/example/secret.txt",
+    "javascript:alert(document.cookie)",
+    "data:text/html,<script>alert(1)</script>",
+    "chrome://settings",
+    "edge://settings",
+    "https://alice:secret@example.test/",
+    "http://example.test/",
+    "https://localhost/admin",
+    "https://localhost./admin",
+    "https://service.internal/admin",
+    "https://service.internal./admin",
+    "https://host.local./admin",
+    "https://metadata.google.internal/computeMetadata/v1/",
+    "https://127.0.0.1/admin",
+    "https://[::1]/admin",
+    "https://2130706433/admin",
+    "/relative",
+  ]) {
+    assert.throws(() => buildDesktopBrowserNavigateArgv(target, "session-1"), /HTTPS/);
+  }
+  assert.deepEqual(buildDesktopBrowserNavigateArgv("https://example.test/path", "session-1"), [
+    "--json",
+    "navigate",
+    "https://example.test/path",
+    "--session",
+    "session-1",
+  ]);
+});
+
 test("Ticket 06 observe argv is canonical and bound to the Task-owned session", () => {
   const expected = ["--json", "observe", "--session", "session-1"];
 

@@ -41,12 +41,15 @@ function checkpoint(row: Record<string, unknown>): DesktopBrowserRelayOperationC
 }
 
 function callback(row: Record<string, unknown>): DesktopBrowserRelayCallbackOutboxEntry {
+  if (row.result == null && row.delivered_at == null && row.dead_lettered_at == null) {
+    throw new Error("desktop browser Relay pending callback result was scrubbed");
+  }
   return {
     taskId: String(row.task_id),
     operationId: String(row.operation_id),
     callbackType: "terminal",
     accepted: structuredClone(row.accepted) as HostAcceptedMessage,
-    result: structuredClone(row.result) as HostResultMessage,
+    ...(row.result == null ? {} : { result: structuredClone(row.result) as HostResultMessage }),
     createdAt: Number(row.created_at),
     deliveredAt: row.delivered_at == null ? null : Number(row.delivered_at),
     attempts: Number(row.attempts),
@@ -124,12 +127,12 @@ function schemaStatements(schema: string): string[] {
     )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.terminal_evidence(
       operation_id TEXT NOT NULL, dispatch_id TEXT NOT NULL, result_hash TEXT NOT NULL,
-      outcome TEXT NOT NULL, result JSONB NOT NULL, terminal_at BIGINT NOT NULL,
+      outcome TEXT NOT NULL, result JSONB, terminal_at BIGINT NOT NULL,
       PRIMARY KEY(operation_id, dispatch_id)
     )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.callback_outbox(
       operation_id TEXT NOT NULL, callback_type TEXT NOT NULL, task_id TEXT NOT NULL,
-      accepted JSONB NOT NULL, result JSONB NOT NULL, created_at BIGINT NOT NULL, delivered_at BIGINT,
+      accepted JSONB NOT NULL, result JSONB, created_at BIGINT NOT NULL, delivered_at BIGINT,
       attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at BIGINT NOT NULL, claim_owner TEXT,
       claim_expires_at BIGINT, dead_lettered_at BIGINT, PRIMARY KEY(operation_id, callback_type)
     )`,
@@ -139,6 +142,17 @@ function schemaStatements(schema: string): string[] {
     `CREATE TABLE IF NOT EXISTS ${schema}.connection_owners(
       identity_key TEXT PRIMARY KEY, connection_id TEXT NOT NULL, connection_epoch BIGINT NOT NULL
     )`,
+    `ALTER TABLE ${schema}.terminal_evidence ALTER COLUMN result DROP NOT NULL`,
+    `ALTER TABLE ${schema}.callback_outbox ALTER COLUMN result DROP NOT NULL`,
+    `UPDATE ${schema}.terminal_evidence SET result=NULL WHERE result IS NOT NULL`,
+    `UPDATE ${schema}.callback_outbox SET result=NULL WHERE delivered_at IS NOT NULL AND result IS NOT NULL`,
+    `UPDATE ${schema}.callback_outbox SET result=NULL WHERE dead_lettered_at IS NOT NULL AND result IS NOT NULL`,
+    `UPDATE ${schema}.operations o SET terminal_result=NULL
+      WHERE terminal_result IS NOT NULL AND EXISTS (
+        SELECT 1 FROM ${schema}.callback_outbox c
+        WHERE c.operation_id=o.operation_id AND c.callback_type='terminal'
+          AND (c.delivered_at IS NOT NULL OR c.dead_lettered_at IS NOT NULL)
+      )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.local_stop_evidence(
       receipt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
       operation_id TEXT NOT NULL, message JSONB NOT NULL, received_at BIGINT NOT NULL
@@ -456,9 +470,9 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         };
         const at = now();
         await client.query(
-          `INSERT INTO ${schema}.terminal_evidence(operation_id, dispatch_id, result_hash, outcome, result, terminal_at)
-           VALUES ($1,$2,$3,'unknown',$4::jsonb,$5) ON CONFLICT (operation_id, dispatch_id) DO NOTHING`,
-          [message.payload.operationId, message.payload.dispatchId, resultHash, JSON.stringify(result), at],
+          `INSERT INTO ${schema}.terminal_evidence(operation_id, dispatch_id, result_hash, outcome, terminal_at)
+           VALUES ($1,$2,$3,'unknown',$4) ON CONFLICT (operation_id, dispatch_id) DO NOTHING`,
+          [message.payload.operationId, message.payload.dispatchId, resultHash, at],
         );
         await client.query(
           `INSERT INTO ${schema}.callback_outbox(operation_id, callback_type, task_id, accepted, result, created_at, next_attempt_at)
@@ -681,14 +695,13 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         };
         const at = now();
         await client.query(
-          `INSERT INTO ${schema}.terminal_evidence(operation_id, dispatch_id, result_hash, outcome, result, terminal_at)
-           VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,
+          `INSERT INTO ${schema}.terminal_evidence(operation_id, dispatch_id, result_hash, outcome, terminal_at)
+           VALUES ($1,$2,$3,$4,$5)`,
           [
             message.payload.operationId,
             message.payload.dispatchId,
             message.payload.resultHash,
             message.payload.outcome,
-            JSON.stringify(message),
             at,
           ],
         );
@@ -776,7 +789,6 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         dispatchId: String(row.dispatch_id),
         resultHash: String(row.result_hash),
         outcome: row.outcome as DesktopBrowserRelayTerminalEvidence["outcome"],
-        result: structuredClone(row.result) as HostResultMessage,
         terminalAt: Number(row.terminal_at),
       }));
     },
@@ -817,23 +829,36 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async releaseCallback(operationId, callbackType, owner, retryAt, deadLetter) {
       await ready;
-      const updated = await pool.query(
-        `UPDATE ${schema}.callback_outbox SET claim_owner=NULL, claim_expires_at=NULL, next_attempt_at=$4,
-           dead_lettered_at=CASE WHEN $5 THEN $6 ELSE dead_lettered_at END
-         WHERE operation_id=$1 AND callback_type=$2 AND claim_owner=$3`,
-        [operationId, callbackType, owner, retryAt, deadLetter, now()],
-      );
+      const updated = await runTransaction(async (client) => {
+        const result = await client.query(
+          `UPDATE ${schema}.callback_outbox SET claim_owner=NULL, claim_expires_at=NULL, next_attempt_at=$4,
+             dead_lettered_at=CASE WHEN $5 THEN $6 ELSE dead_lettered_at END,
+             result=CASE WHEN $5 THEN NULL ELSE result END
+           WHERE operation_id=$1 AND callback_type=$2 AND claim_owner=$3`,
+          [operationId, callbackType, owner, retryAt, deadLetter, now()],
+        );
+        if (deadLetter && (result.rowCount ?? 0) > 0) {
+          await client.query(`UPDATE ${schema}.operations SET terminal_result=NULL WHERE operation_id=$1`, [operationId]);
+        }
+        return result;
+      });
       if ((updated.rowCount ?? 0) !== 1) throw new Error("desktop browser Relay callback claim does not match");
     },
     async markCallbackDelivered(operationId, callbackType, owner) {
       await ready;
       const params: unknown[] = [operationId, callbackType, now()];
       const ownerClause = owner === undefined ? "" : ` AND claim_owner=$${params.push(owner)}`;
-      const updated = await pool.query(
-        `UPDATE ${schema}.callback_outbox SET delivered_at=$3, claim_owner=NULL, claim_expires_at=NULL
-         WHERE operation_id=$1 AND callback_type=$2 AND delivered_at IS NULL${ownerClause}`,
-        params,
-      );
+      const updated = await runTransaction(async (client) => {
+        const result = await client.query(
+          `UPDATE ${schema}.callback_outbox SET delivered_at=$3, claim_owner=NULL, claim_expires_at=NULL, result=NULL
+           WHERE operation_id=$1 AND callback_type=$2 AND delivered_at IS NULL${ownerClause}`,
+          params,
+        );
+        if ((result.rowCount ?? 0) > 0) {
+          await client.query(`UPDATE ${schema}.operations SET terminal_result=NULL WHERE operation_id=$1`, [operationId]);
+        }
+        return result;
+      });
       if ((updated.rowCount ?? 0) === 0 && owner !== undefined) {
         throw new Error("desktop browser Relay callback claim does not match");
       }

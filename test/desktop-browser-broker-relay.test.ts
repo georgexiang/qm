@@ -6,6 +6,7 @@ import {
   buildDesktopBrowserNavigateArgv,
   buildDesktopBrowserObserveArgv,
   computeDesktopBrowserRequestHash,
+  decodeDesktopBrowserMessage,
   encodeHostChallengeResponseSigningBytes,
   type HostAcceptedMessage,
   type HostChallengeResponseMessage,
@@ -680,7 +681,13 @@ test("Ticket 07 recovers a Host fence missing Relay Accepted Evidence as accepte
   assert.equal((await operationStore.acceptedEvidence()).length, 1);
   assert.equal((await operationStore.terminalEvidence()).length, 1);
   assert.equal((await operationStore.pendingCallbacks()).length, 1);
-  assert.equal(socket.sent.length, 2);
+  assert.equal(socket.sent.length, 3);
+  const resultAck = decodeDesktopBrowserMessage(socket.sent[2]!, "1.2");
+  assert.equal(resultAck.kind, "relay.result-ack");
+  if (resultAck.kind === "relay.result-ack") {
+    assert.equal(resultAck.payload.operationId, desktopBrowserSessionStartCompletedResultFixture.payload.operationId);
+    assert.equal(resultAck.payload.resultHash, desktopBrowserSessionStartCompletedResultFixture.payload.resultHash);
+  }
 });
 
 test("Ticket 07 persists accepted disconnect as unknown terminal evidence before resolving", async () => {
@@ -700,7 +707,52 @@ test("Ticket 07 persists accepted disconnect as unknown terminal evidence before
 
   assert.equal((await pending).kind, "accepted_unknown");
   assert.equal((await operationStore.terminalEvidence()).at(-1)?.outcome, "unknown");
-  assert.equal((await operationStore.pendingCallbacks()).at(-1)?.result.payload.outcome, "unknown");
+  assert.equal((await operationStore.pendingCallbacks()).at(-1)?.result?.payload.outcome, "unknown");
+});
+
+test("Ticket 16 Relay prepare commit failure rejects before WSS delivery", async () => {
+  const durable = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const operationStore: DesktopBrowserRelayOperationStore = {
+    ...durable,
+    async prepare() {
+      throw new Error("prepare storage unavailable");
+    },
+  };
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const sentBeforeDispatch = socket.sent.length;
+  await assert.rejects(
+    service.dispatchInvocation({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-a",
+      browserInstanceId: "browser-primary",
+      invocation: desktopBrowserRelayInvocationFixture,
+    }),
+    /prepare storage unavailable/,
+  );
+  assert.equal(socket.sent.length, sentBeforeDispatch);
+});
+
+test("Ticket 16 Relay accepted commit failure settles without redelivery", async () => {
+  const durable = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
+  const operationStore: DesktopBrowserRelayOperationStore = {
+    ...durable,
+    async recordAccepted() {
+      throw new Error("accepted storage unavailable");
+    },
+  };
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ operationStore });
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation: desktopBrowserRelayInvocationFixture,
+  });
+  await flushMessages();
+  socket.message(JSON.stringify(desktopBrowserSessionStartAcceptedFixture));
+
+  assert.equal((await pending).kind, "accepted_unknown");
+  assert.equal(socket.closeCode, 1008);
+  assert.equal(socket.sent.length, 2);
 });
 
 test("Ticket 07 terminal persistence failure settles the dispatch as accepted unknown", async () => {

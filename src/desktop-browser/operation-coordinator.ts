@@ -298,11 +298,22 @@ export function createDesktopBrowserOperationCoordinator(options: {
           authority: prepared.operation.authority,
         },
       };
-      const dispatched = await options.dispatcher.dispatch({
-        publicDeviceFingerprint: prepared.operation.authority.deviceId,
-        browserInstanceId: prepared.operation.authority.browserInstanceId,
-        invocation,
-      });
+      let dispatched: DesktopBrowserRelayDispatchResult;
+      try {
+        dispatched = await options.dispatcher.dispatch({
+          publicDeviceFingerprint: prepared.operation.authority.deviceId,
+          browserInstanceId: prepared.operation.authority.browserInstanceId,
+          invocation,
+        });
+      } catch {
+        const marked = await options.tasks.markOperationDeliveryUnknown(
+          task.id,
+          prepared.operation.authority.operationId,
+        );
+        if (marked.status === "refused") return marked;
+        if (marked.task.status === "canceled_with_unknown_effects") await options.quarantineDevice?.(task.id);
+        return { status: "refused", reason: "Desktop Browser Relay request outcome is unknown" };
+      }
       if (dispatched.kind === "not_accepted_or_unknown") {
         const marked = await options.tasks.markOperationDeliveryUnknown(
           task.id,

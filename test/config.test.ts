@@ -43,6 +43,59 @@ test("store kinds default to memory and accept postgres", () => {
   );
 });
 
+test("Desktop Browser Relay directions require distinct strong credentials", () => {
+  const coreToRelay = "core-to-relay-secret-0123456789abcdef";
+  const relayToCore = "relay-to-core-secret-0123456789abcdef";
+  const config = loadConfig({
+    QM_DESKTOP_BROWSER_RELAY_URL: "https://relay.example.test",
+    QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET: coreToRelay,
+    QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET: relayToCore,
+  });
+  assert.equal(config.desktopBrowserRelayAuthSecret, coreToRelay);
+  assert.equal(config.desktopBrowserRelaySourceAuthSecret, relayToCore);
+  assert.throws(
+    () =>
+      loadConfig({
+        QM_DESKTOP_BROWSER_RELAY_URL: "https://relay.example.test",
+        QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET: coreToRelay,
+        QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET: coreToRelay,
+      }),
+    /must be different/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        CORE_SIGNING_SECRET: "generic-core-signing-secret-000000000001",
+        QM_DESKTOP_BROWSER_RELAY_URL: "https://relay.example.test",
+        QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET: "core-to-relay-secret-0000000000000001",
+        QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET: "generic-core-signing-secret-000000000001",
+      }),
+    /must differ from CORE_SIGNING_SECRET/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        CORE_SIGNING_SECRET: "generic-core-signing-secret-000000000001",
+        QM_DESKTOP_BROWSER_RELAY_URL: "https://relay.example.test",
+        QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET: "generic-core-signing-secret-000000000001",
+        QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET: relayToCore,
+      }),
+    /must differ from CORE_SIGNING_SECRET/,
+  );
+  assert.throws(
+    () => loadConfig({ QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET: "short" }),
+    /must be configured together/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        QM_DESKTOP_BROWSER_RELAY_URL: "https://relay.example.test",
+        QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET: coreToRelay,
+      }),
+    /must be configured together/,
+  );
+});
+
 test("production and unauthenticated-core escape hatch are parsed once", () => {
   assert.throws(() => loadConfig({ NODE_ENV: "production" }), /missing or insecure required core secrets/);
   assert.equal(loadConfig(productionEnv).production, true);

@@ -91,6 +91,7 @@ export interface Config {
   publicWebUrl?: string;
   desktopBrowserRelayUrl?: string;
   desktopBrowserRelayAuthSecret?: string;
+  desktopBrowserRelaySourceAuthSecret?: string;
   flyAppName?: string;
   slack?: SlackPluginConfig;
   runStore: "memory" | "postgres";
@@ -727,13 +728,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const slack = slackPluginConfigFromEnv(env);
   const desktopBrowserRelayUrl = env.QM_DESKTOP_BROWSER_RELAY_URL?.replace(/\/$/, "");
   const desktopBrowserRelayAuthSecret = env.QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET;
-  if (Boolean(desktopBrowserRelayUrl) !== Boolean(desktopBrowserRelayAuthSecret)) {
+  const desktopBrowserRelaySourceAuthSecret = env.QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET;
+  if (
+    new Set([
+      Boolean(desktopBrowserRelayUrl),
+      Boolean(desktopBrowserRelayAuthSecret),
+      Boolean(desktopBrowserRelaySourceAuthSecret),
+    ]).size !== 1
+  ) {
     throw new Error(
-      "QM_DESKTOP_BROWSER_RELAY_URL and QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET must be configured together",
+      "QM_DESKTOP_BROWSER_RELAY_URL, QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET, and QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET must be configured together",
     );
   }
   if (desktopBrowserRelayAuthSecret && desktopBrowserRelayAuthSecret.length < 32) {
     throw new Error("QM_DESKTOP_BROWSER_RELAY_AUTH_SECRET must be at least 32 characters");
+  }
+  if (desktopBrowserRelaySourceAuthSecret && desktopBrowserRelaySourceAuthSecret.length < 32) {
+    throw new Error("QM_DESKTOP_BROWSER_RELAY_SOURCE_AUTH_SECRET must be at least 32 characters");
+  }
+  if (
+    desktopBrowserRelayAuthSecret &&
+    desktopBrowserRelaySourceAuthSecret &&
+    desktopBrowserRelayAuthSecret === desktopBrowserRelaySourceAuthSecret
+  ) {
+    throw new Error("Desktop Browser Core-to-Relay and Relay-to-Core secrets must be different");
+  }
+  if (desktopBrowserRelaySourceAuthSecret && desktopBrowserRelaySourceAuthSecret === env.CORE_SIGNING_SECRET) {
+    throw new Error("Desktop Browser Relay-to-Core secret must differ from CORE_SIGNING_SECRET");
+  }
+  if (desktopBrowserRelayAuthSecret && desktopBrowserRelayAuthSecret === env.CORE_SIGNING_SECRET) {
+    throw new Error("Desktop Browser Core-to-Relay secret must differ from CORE_SIGNING_SECRET");
   }
   return {
     production: env.NODE_ENV === "production",
@@ -845,6 +869,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.PUBLIC_WEB_URL ? { publicWebUrl: env.PUBLIC_WEB_URL } : {}),
     ...(desktopBrowserRelayUrl ? { desktopBrowserRelayUrl } : {}),
     ...(desktopBrowserRelayAuthSecret ? { desktopBrowserRelayAuthSecret } : {}),
+    ...(desktopBrowserRelaySourceAuthSecret ? { desktopBrowserRelaySourceAuthSecret } : {}),
     ...(env.FLY_APP_NAME ? { flyAppName: env.FLY_APP_NAME } : {}),
     ...(slack ? { slack } : {}),
     runStore,

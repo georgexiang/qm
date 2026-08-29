@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   DESKTOP_BROWSER_TICKET_05_PROTOCOL_VERSION,
+  DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
   computeDesktopBrowserRequestHash,
   computeDesktopBrowserPublicDeviceFingerprint,
   decodeDesktopBrowserMessage,
@@ -755,7 +756,7 @@ export class DesktopBrowserRelayService {
       connectionId: connection.connectionId,
       publicDeviceFingerprint: computeDesktopBrowserPublicDeviceFingerprint(
         projectDesktopBrowserPublicIdentity({
-          registrationProtocolVersion: connection.negotiatedProtocolVersion!,
+          registrationProtocolVersion: DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
           deploymentCanonicalId: this.options.deploymentCanonicalId,
           registrationId: connection.connectionId,
           actorId: "projection",
@@ -1008,6 +1009,9 @@ export class DesktopBrowserRelayService {
     if (message.kind === "relay.local-stop-ack") {
       throw new Error("unexpected relay.local-stop-ack frame from host");
     }
+    if (message.kind === "relay.result-ack") {
+      throw new Error("unexpected relay.result-ack frame from host");
+    }
     if (message.kind === "relay.device-reconcile-ack") {
       throw new Error("unexpected relay.device-reconcile-ack frame from host");
     }
@@ -1148,6 +1152,13 @@ export class DesktopBrowserRelayService {
         if (this.operationStore) {
           try {
             await this.operationStore.recordTerminal(message);
+            connection.socket.send(
+              encodeDesktopBrowserMessage({
+                protocolVersion: message.protocolVersion,
+                kind: "relay.result-ack",
+                payload: { operationId: message.payload.operationId, resultHash: message.payload.resultHash },
+              }),
+            );
             return;
           } catch {
             throw new Error("host.result dispatch does not match a durable Relay operation");
@@ -1185,6 +1196,15 @@ export class DesktopBrowserRelayService {
         throw new Error("host.result operation does not match the accepted invocation");
       }
       if (this.operationStore) await this.operationStore.recordTerminal(message);
+      if (this.operationStore) {
+        connection.socket.send(
+          encodeDesktopBrowserMessage({
+            protocolVersion: message.protocolVersion,
+            kind: "relay.result-ack",
+            payload: { operationId: message.payload.operationId, resultHash: message.payload.resultHash },
+          }),
+        );
+      }
       connection.pendingDispatch = null;
       pending.settle();
       this.options.clock.clearTimeout(pending.timeout);

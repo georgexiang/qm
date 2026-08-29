@@ -41,6 +41,15 @@ test("Ticket 11 round-trips sanitized Local Stop Receipt delivery and acknowledg
     acknowledgement,
   );
   assert.doesNotMatch(JSON.stringify(receipt), /actor|goal|url|page|devicePublicKey/iu);
+  const terminalAcknowledgement = {
+    protocolVersion: "1.3",
+    kind: "relay.result-ack",
+    payload: { operationId: "operation-1", resultHash: "sha256:result-1" },
+  } as const satisfies DesktopBrowserMessage;
+  assert.deepEqual(
+    decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(terminalAcknowledgement), "1.3", "1.0"),
+    terminalAcknowledgement,
+  );
 });
 
 test("Ticket 13 round-trips Task-bound artifact intent, grant, and terminal metadata", () => {
@@ -270,6 +279,7 @@ test("Core publishes one schema for every Phase F message kind", () => {
     "relay.device-reconcile-ack",
     "relay.invoke",
     "relay.local-stop-ack",
+    "relay.result-ack",
   ]);
 });
 

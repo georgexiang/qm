@@ -14,6 +14,7 @@ import {
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
 import WebSocket from "ws";
+import pg from "pg";
 import {
   DesktopBrowserRelayService,
   type DesktopBrowserRelayBinding,
@@ -45,7 +46,10 @@ import {
   desktopBrowserSessionStartCompletedResultFixture,
 } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
-import { createPostgresDesktopBrowserRelayOperationStore } from "../packages/qm-broker-relay/src/operation-postgres.ts";
+import {
+  createPostgresDesktopBrowserRelayOperationStore,
+  migratePostgresDesktopBrowserRelayOperationStore,
+} from "../packages/qm-broker-relay/src/operation-postgres.ts";
 
 const POSTGRES_URL = process.env.DATABASE_URL;
 const postgresSkip = POSTGRES_URL ? false : "set DATABASE_URL to run Relay PostgreSQL ownership tests";
@@ -60,6 +64,11 @@ class Probe implements DesktopBrowserRelayReadinessProbe {
 
 test("Ticket 14 PostgreSQL owner claims have one monotonic concurrent winner", { skip: postgresSkip }, async () => {
   const schema = `desktop_relay_test_${process.pid}_${Date.now()}`;
+  await migratePostgresDesktopBrowserRelayOperationStore({
+    connectionString: POSTGRES_URL!,
+    schema,
+    runtimeRole: "postgres",
+  });
   const store = createPostgresDesktopBrowserRelayOperationStore({ connectionString: POSTGRES_URL!, schema });
   try {
     await store.check();
@@ -110,6 +119,61 @@ test("Ticket 14 PostgreSQL owner claims have one monotonic concurrent winner", {
     assert.equal((await store.connectionOwner({ devicePublicKey: "device-1", brokerInstanceId: "broker-1" }))?.connectionEpoch, 8);
   } finally {
     await store.close();
+  }
+});
+
+test("Ticket 16 Relay migration scrubs historical delivered browser payloads", { skip: postgresSkip }, async () => {
+  const schema = `desktop_relay_scrub_test_${process.pid}_${Date.now()}`;
+  const migration = {
+    connectionString: POSTGRES_URL!,
+    schema,
+    runtimeRole: "postgres",
+  };
+  await migratePostgresDesktopBrowserRelayOperationStore(migration);
+  const pool = new pg.Pool({ connectionString: POSTGRES_URL! });
+  try {
+    await pool.query(
+      `INSERT INTO ${schema}.operations(
+        operation_id, attempt_id, task_id, protocol_version, operation_sequence,
+        lease_version, lease_id, request_hash, state, terminal_result,
+        device_id, browser_instance_id, effect_class
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      ["op-scrub", "attempt-scrub", "task-scrub", "1.2", 1, 1, "lease-scrub", "request-hash", "completed", { text: "secret observation" }, "device-scrub", "browser-primary", "browser_observation"],
+    );
+    await pool.query(
+      `INSERT INTO ${schema}.terminal_evidence(
+        operation_id, dispatch_id, result_hash, outcome, result, terminal_at
+      ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      ["op-scrub", "dispatch-scrub", "result-hash", "completed", { text: "secret observation" }, 2],
+    );
+    await pool.query(
+      `INSERT INTO ${schema}.callback_outbox(
+        operation_id, callback_type, task_id, accepted, result, created_at, delivered_at, next_attempt_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ["op-scrub", "terminal", "task-scrub", {}, { text: "secret observation" }, 2, 3, 2],
+    );
+
+    await migratePostgresDesktopBrowserRelayOperationStore(migration);
+
+    const rows = await pool.query(
+      `SELECT o.terminal_result, e.result AS evidence_result, c.result AS callback_result,
+              e.result_hash, c.delivered_at
+       FROM ${schema}.operations o
+       JOIN ${schema}.terminal_evidence e USING (operation_id)
+       JOIN ${schema}.callback_outbox c USING (operation_id)`,
+    );
+    assert.deepEqual(rows.rows, [
+      {
+        terminal_result: null,
+        evidence_result: null,
+        callback_result: null,
+        result_hash: "result-hash",
+        delivered_at: "3",
+      },
+    ]);
+  } finally {
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await pool.end();
   }
 });
 
@@ -747,7 +811,8 @@ test("Ticket 11 Local Stop callback remains replayable after a prolonged Core ou
 
 test("Relay callback worker continues past poison entries and dead-letters after 24 hours", async () => {
   let now = 0;
-  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+  const backing = createMemoryDesktopBrowserRelayOperationBacking();
+  const store = createDesktopBrowserRelayOperationStore(backing, {
     now: () => now,
   });
   const prepareTerminal = async (suffix: string) => {
@@ -824,6 +889,9 @@ test("Relay callback worker continues past poison entries and dead-letters after
     (await store.deadLetters()).map((entry) => entry.taskId),
     ["task-poison"],
   );
+  const deadLetter = (await store.deadLetters())[0]!;
+  assert.equal(deadLetter.result, undefined);
+  assert.equal((await backing.snapshot()).operations["operation-poison"]?.terminalResult, undefined);
 });
 
 test("Relay shutdown returns at the configured deadline when cleanup stalls", async () => {
@@ -957,6 +1025,25 @@ test("relay process requires its own durable database and validates the isolated
   assert.throws(
     () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_DATABASE_SCHEMA: "public;drop" })),
     /QM_RELAY_DATABASE_SCHEMA/,
+  );
+  for (const coreApiUrl of [
+    "http://core.example.test",
+    "https://user:secret@core.example.test",
+    "https://core.example.test/base",
+    "https://core.example.test?other=1",
+    "https://core.example.test#fragment",
+  ]) {
+    assert.throws(
+      () => loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_CORE_API_URL: coreApiUrl })),
+      /QM_RELAY_CORE_API_URL/,
+    );
+  }
+  assert.throws(
+    () =>
+      loadDesktopBrowserRelayConfig(
+        relayProcessEnv({ QM_RELAY_CORE_AUTH_SECRET: relayProcessEnv().QM_RELAY_SOURCE_AUTH_SECRET }),
+      ),
+    /must differ/,
   );
   assert.equal(
     loadDesktopBrowserRelayConfig(relayProcessEnv({ QM_RELAY_DATABASE_SCHEMA: "desktop_relay" })).databaseSchema,

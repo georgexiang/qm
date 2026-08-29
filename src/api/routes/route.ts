@@ -28,7 +28,7 @@ export interface ApiCtx extends BaseCtx {
   actor?: PortalIdentity | null;
 }
 
-export type RouteAuth = "either" | "source" | "public" | { aud: string };
+export type RouteAuth = "either" | "source" | "relay" | "public" | { aud: string };
 
 export type Route<C extends BaseCtx = ApiCtx> = {
   handle: (ctx: C) => void | Promise<void>;

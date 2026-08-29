@@ -57,6 +57,7 @@ export interface ServerDeps {
   production?: boolean;
   allowUnauthenticatedCore?: boolean;
   signingSecret?: string;
+  desktopBrowserRelaySourceAuthSecret?: string;
   capabilitySecret?: string;
   portalIdentitySecret?: string;
   requireSignedPortalIdentity?: boolean;

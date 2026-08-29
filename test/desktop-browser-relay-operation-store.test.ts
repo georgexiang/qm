@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { computeDesktopBrowserRequestHash } from "qm-desktop-browser-contracts";
+import { buildDesktopBrowserObserveArgv, computeDesktopBrowserRequestHash } from "qm-desktop-browser-contracts";
 import {
   canonicalRelayJson,
   createMemoryDesktopBrowserRelayOperationBacking,
@@ -159,7 +159,6 @@ test("Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal
       dispatchId: desktopBrowserSessionStartCompletedResultFixture.payload.dispatchId,
       resultHash: desktopBrowserSessionStartCompletedResultFixture.payload.resultHash,
       outcome: "completed",
-      result: desktopBrowserSessionStartCompletedResultFixture,
       terminalAt: 2_000,
     },
   ]);
@@ -242,7 +241,68 @@ test("Ticket 07 terminalizes accepted disconnect as unknown with evidence and ca
     "accepted_unknown",
   );
   assert.equal((await store.terminalEvidence()).at(-1)?.outcome, "unknown");
-  assert.equal((await store.pendingCallbacks()).at(-1)?.result.payload.outcome, "unknown");
+  assert.equal((await store.pendingCallbacks()).at(-1)?.result?.payload.outcome, "unknown");
+});
+
+test("Ticket 16 Relay scrubs delivered observation text while retaining terminal metadata", async () => {
+  const store = createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking(), {
+    now: () => 5_000,
+  });
+  const authority = {
+    ...desktopBrowserRelayInvocationFixture.payload.authority,
+    operationId: "operation-observation-scrub",
+    operationSequence: 2,
+    leaseVersion: 4,
+    capabilitySet: { ...desktopBrowserRelayInvocationFixture.payload.authority.capabilitySet, protocolVersion: "1.3" as const },
+    argv: buildDesktopBrowserObserveArgv("session-1"),
+    effectClass: "observation" as const,
+  };
+  const invocation = {
+    protocolVersion: "1.3" as const,
+    kind: "relay.invoke" as const,
+    payload: {
+      dispatchId: "dispatch-observation-scrub",
+      requestHash: computeDesktopBrowserRequestHash(authority, "1.3"),
+      authority,
+    },
+  };
+  const accepted = {
+    protocolVersion: "1.3" as const,
+    kind: "host.accepted" as const,
+    payload: {
+      dispatchId: invocation.payload.dispatchId,
+      operationId: authority.operationId,
+      requestHash: invocation.payload.requestHash,
+    },
+  };
+  const result = {
+    protocolVersion: "1.3" as const,
+    kind: "host.result" as const,
+    payload: {
+      dispatchId: invocation.payload.dispatchId,
+      operationId: authority.operationId,
+      outcome: "completed" as const,
+      resultHash: "sha256:observation-scrub",
+      result: {
+        schemaVersion: "1.0" as const,
+        command: "observe" as const,
+        completedAt: "2026-08-29T12:00:00.000Z",
+        data: { tab_id: 7, text: "private observed page text", ref_count: 1, truncated: false },
+      },
+    },
+  };
+  await store.prepare(invocation);
+  await store.markDeliveryStarted(authority.attemptId, invocation.payload.dispatchId);
+  await store.recordAccepted(accepted);
+  await store.recordTerminal(result);
+  assert.doesNotMatch(JSON.stringify(await store.terminalEvidence()), /private observed page text/);
+  assert.match(JSON.stringify(await store.pendingCallbacks()), /private observed page text/);
+
+  await store.markCallbackDelivered(authority.operationId, "terminal");
+
+  assert.doesNotMatch(JSON.stringify(await store.terminalEvidence()), /private observed page text/);
+  assert.doesNotMatch(JSON.stringify(await store.attemptStatus(authority.attemptId)), /private observed page text/);
+  assert.deepEqual(await store.pendingCallbacks(), []);
 });
 
 test("Ticket 07 keeps the first terminal fact when disconnect races a real result", async () => {

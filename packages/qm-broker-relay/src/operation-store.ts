@@ -32,7 +32,6 @@ export interface DesktopBrowserRelayTerminalEvidence {
   dispatchId: string;
   resultHash: string;
   outcome: "completed" | "failed" | "unknown";
-  result: HostResultMessage;
   terminalAt: number;
 }
 
@@ -41,7 +40,7 @@ export interface DesktopBrowserRelayCallbackOutboxEntry {
   operationId: string;
   callbackType: "terminal";
   accepted: HostAcceptedMessage;
-  result: HostResultMessage;
+  result?: HostResultMessage;
   createdAt: number;
   deliveredAt: number | null;
   attempts: number;
@@ -476,7 +475,6 @@ export function createDesktopBrowserRelayOperationStore(
             dispatchId: message.payload.dispatchId,
             resultHash,
             outcome: "unknown",
-            result,
             terminalAt: now(),
           });
         }
@@ -652,7 +650,10 @@ export function createDesktopBrowserRelayOperationStore(
           (entry) =>
             entry.operationId === message.payload.operationId && entry.dispatchId === message.payload.dispatchId,
         );
-        if (existingEvidence && canonicalRelayJson(existingEvidence.result) !== canonicalRelayJson(message)) {
+        if (
+          existingEvidence &&
+          (existingEvidence.resultHash !== message.payload.resultHash || existingEvidence.outcome !== message.payload.outcome)
+        ) {
           throw new Error("desktop browser Relay terminal result conflicts with persisted evidence");
         }
         if (!existingEvidence) {
@@ -661,7 +662,6 @@ export function createDesktopBrowserRelayOperationStore(
             dispatchId: message.payload.dispatchId,
             resultHash: message.payload.resultHash,
             outcome: message.payload.outcome,
-            result: copy(message),
             terminalAt: now(),
           });
         }
@@ -790,7 +790,12 @@ export function createDesktopBrowserRelayOperationStore(
         entry.claimOwner = null;
         entry.claimExpiresAt = null;
         entry.nextAttemptAt = retryAt;
-        if (deadLetter) entry.deadLetteredAt = now();
+        if (deadLetter) {
+          entry.deadLetteredAt = now();
+          const operation = state.operations[operationId];
+          if (operation) delete operation.terminalResult;
+          delete entry.result;
+        }
       });
     },
     async markCallbackDelivered(operationId, callbackType, owner) {
@@ -805,6 +810,9 @@ export function createDesktopBrowserRelayOperationStore(
         if (entry.deliveredAt === null) entry.deliveredAt = now();
         entry.claimOwner = null;
         entry.claimExpiresAt = null;
+        const operation = state.operations[operationId];
+        if (operation) delete operation.terminalResult;
+        delete entry.result;
       });
     },
   };

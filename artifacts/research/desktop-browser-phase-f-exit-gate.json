@@ -1,0 +1,186 @@
+{
+  "schemaVersion": 1,
+  "status": "ready-for-macos-validation",
+  "sourceCommit": "26c498174d106f9da04e581db23307aa9da26b48",
+  "acceptance": {
+    "vertical_product_seam": {
+      "tests": [
+        "Ticket 16 explicit WebUI Turn reaches a visible window, sanitized observation, cleanup, and durable Core outcome"
+      ]
+    },
+    "pinned_macos_chrome_edge": {
+      "tests": [
+        "Ticket 15 builds and installs a deterministic pinned user-local macOS bundle",
+        "Ticket 10 Chrome and Edge launch the same unpacked Companion"
+      ],
+      "workflowSteps": [
+        "Build pinned Phase F bundle",
+        "Run installed Relay-to-Host seam in Chrome and Edge"
+      ]
+    },
+    "fault_matrix": {
+      "tests": [
+        "Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal state, and callback outbox",
+        "Ticket 07 terminalizes accepted disconnect as unknown with evidence and callback in one transaction"
+      ]
+    },
+    "no_duplicate_effect": {
+      "tests": [
+        "Ticket 07 restart never redelivers an effectful operation after wire delivery started",
+        "a durable operation fence prevents duplicate and mismatched session-start spawns after restart"
+      ]
+    },
+    "observation_retry": {
+      "tests": [
+        "Ticket 06 never retries unknown navigate and retries lost observation once with a new identity",
+        "Ticket 16 observation request failure permits one new operation identity"
+      ]
+    },
+    "authorization_and_local_control": {
+      "tests": [
+        "desktop browser routing stays explicit and current Project authorization fails closed",
+        "Ticket 09 coordinator refuses device_busy before creating an Attempt",
+        "Ticket 10 stale Stop nonce cannot stop a newer Task or persist the wrong receipt",
+        "Ticket 11 concurrent Local Stop Receipt and Core finalization preserve one terminal outcome",
+        "Ticket 12 quarantine preserves exclusivity and requires local reconciliation when ownership is lost"
+      ]
+    },
+    "artifact_trust_chain": {
+      "tests": [
+        "Ticket 13 redeems one short-lived grant into a Task-bound FileArtifact",
+        "Ticket 13 keeps failed artifact uploads invisible",
+        "Ticket 13 allows only one concurrent redemption winner"
+      ]
+    },
+    "affected_regressions": {
+      "tests": [
+        "Ticket 16 Phase F exit gate maps every accepted seam, fault boundary, and ADR to executable evidence"
+      ],
+      "workflowSteps": [
+        "Run Phase F repository gates"
+      ]
+    },
+    "contracts_and_pinned_artifacts": {
+      "tests": [
+        "customer-side consumers round-trip every Phase F fixture through the public contract",
+        "Ticket 10 unpacked Companion has one fixed Chrome and Edge identity without browser-content permissions",
+        "Ticket 15 checked-in provenance matches the pinned Host source artifact"
+      ],
+      "workflowSteps": [
+        "Run Phase F repository gates"
+      ]
+    },
+    "independent_reviews": {
+      "tests": [
+        "Ticket 16 Phase F exit gate maps every accepted seam, fault boundary, and ADR to executable evidence"
+      ]
+    },
+    "adr_alignment": {
+      "tests": [
+        "Ticket 06 policy grammar accepts only the four Phase F commands without rewriting argv",
+        "Ticket 07 persists one checkpoint, append-only evidence, scrubbed terminal state, and callback outbox"
+      ]
+    }
+  },
+  "faults": {
+    "core_to_relay_request": {
+      "tests": [
+        "Ticket 16 Core-to-Relay request failure leaves the operation recoverable"
+      ]
+    },
+    "relay_prepare_commit": {
+      "tests": [
+        "Ticket 16 Relay prepare commit failure rejects before WSS delivery"
+      ]
+    },
+    "relay_accept_commit": {
+      "tests": [
+        "Ticket 16 Relay accepted commit failure settles without redelivery"
+      ]
+    },
+    "relay_terminal_commit": {
+      "tests": [
+        "Ticket 07 terminal persistence failure settles the dispatch as accepted unknown"
+      ]
+    },
+    "wss_delivery": {
+      "tests": [
+        "relay returns not_accepted_or_unknown when a session-start dispatch times out before host.accepted",
+        "relay returns accepted_unknown when a session-start dispatch loses its socket after host.accepted"
+      ]
+    },
+    "host_fence": {
+      "tests": [
+        "Ticket 16 Host fence creation failure rejects before acceptance or spawn"
+      ]
+    },
+    "process_spawn": {
+      "tests": [
+        "explicit spawn rejection after acceptance persists failed and replays without respawn"
+      ]
+    },
+    "host_result": {
+      "tests": [
+        "Host result requires prior acceptance while accepted unknown remains distinct without creating another operation"
+      ]
+    },
+    "callback_delivery": {
+      "tests": [
+        "Relay callback worker retains failures and acknowledges one signed terminal delivery"
+      ]
+    },
+    "core_terminal_cas": {
+      "tests": [
+        "Ticket 11 concurrent Local Stop Receipt and Core finalization preserve one terminal outcome"
+      ]
+    },
+    "stop": {
+      "tests": [
+        "Ticket 10 concurrent Stop requests cancel one operation exactly once"
+      ]
+    },
+    "restart_recovery": {
+      "tests": [
+        "Ticket 11 Core restart queries Relay for each nonterminal Attempt without rerunning work",
+        "Ticket 16 restart terminalizes WSS-started work without Accepted Evidence"
+      ]
+    }
+  },
+  "adrs": {
+    "0001": {
+      "status": "accepted",
+      "file": "0001-desktop-browser-replaces-local-browser-control.md",
+      "title": "Desktop Browser replaces Local Browser Control"
+    },
+    "0002": {
+      "status": "accepted",
+      "file": "0002-core-authority-with-independent-broker-relay.md",
+      "title": "Core authority with independent Broker Relay"
+    },
+    "0003": {
+      "status": "proposed",
+      "file": "0003-full-bsk-argv-passthrough.md",
+      "title": "Full bsk argv passthrough"
+    },
+    "0004": {
+      "status": "accepted",
+      "file": "0004-deployment-shared-browser-principal.md",
+      "title": "Deployment-shared Browser Principal"
+    },
+    "0005": {
+      "status": "accepted",
+      "file": "0005-current-checkpoint-with-operation-receipts.md",
+      "title": "Current checkpoint with append-only operation evidence"
+    }
+  },
+  "reviews": {
+    "security": {
+      "status": "approved",
+      "file": "desktop-browser-phase-f-security-review.json"
+    },
+    "code": {
+      "status": "approved",
+      "file": "desktop-browser-phase-f-code-review.json"
+    }
+  }
+}

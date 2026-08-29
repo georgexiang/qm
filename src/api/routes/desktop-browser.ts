@@ -301,24 +301,24 @@ export const desktopBrowserRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
 ];
 
 export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/desktop-browser/relay/artifact-grants", auth: "source", handle: issueArtifactGrant },
-  { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "source", handle: relayReady },
+  { method: "POST", path: "/v1/desktop-browser/relay/artifact-grants", auth: "relay", handle: issueArtifactGrant },
+  { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "relay", handle: relayReady },
   {
     method: "POST",
     path: "/v1/desktop-browser/relay/callbacks/terminal",
-    auth: "source",
+    auth: "relay",
     handle: consumeRelayTerminalCallback,
   },
   {
     method: "POST",
     path: "/v1/desktop-browser/relay/callbacks/local-stop",
-    auth: "source",
+    auth: "relay",
     handle: consumeLocalStopCallback,
   },
   {
     method: "POST",
     path: "/v1/desktop-browser/relay/device-reconciliations",
-    auth: "source",
+    auth: "relay",
     handle: reconcileRelayDevice,
   },
   { method: "POST", path: "/v1/desktop-browser/tasks/:id/actions", auth: "source", handle: taskAction },
@@ -349,19 +349,19 @@ export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
   {
     method: "POST",
     path: "/v1/desktop-browser/relay/bindings/resolve",
-    auth: "source",
+    auth: "relay",
     handle: resolveRelayBinding,
   },
   {
     method: "PUT",
     path: "/v1/desktop-browser/relay/connections/:id",
-    auth: "source",
+    auth: "relay",
     handle: publishRelayConnection,
   },
   {
     method: "DELETE",
     path: "/v1/desktop-browser/relay/connections/:id",
-    auth: "source",
+    auth: "relay",
     handle: clearRelayConnection,
   },
 ];

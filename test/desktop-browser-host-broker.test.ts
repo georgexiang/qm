@@ -24,6 +24,7 @@ import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_RELAY_AUDIENCE,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
+  DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
   DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
   buildDesktopBrowserNavigateArgv,
   buildDesktopBrowserObserveArgv,
@@ -52,12 +53,7 @@ import {
   createMemoryDesktopBrowserRelayOperationBacking,
 } from "../packages/qm-broker-relay/src/operation-store.ts";
 import { desktopBrowserRegistrationReservationTupleFixture } from "../packages/desktop-browser-contracts/src/fixtures.ts";
-import { createDesktopBrowserTaskStore, type DesktopBrowserTask } from "../src/desktop-browser/browser-task-store.ts";
-import { createDesktopBrowserOperationCoordinator } from "../src/desktop-browser/operation-coordinator.ts";
 import { projectDesktopBrowserTaskActivity } from "../src/desktop-browser/task-activity.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createAuditLog } from "../src/audit/audit-log.ts";
-import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
 import { createPiTools, type ToolContextRef } from "../src/harness/pi-tools.ts";
 import {
   HOST_BROKER_CONTROL_NOTICE,
@@ -87,6 +83,11 @@ import {
   listHostBrokerLocalStopReceipts,
   type HostBrokerLocalControl,
 } from "../packages/qm-host-broker/src/companion-control.ts";
+import { buildApp } from "../src/wiring.ts";
+import { createServer } from "../src/api/server.ts";
+import { signedRequestHeaders } from "../src/auth/source-auth-sign.ts";
+import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
+import { testConfig } from "./support/test-config.ts";
 
 class FakeSocket implements HostBrokerSocket {
   private readonly listeners = new Map<string, Array<(event?: unknown) => void>>();
@@ -679,7 +680,6 @@ test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered out
           reached: "load",
           url: "https://example.test/?token=secret",
           error_text: "Authorization: Bearer secret",
-          future_field: "must-not-leave-host",
         }),
         stderr: "",
       };
@@ -867,6 +867,84 @@ test("Ticket 06 runs and cleans up the Task-owned session with Host-filtered out
   assert.deepEqual(spawnArgv, [startAuthority.argv, navigateAuthority.argv, observeAuthority.argv, stopAuthority.argv]);
 });
 
+test("Ticket 16 Host fails closed on an unknown BrowserSkill output key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-unknown-output-key-"));
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    sessionRunner: {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            session_id: "session-unknown-key",
+            browser_instance_id: "browser-primary",
+            agent_window_id: 42,
+            future_secret: "must-not-leave-host",
+          }),
+          stderr: "",
+        };
+      },
+    },
+  });
+  const authority = sessionStartAuthority("operation-unknown-output-key");
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-unknown-output-key",
+        requestHash: computeDesktopBrowserRequestHash(authority),
+        authority,
+      },
+    }),
+  );
+  const encoded = await waitFor(() => socket.sent[3], "unknown output terminal result");
+  const result = decodeDesktopBrowserMessage(encoded, "1.2");
+  assert.equal(result.kind, "host.result");
+  if (result.kind === "host.result") assert.equal(result.payload.outcome, "unknown");
+  assert.doesNotMatch(encoded, /future_secret|must-not-leave-host/);
+  socket.close(1000, "done");
+  await running;
+});
+
+test("Ticket 16 Host fence creation failure rejects before acceptance or spawn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "host-broker-ticket-16-fence-failure-"));
+  let spawnCalls = 0;
+  const { socket, running } = await connectOperationHost({
+    dataDir: dir,
+    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    sessionRunner: {
+      async run() {
+        spawnCalls += 1;
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      },
+    },
+  });
+  const sentBeforeOperation = socket.sent.length;
+  symlinkSync(tmpdir(), join(dir, "operations"));
+  const authority: DesktopBrowserOperationAuthorityEnvelope = {
+    ...sessionStartAuthority("fence-create-failure"),
+    capabilitySet: {
+      ...sessionStartAuthority("ignored").capabilitySet,
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+    },
+  };
+  socket.message(
+    JSON.stringify({
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "relay.invoke",
+      payload: {
+        dispatchId: "dispatch-fence-create-failure",
+        requestHash: computeDesktopBrowserRequestHash(authority, DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION),
+        authority,
+      },
+    }),
+  );
+  await assert.rejects(running, /directory|symbolic|symlink/i);
+  assert.equal(socket.sent.length, sentBeforeOperation);
+  assert.equal(spawnCalls, 0);
+});
+
 test("Ticket 06 rejects stale attempts and operation ordering before fencing or spawning", async () => {
   for (const mutation of [
     { attemptId: "attempt-stale", operationSequence: 2, leaseVersion: 4 },
@@ -938,15 +1016,15 @@ test("Ticket 06 rejects stale attempts and operation ordering before fencing or 
   }
 });
 
-test("Ticket 06 product seam reaches a visible window, sanitized observation, cleanup, and Core outcome", async () => {
+test("Ticket 16 explicit WebUI Turn reaches a visible window, sanitized observation, cleanup, and durable Core outcome", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "desktop-browser-ticket-06-product-"));
   const failedArtifactBytes = Buffer.from("phase-f-failed-artifact", "utf8");
   const uploadedArtifactBytes = Buffer.from("phase-f-fake-artifact", "utf8");
   const artifactIntents: unknown[] = [];
   const identity = await loadOrCreateDeviceIdentity(dir);
   const publicDeviceFingerprint = computeDesktopBrowserPublicDeviceFingerprint({
-    publicIdentityVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
-    deploymentCanonicalId: "qm://deployments/example",
+    publicIdentityVersion: "1.0",
+    deploymentCanonicalId: "https://qm.example.com",
     devicePublicKey: identity.devicePublicKey,
     brokerInstanceId: "broker-product",
     browserInstanceId: "browser-primary",
@@ -962,7 +1040,7 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
   });
   const relay = new DesktopBrowserRelayService({
     relayInstanceId: "relay-product",
-    deploymentCanonicalId: "qm://deployments/example",
+    deploymentCanonicalId: "https://qm.example.com",
     supportedProtocolVersions: [DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION],
     supportedPolicyGrammarVersions: ["1.0"],
     registry,
@@ -999,7 +1077,7 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
   const host = new HostBrokerConnection({
     qmUrl: "https://qm.example.com",
     relayUrl: `wss://qm.example.com${DESKTOP_BROWSER_RELAY_WSS_PATH}`,
-    deploymentCanonicalId: "qm://deployments/example",
+    deploymentCanonicalId: "https://qm.example.com",
     deviceId: publicDeviceFingerprint,
     brokerInstanceId: "broker-product",
     brokerVersion: "0.0.0-test",
@@ -1077,93 +1155,99 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
     },
   });
   const running = host.start().catch(() => undefined);
+  t.after(async () => {
+    await relayHttp.shutdown();
+    await running;
+  });
   sockets.host.open();
   const projection = await waitFor(() => registry.published.get("connection-product"), "product relay projection");
   assert.equal(projection.publicDeviceFingerprint, publicDeviceFingerprint);
   const now = Date.now();
-  const authorityState = {
-    registration: {
-      deploymentCanonicalId: "qm://deployments/example",
-      registrationId: "registration-product",
-      waitingTaskId: "task-product",
-      actorId: "actor-product",
-      projectId: "project-product",
-      membershipEpoch: 42,
-      authorityId: "authority-product",
-      authorityExpiresAt: now + 120_000,
-      publicDeviceFingerprint: projection.publicDeviceFingerprint,
-      browserInstanceId: "browser-primary",
-      status: "online" as const,
-      browserRuntimeStatus: "ready" as const,
-    },
-    relayConnection: projection,
-  };
-  const ids = [
-    "task-product",
-    "attempt-product",
-    "lease-product",
-    "operation-start-product",
-    "nonce-start-product",
-    "operation-navigate-product",
-    "nonce-navigate-product",
-    "operation-observe-product",
-    "nonce-observe-product",
-    "operation-stop-product",
-    "nonce-stop-product",
-  ];
-  const tasks = createDesktopBrowserTaskStore(createMemoryMap<DesktopBrowserTask>(), {
-    id: () => ids.shift()!,
-    now: () => now,
-    sessionStartAuthority: async () => structuredClone(authorityState),
-  });
-  const task = await tasks.createWaiting({
-    goal: "Inspect the example page",
-    actorId: "actor-product",
-    projectId: "project-product",
-    projectName: "Product Project",
-    projectMembershipVersion: "42",
-    authorityId: "authority-product",
-    authorityExpiresAt: now + 120_000,
-    sessionId: "session-product",
-    threadRef: "thread-product",
-  });
-  const preparedStart = await tasks.prepareSessionStart(task.id);
-  assert.equal(preparedStart.status, "ok");
-  const startInvocation = {
-    protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
-    kind: "relay.invoke" as const,
-    payload: {
-      dispatchId: "dispatch-start-product",
-      requestHash: preparedStart.operation.requestHash,
-      authority: preparedStart.operation.authority,
-    },
-  };
-  const startDispatch = await relay.dispatchProjectedInvocation({
-    publicDeviceFingerprint: projection.publicDeviceFingerprint,
-    browserInstanceId: "browser-primary",
-    invocation: startInvocation,
-  });
-  assert.equal(startDispatch.kind, "host.result");
-  if (startDispatch.kind !== "host.result") assert.fail("session start did not reach Host");
-  await tasks.consumeSessionStartAccepted(task.id, startDispatch.accepted);
-  await tasks.consumeSessionStartResult(task.id, startDispatch.result, { status: "ok", authority: authorityState });
-
-  let dispatchNumber = 0;
-  const auditLog = createAuditLog();
-  const coordinator = createDesktopBrowserOperationCoordinator({
-    tasks,
-    auditLog,
-    createDispatchId: () => `dispatch-product-${++dispatchNumber}`,
-    dispatcher: createHttpDesktopBrowserRelayDispatcher({
-      baseUrl: `http://127.0.0.1:${relayHttpPort}`,
-      authSecret: "relay-core-auth-secret-for-product-test-0001",
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "desktop-browser-ticket-16-core-")),
+      publicWebUrl: "https://qm.example.com",
+      desktopBrowserRelayUrl: `http://127.0.0.1:${relayHttpPort}`,
+      desktopBrowserRelayAuthSecret: "relay-core-auth-secret-for-product-test-0001",
+      desktopBrowserRelaySourceAuthSecret: "core-relay-auth-secret-for-product-test-0002",
     }),
+  );
+  t.after(() => built.runtime.stop());
+  const coreSigningSecret = "core-source-auth-secret-for-product-test-0001";
+  const coreHttp = createServer(built.app, { signingSecret: coreSigningSecret });
+  coreHttp.listen(0, "127.0.0.1");
+  await once(coreHttp, "listening");
+  t.after(() => new Promise<void>((resolve) => coreHttp.close(() => resolve())));
+  const coreHttpPort = (coreHttp.address() as AddressInfo).port;
+  await built.app.upsertDirectory([{ principalId: "actor-product", displayName: "Product Actor", type: "internal" }]);
+  const project = await built.app.createProject("actor-product", "Product Project");
+  assert.ok(project);
+  const turnBody = JSON.stringify({
+    surface: "web",
+    actor: { externalId: "actor-product", displayName: "Product Actor" },
+    conversation: {
+      kind: "group",
+      channelRef: projectGroupRef(project.id),
+      threadRef: "web:actor-product:phase-f-product",
+      audience: [],
+    },
+    text: "/desktop-browser Inspect the example page",
   });
+  const turnResponse = await fetch(`http://127.0.0.1:${coreHttpPort}/v1/turns`, {
+    method: "POST",
+    headers: signedRequestHeaders(coreSigningSecret, "POST", "/v1/turns", turnBody, {
+      "content-type": "application/json",
+    }),
+    body: turnBody,
+  });
+  assert.equal(turnResponse.status, 200);
+  const turn = (await turnResponse.json()) as Awaited<ReturnType<typeof built.app.turn>>;
+  assert.equal(turn.status, "ok");
+  assert.equal(turn.desktopBrowserActivity?.status, "waiting_for_broker");
+  const createdTask = await built.desktopBrowserTasks.get(turn.desktopBrowserActivity!.taskId);
+  assert.ok(createdTask);
+  const reserved = await built.desktopBrowserDeviceRegistry.reserve({
+    waitingTaskId: createdTask.id,
+    actorId: createdTask.actorId,
+    projectId: createdTask.projectId,
+    membershipEpoch: Number(createdTask.projectMembershipVersion),
+    authorityId: createdTask.authorityId,
+    authorityExpiresAt: createdTask.authorityExpiresAt,
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-product",
+    browserInstanceId: "browser-primary",
+    connectionEpoch: 7,
+    operatingSystem: "macos-arm64",
+  });
+  assert.equal(reserved.status, "ok");
+  if (reserved.status !== "ok") return;
+  const envelope = confirmRegistration(
+    identity,
+    reserved.reservation.registrationTuple,
+    reserved.reservation.confirmationFingerprint,
+  );
+  assert.equal(
+    (
+      await built.desktopBrowserDeviceRegistry.confirm({
+        registrationId: reserved.reservation.registrationTuple.registrationId,
+        authorityId: createdTask.authorityId,
+        browserRuntimeStatus: "ready",
+        envelope,
+      })
+    ).status,
+    "ok",
+  );
+  await built.desktopBrowserDeviceRegistry.publishRelayConnection(projection);
+  const tasks = built.desktopBrowserTasks;
+  const task = createdTask;
+  const coordinator = built.desktopBrowserOperations;
+  assert.ok(coordinator);
+  assert.deepEqual(await coordinator.startForTask(task.id), { status: "ok" });
   const scope = {
-    sessionId: "session-product",
-    actorId: "actor-product",
-    projectScopeLabel: "group:web-project-project-product",
-    projectMembershipVersion: "42",
+    sessionId: task.sessionId,
+    actorId: task.actorId,
+    projectScopeLabel: projectScopeId(task.projectId),
+    projectMembershipVersion: task.projectMembershipVersion,
   };
   const toolRef: ToolContextRef = {
     current: {
@@ -1233,11 +1317,11 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
   );
   assert.deepEqual(await invokeTool({ action: "finalize", outcome: "completed", summary: "Example page inspected" }), {
     status: "ok",
-    taskId: "task-product",
+    taskId: task.id,
   });
   assert.deepEqual(await invokeTool({ action: "finalize", outcome: "completed", summary: "Example page inspected" }), {
     status: "ok",
-    taskId: "task-product",
+    taskId: task.id,
   });
   const completed = await tasks.get(task.id);
   assert.ok(completed);
@@ -1245,25 +1329,31 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
     outcome: "completed",
     summary: "Example page inspected",
     actorId: "actor-product",
-    projectId: "project-product",
+    projectId: project.id,
     browserSkillSessionId: "browser-session-product",
     browserInstanceId: "browser-primary",
     agentWindowId: 42,
     observation: observed.observation,
   });
-  assert.deepEqual(await auditLog.events(), [
-    {
-      at: now,
-      principalId: "actor-product",
-      action: "desktop_browser.task.finalized",
-      resource: "task-product",
-      scopeLabel: "group:web-project-project-product",
-      status: "completed",
-    },
-  ]);
-  assert.deepEqual(ids, []);
-  await relayHttp.shutdown();
-  await running;
+  const auditEvents = await built.auditLog.events();
+  const finalizationEvents = auditEvents.filter(
+    (event) => event.action === "desktop_browser.task.finalized" && event.resource === task.id,
+  );
+  assert.equal(finalizationEvents.length, 1);
+  assert.equal(finalizationEvents[0]!.at >= now, true);
+  assert.deepEqual({ ...finalizationEvents[0], at: 0 }, {
+    at: 0,
+    principalId: "actor-product",
+    action: "desktop_browser.task.finalized",
+    resource: task.id,
+    scopeLabel: projectScopeId(project.id),
+    status: "completed",
+  });
+  const durableFences = readdirSync(join(dir, "operations"))
+    .map((name) => readFileSync(join(dir, "operations", name), "utf8"))
+    .join("\n");
+  assert.doesNotMatch(durableFences, /Heading: Example|Visible content|Authorization: Bearer/);
+  assert.match(durableFences, /resultHash/);
 });
 
 function tupleForIdentity(devicePublicKey: string) {
@@ -1441,7 +1531,7 @@ test("default host support interoperates with the default relay handshake throug
     connectionId: "connection-default-1",
     publicDeviceFingerprint: computeDesktopBrowserPublicDeviceFingerprint(
       projectDesktopBrowserPublicIdentity({
-        registrationProtocolVersion: published.protocolVersion as `${number}.${number}`,
+        registrationProtocolVersion: DESKTOP_BROWSER_REGISTRATION_PROTOCOL_VERSION,
         deploymentCanonicalId: "qm://deployments/example",
         registrationId: published.connectionId,
         actorId: "projection",
@@ -1584,7 +1674,6 @@ test("relay.invoke retains negotiated 1.2 and fences before one fixed BrowserSki
           session_id: "session-1",
           browser_instance_id: "browser-primary",
           agent_window_id: 42,
-          ignored_remote_field: "filtered",
         }),
         stderr: "",
       };

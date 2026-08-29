@@ -338,6 +338,7 @@ interface HostOperationFence {
   attemptId: string;
   state: "accepted" | "completed" | "failed" | "unknown";
   terminalPayload?: PersistedHostTerminalPayload;
+  terminalAcknowledged?: { resultHash: string; acknowledgedAt: number };
 }
 
 interface HostSessionOwnershipRecord {
@@ -746,8 +747,15 @@ function parseBrowserSkillJsonObject(stdout: string, maxBytes: number, label: st
   return raw as Record<string, unknown>;
 }
 
+function assertKnownBrowserSkillKeys(record: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  const known = new Set(allowed);
+  const unknown = Object.keys(record).filter((key) => !known.has(key));
+  if (unknown.length > 0) throw new Error(`BrowserSkill ${label} output has unknown keys`);
+}
+
 function parseBrowserSkillSessionStartResult(stdout: string, maxBytes: number): DesktopBrowserSessionStartResult {
   const record = parseBrowserSkillJsonObject(stdout, maxBytes, "session start");
+  assertKnownBrowserSkillKeys(record, ["session_id", "browser_instance_id", "agent_window_id"], "session start");
   if (typeof record.session_id !== "string" || record.session_id.length === 0 || /\s/.test(record.session_id)) {
     throw new Error("BrowserSkill session start output has an invalid session_id");
   }
@@ -788,6 +796,7 @@ function parseBrowserSkillCompletedResult(
   if (isSessionStartOperation(authority)) return parseBrowserSkillSessionStartResult(stdout, maxBytes);
   const record = parseBrowserSkillJsonObject(stdout, maxBytes, String(authority.argv[1]));
   if (authority.argv[1] === "navigate") {
+    assertKnownBrowserSkillKeys(record, ["tab_id", "reached", "url", "error_text"], "navigate");
     if (!Number.isSafeInteger(record.tab_id) || (record.tab_id as number) < 0) {
       throw new Error("BrowserSkill navigate output has an invalid tab_id");
     }
@@ -808,6 +817,7 @@ function parseBrowserSkillCompletedResult(
     };
   }
   if (authority.argv[1] === "observe") {
+    assertKnownBrowserSkillKeys(record, ["tab_id", "text", "ref_count", "truncated", "debug"], "observe");
     if (!Number.isSafeInteger(record.tab_id) || (record.tab_id as number) < 0) {
       throw new Error("BrowserSkill observe output has an invalid tab_id");
     }
@@ -833,6 +843,7 @@ function parseBrowserSkillCompletedResult(
     };
   }
   if (authority.argv[1] === "session" && authority.argv[2] === "stop") {
+    assertKnownBrowserSkillKeys(record, ["returned_tab_ids", "return_failures"], "session stop");
     const returnedTabIds = record.returned_tab_ids ?? [];
     const returnFailures = record.return_failures ?? [];
     if (
@@ -849,6 +860,7 @@ function parseBrowserSkillCompletedResult(
         throw new Error("BrowserSkill session stop output has an invalid return failure");
       }
       const entry = failure as Record<string, unknown>;
+      assertKnownBrowserSkillKeys(entry, ["tab_id", "code", "message"], "session stop return failure");
       if (!Number.isSafeInteger(entry.tab_id) || (entry.tab_id as number) < 0) {
         throw new Error("BrowserSkill session stop output has an invalid return failure tab_id");
       }
@@ -2220,6 +2232,34 @@ export class HostBrokerConnection {
                 throw new Error("Local Stop acknowledgement does not match an outstanding receipt");
               }
               deleteHostBrokerLocalStopReceipt(this.dataDir, acknowledgement.payload.receiptId);
+              return;
+            }
+            if (rawEnvelope.kind === "relay.result-ack") {
+              if (!negotiatedProtocolVersion || !this.dataDir) {
+                throw new Error("Terminal acknowledgement arrived before Host registration");
+              }
+              const acknowledgement = decodeDesktopBrowserMessage(raw, negotiatedProtocolVersion);
+              if (acknowledgement.kind !== "relay.result-ack") {
+                throw new Error("invalid terminal acknowledgement");
+              }
+              const fence = loadOperationFence(this.dataDir, acknowledgement.payload.operationId);
+              if (!fence?.terminalPayload) return;
+              const result = materializeHostResultPayload(
+                fence.terminalPayload.dispatchId ?? "acknowledged-dispatch",
+                fence.operationId,
+                fence.terminalPayload,
+              );
+              if (result.resultHash !== acknowledgement.payload.resultHash) {
+                throw new Error("Terminal acknowledgement result hash does not match Host fence");
+              }
+              const { terminalPayload: _terminalPayload, ...retainedFence } = fence;
+              saveOperationFence(this.dataDir, {
+                ...retainedFence,
+                terminalAcknowledged: {
+                  resultHash: acknowledgement.payload.resultHash,
+                  acknowledgedAt: Date.now(),
+                },
+              });
               return;
             }
             if (rawEnvelope.kind === "relay.device-reconcile-ack") {

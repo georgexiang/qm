@@ -4,7 +4,7 @@
   "hostBroker": {
     "repository": "https://github.com/yc-software/qm.git",
     "sourceCommit": "936dd2b232e3b143e00f269d18b8c061167024c6",
-    "compiledArtifactSha256": "5d6eac8a2a739a8fee0d4dc803791e83c188c46edeaf475e28a83448a0128105",
+    "compiledArtifactSha256": "fbf898eaf4e64904598abf7d53bb7bb244c46856f222b491871fa4d03ae710b6",
     "toolchain": {
       "node": "v24.20.0",
       "npm": "11.19.0",

@@ -299,6 +299,12 @@ export interface RelayLocalStopAckMessage {
   payload: { receiptId: string };
 }
 
+export interface RelayResultAckMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "relay.result-ack";
+  payload: { operationId: string; resultHash: string };
+}
+
 export interface HostDeviceReconciledMessage {
   protocolVersion: `${number}.${number}`;
   kind: "host.device-reconciled";
@@ -402,6 +408,7 @@ export type DesktopBrowserMessage =
   | HostResultMessage
   | HostLocalStopReceiptMessage
   | RelayLocalStopAckMessage
+  | RelayResultAckMessage
   | HostDeviceReconciledMessage
   | RelayDeviceReconcileAckMessage
   | CompanionStatusMessage;
@@ -1059,6 +1066,13 @@ export const desktopBrowserMessageSchemas = {
   "relay.local-stop-ack": strictMessageSchema(
     "relay.local-stop-ack",
     strictObjectSchema(["receiptId"], { receiptId: canonicalLexicalStringSchema }),
+  ),
+  "relay.result-ack": strictMessageSchema(
+    "relay.result-ack",
+    strictObjectSchema(["operationId", "resultHash"], {
+      operationId: canonicalLexicalStringSchema,
+      resultHash: canonicalLexicalStringSchema,
+    }),
   ),
   "host.device-reconciled": strictMessageSchema(
     "host.device-reconciled",
@@ -1735,6 +1749,29 @@ export function validateDesktopBrowserSessionStartArgv(
 export function buildDesktopBrowserNavigateArgv(url: string, sessionId: string): DesktopBrowserNavigateArgv {
   if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(url)) {
     throw new Error("url must be a canonical lexical string");
+  }
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    throw new Error("url must be one absolute HTTPS URL");
+  }
+  const hostname = target.hostname.toLowerCase().replace(/\.$/, "");
+  const isIpLiteral = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || (hostname.startsWith("[") && hostname.endsWith("]"));
+  const isLocalHostname =
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal");
+  if (
+    target.protocol !== "https:" ||
+    target.username ||
+    target.password ||
+    hostname.length === 0 ||
+    isIpLiteral ||
+    isLocalHostname
+  ) {
+    throw new Error("url must be one credential-free absolute HTTPS URL with a public DNS hostname");
   }
   if (!new RegExp(CANONICAL_LEXICAL_STRING_PATTERN).test(sessionId)) {
     throw new Error("sessionId must be a canonical lexical string");

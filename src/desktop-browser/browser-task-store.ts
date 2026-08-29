@@ -213,6 +213,10 @@ export interface DesktopBrowserTaskStore {
     id: string,
     operationId: string,
   ): Promise<{ status: "ok"; task: DesktopBrowserTask } | { status: "refused"; reason: string }>;
+  markSessionStartDeliveryUnknown(
+    id: string,
+    operationId: string,
+  ): Promise<{ status: "ok"; task: DesktopBrowserTask } | { status: "refused"; reason: string }>;
   finalize(
     id: string,
     input: { outcome: "completed" | "failed"; summary: string },
@@ -1236,7 +1240,8 @@ export function createDesktopBrowserTaskStore(
         }
         const operations = [...task.operations];
         const at = now();
-        operations[index] = { ...operation, status: "unknown", resultRecordedAt: at };
+        const status = operation.operation.authority.effectClass === "observation" ? "result_lost_retryable" : "unknown";
+        operations[index] = { ...operation, status, resultRecordedAt: at };
         recorded = {
           ...task,
           ...(operation.operation.authority.effectClass === "observation" ||
@@ -1322,6 +1327,37 @@ export function createDesktopBrowserTaskStore(
           ...task,
           finalizationAudit: { ...task.finalizationAudit, status: "recorded" },
           updatedAt: now(),
+        };
+        return recorded;
+      });
+      if (refusal) return { status: "refused", reason: refusal };
+      if (!recorded) return { status: "refused", reason: "Desktop Browser Task not found" };
+      return { status: "ok", task: copy(recorded) };
+    },
+    async markSessionStartDeliveryUnknown(taskId, operationId) {
+      if (!backing.update) throw new Error("desktop browser task storage does not support atomic updates");
+      let recorded: DesktopBrowserTask | null = null;
+      let refusal: string | null = null;
+      await backing.update(taskId, (task) => {
+        if (!task.execution || task.execution.operation.authority.operationId !== operationId) {
+          refusal = "Desktop Browser Task session start operation not found";
+          return task;
+        }
+        if (task.execution.attemptStatus !== "prepared") {
+          if (task.execution.attemptStatus === "accepted_unknown") {
+            recorded = task;
+            return task;
+          }
+          refusal = "Desktop Browser Task session start delivery is already settled";
+          return task;
+        }
+        const at = now();
+        recorded = {
+          ...task,
+          status: "canceled_with_unknown_effects",
+          recoveryExpiresAt: at + 15 * 60_000,
+          execution: { ...task.execution, attemptStatus: "accepted_unknown", resultRecordedAt: at },
+          updatedAt: at,
         };
         return recorded;
       });

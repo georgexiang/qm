@@ -193,7 +193,10 @@ import {
   type DesktopBrowserArtifactGrantService,
 } from "./desktop-browser/artifact-grant-service.ts";
 import { reconcileDesktopBrowserFinalizationAudits } from "./desktop-browser/finalization-audit.ts";
-import { createDesktopBrowserOperationCoordinator } from "./desktop-browser/operation-coordinator.ts";
+import {
+  createDesktopBrowserOperationCoordinator,
+  type DesktopBrowserOperationCoordinator,
+} from "./desktop-browser/operation-coordinator.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "./desktop-browser/relay-dispatcher.ts";
 import { reconcileDesktopBrowserStops } from "./desktop-browser/stop-delivery.ts";
 import { reconcileDesktopBrowserAttempts } from "./desktop-browser/attempt-reconciliation.ts";
@@ -340,6 +343,7 @@ export interface BuiltApp {
   desktopBrowserTasks: DesktopBrowserTaskStore;
   desktopBrowserArtifacts: DesktopBrowserArtifactGrantService;
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
+  desktopBrowserOperations?: DesktopBrowserOperationCoordinator;
   desktopBrowserStopReconciliation?: Sweeper;
   desktopBrowserAttemptReconciliation?: Sweeper;
   desktopBrowserQuarantineReconciliation?: Sweeper;
@@ -1113,6 +1117,9 @@ export function buildApp(
     backgroundJobTtlMs: config.backgroundJobTtlMs,
     backgroundJobTtlMaxMs: config.backgroundJobTtlMaxMs,
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+    ...(config.desktopBrowserRelaySourceAuthSecret
+      ? { desktopBrowserRelaySourceAuthSecret: config.desktopBrowserRelaySourceAuthSecret }
+      : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
     ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
@@ -1630,6 +1637,7 @@ export function buildApp(
     desktopBrowserTasks,
     desktopBrowserArtifacts,
     desktopBrowserDeviceRegistry,
+    ...(desktopBrowserOperations ? { desktopBrowserOperations } : {}),
     ...(desktopBrowserStopReconciliation ? { desktopBrowserStopReconciliation } : {}),
     ...(desktopBrowserAttemptReconciliation ? { desktopBrowserAttemptReconciliation } : {}),
     ...(desktopBrowserQuarantineReconciliation ? { desktopBrowserQuarantineReconciliation } : {}),

@@ -19,7 +19,19 @@ export async function reconcileDesktopBrowserAttempts(
     if (currentOperation?.hostResult || (!currentOperation && task.execution.hostResult)) continue;
     try {
       const status = await relay.attemptStatus(task.execution.attemptId);
-      if (!status?.accepted) continue;
+      if (!status) continue;
+      if (!status.accepted) {
+        if (status.checkpoint.deliveryState !== "started") continue;
+        const operationId = status.checkpoint.operationId;
+        const current = task.operations?.find(
+          (operation) => operation.operation.authority.operationId === operationId,
+        );
+        const marked = current
+          ? await tasks.markOperationDeliveryUnknown(task.id, operationId)
+          : await tasks.markSessionStartDeliveryUnknown(task.id, operationId);
+        if (marked.status === "refused") throw new Error(marked.reason);
+        continue;
+      }
       if (status.result) {
         const consumed = await app.desktopBrowserConsumeRelayTerminalCallback(task.id, status.accepted, status.result);
         if (consumed.status === "refused") throw new Error(consumed.reason);

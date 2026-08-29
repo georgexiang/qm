@@ -26,17 +26,19 @@ import {
 } from "qm-desktop-browser-contracts/fixtures";
 
 const SECRET = "desktop-browser-relay-route-secret".repeat(2);
+const GENERIC_SECRET = "generic-core-source-route-secret".repeat(2);
 
 function signed(
   method: string,
   path: string,
   body: string,
   ts = Math.floor(Date.now() / 1000),
+  secret = SECRET,
 ): Record<string, string> {
   return {
     "content-type": "application/json",
     "x-timestamp": String(ts),
-    "x-signature": signRequest(SECRET, ts, `${method}\n${path}\n${body}`),
+    "x-signature": signRequest(secret, ts, `${method}\n${path}\n${body}`),
   };
 }
 
@@ -86,7 +88,10 @@ test("relay registry routes resolve pending bindings and accept low-sensitivity 
   });
   assert.equal(reserve.status, "ok");
 
-  const server = createServer(built.app, { signingSecret: SECRET });
+  const server = createServer(built.app, {
+    signingSecret: GENERIC_SECRET,
+    desktopBrowserRelaySourceAuthSecret: SECRET,
+  });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -96,6 +101,12 @@ test("relay registry routes resolve pending bindings and accept low-sensitivity 
       devicePublicKey,
       brokerInstanceId: "broker-1",
     });
+    const genericResponse = await fetch(`${base}${resolvePath}`, {
+      method: "POST",
+      headers: signed("POST", resolvePath, resolveBody, Math.floor(Date.now() / 1000), GENERIC_SECRET),
+      body: resolveBody,
+    });
+    assert.equal(genericResponse.status, 401);
     const bindingResponse = await fetch(`${base}${resolvePath}`, {
       method: "POST",
       headers: signed("POST", resolvePath, resolveBody),
@@ -158,7 +169,10 @@ test("relay terminal callback route authenticates and consumes acceptance before
       return { status: "ok" };
     },
   };
-  const server = createServer(app as any, { signingSecret: SECRET });
+  const server = createServer(app as any, {
+    signingSecret: GENERIC_SECRET,
+    desktopBrowserRelaySourceAuthSecret: SECRET,
+  });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const path = "/v1/desktop-browser/relay/callbacks/terminal";
@@ -190,7 +204,8 @@ test("Ticket 13 issues a source-authenticated grant and redeems bytes outside Re
     validateIntent: async () => ({ status: "ok" }),
   });
   const server = createServer({} as any, {
-    signingSecret: SECRET,
+    signingSecret: GENERIC_SECRET,
+    desktopBrowserRelaySourceAuthSecret: SECRET,
     publicUrl: "https://qm.example.test",
     desktopBrowserArtifacts: artifacts,
   });
@@ -284,7 +299,10 @@ test("relay connection publish rejects malformed projections before the durable 
     seen.push(projection);
   };
 
-  const server = createServer(built.app, { signingSecret: SECRET });
+  const server = createServer(built.app, {
+    signingSecret: GENERIC_SECRET,
+    desktopBrowserRelaySourceAuthSecret: SECRET,
+  });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const path = "/v1/desktop-browser/relay/connections/connection-1";

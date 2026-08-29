@@ -142,6 +142,7 @@ interface Wiring {
   deps: ServerDeps;
   secret: string | undefined;
   auth: SourceAuth | null;
+  relayAuth: SourceAuth | null;
   requirePortalIdentity: boolean;
   allowUnsignedSourceAuth: boolean;
 }
@@ -160,7 +161,7 @@ const rawBodies = new WeakMap<IncomingMessage, string>();
 async function gate(
   req: IncomingMessage,
   res: ServerResponse,
-  { app, deps, secret, auth, requirePortalIdentity, allowUnsignedSourceAuth }: Wiring,
+  { app, deps, secret, auth, relayAuth, requirePortalIdentity, allowUnsignedSourceAuth }: Wiring,
   method: string,
   pathname: string,
   url: URL,
@@ -168,11 +169,26 @@ async function gate(
   routeAuth: RouteAuth | undefined,
 ): Promise<GateResult | null> {
   const isPublicRoute = routeAuth === "public";
+  const isRelayRoute = routeAuth === "relay";
   const requiredAud = typeof routeAuth === "object" ? routeAuth.aud : null;
   let capability: CapabilityClaims | null = null;
   const capToken = capabilityFromHeaders(req);
   if (isPublicRoute) {
     void isPublicRoute;
+  } else if (isRelayRoute) {
+    if (
+      !(await verifyOrReject(
+        req,
+        res,
+        deps.desktopBrowserRelaySourceAuthSecret,
+        relayAuth,
+        canonicalPayload(method, pathname + url.search, raw),
+        method !== "GET",
+        false,
+      ))
+    ) {
+      return null;
+    }
   } else if (capToken) {
     const capSecret = deps.capabilitySecret ?? secret;
     capability = capSecret ? await verifyCapabilityToken(capToken, capSecret) : null;
@@ -447,11 +463,18 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
         ...(deps.replayDedupe ? { dedupe: deps.replayDedupe } : {}),
       })
     : null;
+  const relayAuth = deps.desktopBrowserRelaySourceAuthSecret
+    ? createSourceAuth({
+        signingSecret: deps.desktopBrowserRelaySourceAuthSecret,
+        ...(deps.replayDedupe ? { dedupe: deps.replayDedupe } : {}),
+      })
+    : null;
   const wiring: Wiring = {
     app,
     deps: { ...deps, control: createControlService(app, deps.scheduler, deps.admin) },
     secret: deps.signingSecret,
     auth,
+    relayAuth,
     requirePortalIdentity,
     allowUnsignedSourceAuth,
   };
@@ -474,8 +497,9 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     if (await dispatch(rawRoutes, base)) return;
     const matched = findRoute(apiRoutes, base.method, base.pathname);
     const routeAuth = matched?.route.auth;
-    const acceptsSourceAuth = !matched || routeAuth === "source" || routeAuth === "either";
-    if (wiring.secret && !capabilityFromHeaders(req) && routeAuth !== "public" && acceptsSourceAuth) {
+    const acceptsSourceAuth = !matched || routeAuth === "source" || routeAuth === "relay" || routeAuth === "either";
+    const routeSecret = routeAuth === "relay" ? deps.desktopBrowserRelaySourceAuthSecret : wiring.secret;
+    if (routeSecret && !capabilityFromHeaders(req) && routeAuth !== "public" && acceptsSourceAuth) {
       const timestamp = Number(req.headers["x-timestamp"] ?? 0);
       if (
         !Number.isFinite(timestamp) ||

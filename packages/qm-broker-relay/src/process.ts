@@ -81,6 +81,22 @@ function parsePositiveSafeInteger(name: string, value: string | undefined, fallb
   return parsed;
 }
 
+function coreApiOrigin(value: string): string {
+  const url = new URL(value);
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("QM_RELAY_CORE_API_URL must be one credential-free HTTPS origin or loopback HTTP origin");
+  }
+  return url.origin;
+}
+
 export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.env): DesktopBrowserRelayRuntimeConfig {
   const sourceAuthSecret = requireEnv("QM_RELAY_SOURCE_AUTH_SECRET", env.QM_RELAY_SOURCE_AUTH_SECRET);
   if (sourceAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
@@ -89,6 +105,9 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
   const coreAuthSecret = requireEnv("QM_RELAY_CORE_AUTH_SECRET", env.QM_RELAY_CORE_AUTH_SECRET);
   if (coreAuthSecret.trim().length < MIN_SOURCE_AUTH_SECRET_LENGTH) {
     throw new Error(`QM_RELAY_CORE_AUTH_SECRET must be at least ${MIN_SOURCE_AUTH_SECRET_LENGTH} characters`);
+  }
+  if (sourceAuthSecret === coreAuthSecret) {
+    throw new Error("QM_RELAY_SOURCE_AUTH_SECRET and QM_RELAY_CORE_AUTH_SECRET must differ");
   }
   const databaseUrl = requireEnv("QM_RELAY_DATABASE_URL", env.QM_RELAY_DATABASE_URL);
   const databaseSchema = env.QM_RELAY_DATABASE_SCHEMA ?? "qm_broker_relay";
@@ -101,7 +120,7 @@ export function loadDesktopBrowserRelayConfig(env: NodeJS.ProcessEnv = process.e
     wssPath: env.QM_RELAY_WSS_PATH ?? DESKTOP_BROWSER_RELAY_WSS_PATH,
     relayInstanceId: requireEnv("QM_RELAY_INSTANCE_ID", env.QM_RELAY_INSTANCE_ID),
     deploymentCanonicalId: requireEnv("QM_RELAY_DEPLOYMENT_CANONICAL_ID", env.QM_RELAY_DEPLOYMENT_CANONICAL_ID),
-    coreApiUrl: requireEnv("QM_RELAY_CORE_API_URL", env.QM_RELAY_CORE_API_URL).replace(/\/$/, ""),
+    coreApiUrl: coreApiOrigin(requireEnv("QM_RELAY_CORE_API_URL", env.QM_RELAY_CORE_API_URL)),
     sourceAuthSecret,
     coreAuthSecret,
     databaseUrl,
@@ -152,6 +171,7 @@ export async function deliverDesktopBrowserRelayCallbacks(
   const now = options.now ?? Date.now;
   for (const entry of await store.claimCallbacks(owner, 25, 30_000)) {
     try {
+      if (!entry.result) throw new Error("desktop browser Relay callback result is unavailable");
       const path = signedPath("/v1/desktop-browser/relay/callbacks/terminal", config.sourceAuthSecret);
       const body = JSON.stringify({ taskId: entry.taskId, accepted: entry.accepted, result: entry.result });
       const response = await fetchImpl(`${config.coreApiUrl}${path}`, {

@@ -573,6 +573,76 @@ test("Ticket 06 coordinator returns observation to the current Task-scoped Agent
   assert.deepEqual(ids, []);
 });
 
+test("Ticket 16 Core-to-Relay request failure leaves the operation recoverable", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-request-failure", readyTask("task-request-failure", "start-request-failure"));
+  const ids = ["operation-request-failure", "nonce-request-failure"];
+  const store = createDesktopBrowserTaskStore(backing, {
+    id: () => ids.shift()!,
+    now: () => Date.parse("2036-08-27T12:00:10.000Z"),
+  });
+  let dispatchCalls = 0;
+  const coordinator = createDesktopBrowserOperationCoordinator({
+    tasks: store,
+    createDispatchId: () => "dispatch-request-failure",
+    dispatcher: {
+      async dispatch() {
+        dispatchCalls += 1;
+        throw new Error("Relay request connection lost");
+      },
+    },
+  });
+
+  assert.deepEqual(
+    await coordinator.invokeForSession({
+      sessionId: "conversation-task-request-failure",
+      actorId: "actor-1",
+      projectScopeLabel: "group:web-project-project-1",
+      projectMembershipVersion: "42",
+      argv: buildDesktopBrowserNavigateArgv("https://example.test", "browser-session-task-request-failure"),
+    }),
+    { status: "refused", reason: "Desktop Browser Relay request outcome is unknown" },
+  );
+
+  const task = await store.get("task-request-failure");
+  assert.equal(task?.operations?.length, 1);
+  assert.equal(task?.operations?.[0]?.operation.authority.operationId, "operation-request-failure");
+  assert.equal(task?.operations?.[0]?.status, "unknown");
+  assert.equal(task?.operations?.[0]?.hostAccepted, undefined);
+  assert.equal(task?.operations?.[0]?.hostResult, undefined);
+  const repeated = await coordinator.invokeForSession({
+    sessionId: "conversation-task-request-failure",
+    actorId: "actor-1",
+    projectScopeLabel: "group:web-project-project-1",
+    projectMembershipVersion: "42",
+    argv: buildDesktopBrowserNavigateArgv("https://example.test", "browser-session-task-request-failure"),
+  });
+  assert.equal(repeated.status, "refused");
+  assert.equal(dispatchCalls, 1);
+  assert.equal((await store.get("task-request-failure"))?.operations?.length, 1);
+});
+
+test("Ticket 16 observation request failure permits one new operation identity", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  await backing.put("task-observe-request-failure", readyTask("task-observe-request-failure", "start-observe-failure"));
+  const ids = ["observe-original", "nonce-original", "observe-retry", "nonce-retry"];
+  const store = createDesktopBrowserTaskStore(backing, {
+    id: () => ids.shift()!,
+    now: () => Date.parse("2036-08-27T12:00:10.000Z"),
+  });
+  const argv = buildDesktopBrowserObserveArgv("browser-session-task-observe-request-failure");
+  const original = await store.prepareOperation("task-observe-request-failure", argv);
+  assert.equal(original.status, "ok");
+  if (original.status !== "ok") return;
+  await store.markOperationDeliveryUnknown("task-observe-request-failure", original.operation.authority.operationId);
+  const retry = await store.prepareOperation("task-observe-request-failure", argv);
+  assert.equal(retry.status, "ok");
+  if (retry.status !== "ok") return;
+  assert.notEqual(retry.operation.authority.operationId, original.operation.authority.operationId);
+  assert.equal(retry.operation.authority.operationSequence, original.operation.authority.operationSequence + 1);
+  assert.equal((await store.get("task-observe-request-failure"))?.operations?.length, 2);
+});
+
 test("Ticket 09 coordinator starts and binds the Task-owned BrowserSkill session", async () => {
   const task = readyTask("task-continue-start", "old-start");
   const previousAuthority = task.execution!.operation.authority;
@@ -1096,6 +1166,42 @@ test("Ticket 11 Core restart queries Relay for each nonterminal Attempt without 
 
   assert.deepEqual(queried.sort(), [first.execution!.attemptId, second.execution!.attemptId].sort());
   assert.deepEqual(consumed, [second.id]);
+});
+
+test("Ticket 16 restart terminalizes WSS-started work without Accepted Evidence", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-recovery-no-accepted", "operation-recovery-no-accepted");
+  task.execution!.attemptStatus = "prepared";
+  task.execution!.hostResult = undefined;
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing, { now: () => 42_000 });
+
+  await reconcileDesktopBrowserAttempts(
+    store,
+    {
+      async attemptStatus(attemptId) {
+        return {
+          checkpoint: {
+            attemptId,
+            operationId: task.execution!.operation.authority.operationId,
+            requestHash: task.execution!.operation.requestHash,
+            state: "prepared",
+            deliveryState: "started",
+            updatedAt: 41_000,
+          },
+        };
+      },
+    },
+    {
+      desktopBrowserConsumeSessionStartAccepted: async () => assert.fail("Accepted Evidence is absent"),
+      desktopBrowserConsumeOperationAccepted: async () => assert.fail("Accepted Evidence is absent"),
+      desktopBrowserConsumeRelayTerminalCallback: async () => assert.fail("terminal result is absent"),
+    },
+  );
+
+  const recovered = await store.get(task.id);
+  assert.equal(recovered?.status, "canceled_with_unknown_effects");
+  assert.equal(recovered?.execution?.attemptStatus, "accepted_unknown");
 });
 
 test("Ticket 11 recovery queries a later operation after session start completed", async () => {

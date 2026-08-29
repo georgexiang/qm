@@ -6,12 +6,23 @@ import { agentApiMatches } from "../src/api/agent-api-catalog.ts";
 import { OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD } from "../src/auth/capability-token.ts";
 
 const PUBLIC_ROUTES = new Set<string>();
+const RELAY_ROUTES = new Set([
+  "GET /v1/desktop-browser/relay/ready",
+  "POST /v1/desktop-browser/relay/artifact-grants",
+  "POST /v1/desktop-browser/relay/callbacks/terminal",
+  "POST /v1/desktop-browser/relay/callbacks/local-stop",
+  "POST /v1/desktop-browser/relay/device-reconciliations",
+  "POST /v1/desktop-browser/relay/bindings/resolve",
+  "PUT /v1/desktop-browser/relay/connections/sample",
+  "DELETE /v1/desktop-browser/relay/connections/sample",
+]);
 const AUD_ROUTES = new Map<string, string>([
   ["POST /v1/connectors/oauth/consent/mint", OAUTH_CONSENT_AUD],
   ["POST /v1/credentials/broker", CREDENTIAL_BROKER_AUD],
 ]);
 function expectedAuth(method: string, pathname: string): RouteAuth {
   if (PUBLIC_ROUTES.has(`${method} ${pathname}`)) return "public";
+  if (RELAY_ROUTES.has(`${method} ${pathname}`)) return "relay";
   const aud = AUD_ROUTES.get(`${method} ${pathname}`);
   if (aud) return { aud };
   if (agentApiMatches(method, pathname)) return "either";

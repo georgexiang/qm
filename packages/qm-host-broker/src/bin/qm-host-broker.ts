@@ -22,6 +22,7 @@ try {
     stdout: process.stdout,
     stderr: process.stderr,
     signal: controller.signal,
+    brokerInstanceId: process.env.QM_HOST_BROKER_INSTANCE_ID,
       companionPort: HOST_BROKER_COMPANION_PORT,
     deviceId: process.env.QM_HOST_BROKER_DEVICE_ID,
     browserSkillExecutable: resolveInstalledBrowserSkillExecutable({ env: process.env, installRoot }),

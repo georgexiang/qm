@@ -14,8 +14,31 @@ on:
       - scripts/smoke-desktop-browser-phase-f-bundle.ts
       - packages/qm-host-broker/**
       - packages/desktop-browser-contracts/**
-      - test/desktop-browser-conformance.test.ts
-      - test/desktop-browser-phase-f-bundle.test.ts
+      - packages/qm-broker-relay/**
+      - src/desktop-browser/**
+      - src/api/routes/desktop-browser.ts
+      - src/api/server.ts
+      - src/api/deps.ts
+      - src/api/app-helpers.ts
+      - src/api/app-sessions.ts
+      - src/api/app-turn.ts
+      - src/api/app-types.ts
+      - src/api/http.ts
+      - src/api/routes/route.ts
+      - src/auth/**
+      - src/config.ts
+      - src/core/orchestrator.ts
+      - src/core/orchestrator/types.ts
+      - src/files/**
+      - src/wiring.ts
+      - plugins/chassis/**
+      - adrs/**
+      - package.json
+      - package-lock.json
+      - artifacts/research/desktop-browser-phase-f-*.json
+      - test/desktop-browser-*.test.ts
+      - test/config.test.ts
+      - test/route-auth-conformance.test.ts
 
 permissions:
   contents: read
@@ -52,6 +75,14 @@ jobs:
         run: test "$(uname -m)" = arm64
       - name: Install QM dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run Phase F repository gates
+        run: |
+          npm run typecheck
+          npm run typecheck:contract
+          npm run lint
+          npm run lint:ox
+          node --test test/desktop-browser-phase-f-exit-gate.test.ts
+          npm run test:all
       - name: Check out pinned BrowserSkill source
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/Tencent/BrowserSkill.git "$RUNNER_TEMP/BrowserSkill"
@@ -103,7 +134,7 @@ jobs:
             --output "$RUNNER_TEMP/desktop-browser-phase-f.tar.gz" \
             --fixture "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json" \
             --host-source-commit 936dd2b232e3b143e00f269d18b8c061167024c6 \
-            --host-artifact-sha256 5d6eac8a2a739a8fee0d4dc803791e83c188c46edeaf475e28a83448a0128105 \
+            --host-artifact-sha256 fbf898eaf4e64904598abf7d53bb7bb244c46856f222b491871fa4d03ae710b6 \
             --browser-skill-source-commit "$BROWSERSKILL_COMMIT" \
             --host-source-dir "$GITHUB_WORKSPACE/packages/qm-host-broker" \
             --contracts-source-dir "$GITHUB_WORKSPACE/packages/desktop-browser-contracts" \
@@ -115,14 +146,11 @@ jobs:
             --conformance-manifest "$RUNNER_TEMP/conformance-baseline/manifest.json" \
             --node-version "$(node --version)" \
             --npm-version "$(npm --version)"
-      - name: Smoke installed bundle in Chrome and Edge
+      - name: Run installed Relay-to-Host seam in Chrome and Edge
         run: |
           edge="/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
           test -x "$edge"
           sha="$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).bundleSha256" "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json")"
-          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP" >/dev/null 2>&1 &
-          fixture_server=$!
-          trap 'kill "$fixture_server" 2>/dev/null || true' EXIT
           for browser in chrome edge; do
             if [ "$browser" = chrome ]; then executable="$CHROME_FOR_TESTING"; else executable="$edge"; fi
             npm run smoke:desktop-browser-phase-f -- \
@@ -132,7 +160,7 @@ jobs:
               --qm-url offline \
               --browser "$browser" \
               --browser-executable "$executable" \
-              --fixture-url "http://127.0.0.1:8765/"
+                --fixture-url "https://example.com/"
           done
       - name: Download released smoke artifacts
         run: |
