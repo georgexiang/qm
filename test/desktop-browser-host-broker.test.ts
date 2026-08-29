@@ -199,12 +199,33 @@ class MemoryRegistryAdapter implements DesktopBrowserRelayRegistryAdapter {
   readonly published = new Map<string, DesktopBrowserRelayProjection>();
   readonly cleared: string[] = [];
   readonly bindings = new Map<string, DesktopBrowserRelayBinding>();
+  readonly owners = new Map<string, { connectionId: string; connectionEpoch: number }>();
 
   async resolveBinding(input: {
     devicePublicKey: string;
     brokerInstanceId: string;
   }): Promise<DesktopBrowserRelayBinding | null> {
-    return this.bindings.get(`${input.devicePublicKey}\u0000${input.brokerInstanceId}`) ?? null;
+    const key = `${input.devicePublicKey}\u0000${input.brokerInstanceId}`;
+    const binding = this.bindings.get(key) ?? null;
+    const owner = this.owners.get(key);
+    return binding && owner ? { ...binding, connectionEpoch: owner.connectionEpoch, ownerConnectionId: owner.connectionId } : binding;
+  }
+
+  async claimConnection(input: { connectionId: string; connectionEpoch: number; devicePublicKey: string; brokerInstanceId: string }): Promise<DesktopBrowserRelayBinding | null> {
+    const key = `${input.devicePublicKey}\u0000${input.brokerInstanceId}`;
+    const binding = this.bindings.get(key);
+    const owner = this.owners.get(key);
+    let expected = binding?.connectionEpoch;
+    if (owner?.connectionId === input.connectionId) expected = owner.connectionEpoch;
+    else if (owner) expected = owner.connectionEpoch + 1;
+    if (!binding || input.connectionEpoch !== expected) return null;
+    this.owners.set(key, { connectionId: input.connectionId, connectionEpoch: input.connectionEpoch });
+    return { ...binding, connectionEpoch: input.connectionEpoch, ownerConnectionId: input.connectionId };
+  }
+
+  async isConnectionOwner(input: { connectionId: string; connectionEpoch: number; devicePublicKey: string; brokerInstanceId: string }): Promise<boolean> {
+    const owner = this.owners.get(`${input.devicePublicKey}\u0000${input.brokerInstanceId}`);
+    return owner?.connectionId === input.connectionId && owner.connectionEpoch === input.connectionEpoch;
   }
 
   async publishConnection(projection: DesktopBrowserRelayProjection): Promise<void> {

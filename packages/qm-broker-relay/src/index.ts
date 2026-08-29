@@ -20,7 +20,12 @@ import {
   type RelayArtifactGrantMessage,
 } from "qm-desktop-browser-contracts";
 import type { WebSocket, WebSocketServer } from "ws";
-import { type DesktopBrowserRelayOperationStore } from "./operation-store.ts";
+import {
+  createDesktopBrowserRelayOperationStore,
+  createMemoryDesktopBrowserRelayOperationBacking,
+  type DesktopBrowserRelayConnectionOwnerStore,
+  type DesktopBrowserRelayOperationStore,
+} from "./operation-store.ts";
 
 type RelayConnectionStage = "awaiting_hello" | "awaiting_challenge_response" | "pending" | "registered" | "closing";
 
@@ -109,6 +114,7 @@ export interface DesktopBrowserRelayServiceOptions {
   createNonce?: () => string;
   createConnectionId?: () => string;
   operationStore?: DesktopBrowserRelayOperationStore;
+  connectionOwnerStore?: DesktopBrowserRelayConnectionOwnerStore;
   artifactGrantClient?: DesktopBrowserRelayArtifactGrantClient;
 }
 
@@ -135,6 +141,8 @@ interface RelayConnectionState {
     timeout: RelayTimerHandle;
     accepted: HostAcceptedMessage | null;
     resolve: (result: RelayDispatchResult) => void;
+    settled: Promise<void>;
+    settle: () => void;
   } | null;
   lastSeenAt: number;
   closeReason: string | null;
@@ -268,8 +276,21 @@ export class DesktopBrowserRelayService {
   private readonly dispatchTombstonesById = new Map<string, RelayDispatchTombstone>();
   private readonly dispatchTombstoneOrder: string[] = [];
   private readonly operationStore: DesktopBrowserRelayOperationStore | null;
+  private readonly connectionOwnerStore: DesktopBrowserRelayConnectionOwnerStore;
   private readonly artifactGrantClient: DesktopBrowserRelayArtifactGrantClient | null;
   private draining = false;
+  private drainStartedAt: number | null = null;
+  private readonly metricValues = {
+    connectionsAccepted: 0,
+    authenticatedConnections: 0,
+    reconnects: 0,
+    replacements: 0,
+    authenticationFailures: 0,
+    heartbeatTimeouts: 0,
+    unknownEffects: 0,
+    projectionFailures: 0,
+    drainDurationMs: 0,
+  };
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
     this.options = {
@@ -291,6 +312,10 @@ export class DesktopBrowserRelayService {
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
     };
     this.operationStore = options.operationStore ?? null;
+    this.connectionOwnerStore =
+      options.connectionOwnerStore ??
+      options.operationStore ??
+      createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking());
     this.artifactGrantClient = options.artifactGrantClient ?? null;
     if (this.options.supportedProtocolVersions.length === 0) {
       throw new Error("at least one supported protocol version is required");
@@ -315,6 +340,7 @@ export class DesktopBrowserRelayService {
       socket.close(1012, "service restart");
       return connectionId;
     }
+    this.metricValues.connectionsAccepted += 1;
     const connection: RelayConnectionState = {
       connectionId,
       socket,
@@ -408,6 +434,7 @@ export class DesktopBrowserRelayService {
     browserInstanceId: string;
     invocation: RelayInvocationMessage;
   }): Promise<RelayDispatchResult> {
+    if (this.draining) throw new Error("desktop browser Relay is draining");
     const connection = await this.resolveCurrentRegisteredConnection(input);
     const binding = connection.binding;
     if (!binding) throw new Error("desktop browser host is not connected");
@@ -500,6 +527,16 @@ export class DesktopBrowserRelayService {
         };
       }
     }
+    if (this.draining || this.connections.get(connection.connectionId) !== connection || connection.stage !== "registered") {
+      throw new Error("desktop browser Relay began draining before dispatch delivery");
+    }
+    if (!(await this.isCurrentConnectionOwner(connection))) {
+      await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+      throw new Error("desktop browser Relay connection was superseded before dispatch delivery");
+    }
+    if (this.draining || this.connections.get(connection.connectionId) !== connection || connection.stage !== "registered") {
+      throw new Error("desktop browser Relay began draining before dispatch admission");
+    }
     connection.currentLease = {
       taskId: authority.taskId,
       attemptId: authority.attemptId,
@@ -510,6 +547,10 @@ export class DesktopBrowserRelayService {
     this.assertOperationRequestHash(authority.operationId, canonicalRequestHash);
     this.assertDispatchIdAvailable(decoded.payload.dispatchId);
     return new Promise<RelayDispatchResult>((resolve, reject) => {
+      let settleDispatch!: () => void;
+      const settled = new Promise<void>((settle) => {
+        settleDispatch = settle;
+      });
       this.startDispatchTracking(decoded.payload.dispatchId, authority.operationId, canonicalRequestHash);
       const timeout = this.options.clock.setTimeout(() => {
         if (connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId) return;
@@ -529,6 +570,8 @@ export class DesktopBrowserRelayService {
         timeout,
         accepted: null,
         resolve,
+        settled,
+        settle: settleDispatch,
       };
       try {
         if (!this.operationStore) {
@@ -536,29 +579,43 @@ export class DesktopBrowserRelayService {
           return;
         }
         void this.operationStore
-          .markDeliveryStarted(authority.attemptId, decoded.payload.dispatchId)
-          .then(
-            async () => {
-              if (
-                !this.connections.has(connection.connectionId) ||
-                connection.stage === "closing" ||
-                connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId
-              ) {
-                await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
-                return;
-              }
-              try {
-                connection.socket.send(encodeDesktopBrowserMessage(decoded));
-              } catch (error) {
-                await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
-                this.options.clock.clearTimeout(timeout);
-                connection.pendingDispatch = null;
-                this.dropDispatchTracking(decoded.payload.dispatchId);
-                reject(error instanceof Error ? error : new Error(String(error)));
-              }
+          .markDeliveryStartedIfOwner(
+            {
+              connectionId: connection.connectionId,
+              connectionEpoch: connection.binding!.connectionEpoch,
+              devicePublicKey: connection.binding!.devicePublicKey,
+              brokerInstanceId: connection.binding!.brokerInstanceId,
             },
-            (error) => {
+            authority.attemptId,
+            decoded.payload.dispatchId,
+          )
+          .then(async (started) => {
+          if (!started) {
+            await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+            return;
+          }
+          if (
+            !this.connections.has(connection.connectionId) ||
+            connection.stage === "closing" ||
+            connection.pendingDispatch?.dispatchId !== decoded.payload.dispatchId
+          ) {
+            await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
+            return;
+          }
+          try {
+            connection.socket.send(encodeDesktopBrowserMessage(decoded));
+          } catch (error) {
+            await this.operationStore!.markDeliveryNotStarted(authority.attemptId, decoded.payload.dispatchId);
+            this.options.clock.clearTimeout(timeout);
+            connection.pendingDispatch?.settle();
+            connection.pendingDispatch = null;
+            this.dropDispatchTracking(decoded.payload.dispatchId);
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+            async (error) => {
               this.options.clock.clearTimeout(timeout);
+              connection.pendingDispatch?.settle();
               connection.pendingDispatch = null;
               this.dropDispatchTracking(decoded.payload.dispatchId);
               reject(error instanceof Error ? error : new Error(String(error)));
@@ -567,6 +624,7 @@ export class DesktopBrowserRelayService {
           .catch((error) => {
             if (connection.pendingDispatch?.dispatchId === decoded.payload.dispatchId) {
               this.options.clock.clearTimeout(timeout);
+              connection.pendingDispatch?.settle();
               connection.pendingDispatch = null;
               this.dropDispatchTracking(decoded.payload.dispatchId);
               reject(error instanceof Error ? error : new Error(String(error)));
@@ -574,6 +632,7 @@ export class DesktopBrowserRelayService {
           });
       } catch (error) {
         this.options.clock.clearTimeout(timeout);
+        connection.pendingDispatch?.settle();
         connection.pendingDispatch = null;
         this.dropDispatchTracking(decoded.payload.dispatchId);
         reject(error instanceof Error ? error : new Error(String(error)));
@@ -647,13 +706,46 @@ export class DesktopBrowserRelayService {
     return this.operationStore.attemptStatus(attemptId);
   }
 
-  async drain(): Promise<void> {
+  beginDrain(): void {
     this.draining = true;
+    this.drainStartedAt ??= this.options.clock.now();
+  }
+
+  isDraining(): boolean {
+    return this.draining;
+  }
+
+  metrics(): Readonly<typeof this.metricValues> & { draining: boolean; activeConnections: number } {
+    return { ...this.metricValues, draining: this.draining, activeConnections: this.connections.size };
+  }
+
+  async drain(graceMs = 0): Promise<void> {
+    this.beginDrain();
+    const connections = [...this.connections.values()];
+    const deadline = this.options.clock.now() + graceMs;
+    const waitUntilDeadline = async (work: Promise<unknown>) => {
+      const remaining = Math.max(0, deadline - this.options.clock.now());
+      if (remaining === 0) return;
+      let timeout: RelayTimerHandle | null = null;
+      await Promise.race([
+        work,
+        new Promise<void>((resolve) => {
+          timeout = this.options.clock.setTimeout(resolve, remaining);
+        }),
+      ]);
+      if (timeout !== null) this.options.clock.clearTimeout(timeout);
+    };
     await Promise.all(
-      [...this.connections.values()].map(async (connection) =>
-        this.closeConnection(connection, 1012, "service restart"),
-      ),
+      connections.map(async (connection) => {
+        const pending = connection.pendingDispatch;
+        if (pending?.authority.effectClass === "observation" && graceMs > 0) {
+          await waitUntilDeadline(pending.settled);
+        }
+        await waitUntilDeadline(connection.processing);
+        await waitUntilDeadline(this.closeConnection(connection, 1012, "service restart"));
+      }),
     );
+    this.metricValues.drainDurationMs = Math.max(0, this.options.clock.now() - (this.drainStartedAt ?? 0));
   }
 
   private snapshot(connection: RelayConnectionState): DesktopBrowserRelaySnapshot {
@@ -872,7 +964,7 @@ export class DesktopBrowserRelayService {
     );
   }
 
-  private async handleMessage(connection: RelayConnectionState, raw: string): Promise<void> {
+  private async handleMessage(connection: RelayConnectionState, raw: string, ownershipLocked = false): Promise<void> {
     if (!this.connections.has(connection.connectionId) || connection.stage === "closing") return;
     if (byteLength(raw) > this.options.maxMessageBytes) {
       throw new Error("desktop browser relay message exceeded the maximum allowed size");
@@ -905,6 +997,14 @@ export class DesktopBrowserRelayService {
       connection.negotiatedProtocolVersion ?? this.options.supportedProtocolVersions[0],
     );
     if (message.kind === "relay.invoke") throw new Error("unexpected relay.invoke frame from host");
+    if (!ownershipLocked) {
+      const owned = await this.withCurrentConnectionOwner(connection, () =>
+        this.handleMessage(connection, raw, true),
+      );
+      if (owned) return;
+      await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+      return;
+    }
     if (message.kind === "relay.local-stop-ack") {
       throw new Error("unexpected relay.local-stop-ack frame from host");
     }
@@ -981,7 +1081,8 @@ export class DesktopBrowserRelayService {
           this.connections.get(connection.connectionId) === connection &&
           connection.stage === "registered" &&
           connection.binding?.connectionEpoch === connectionEpoch &&
-          connection.pendingDispatch === pending
+          connection.pendingDispatch === pending &&
+          (await this.isCurrentConnectionOwner(connection))
         ) {
           connection.socket.send(
             encodeDesktopBrowserMessage({
@@ -1001,8 +1102,12 @@ export class DesktopBrowserRelayService {
         this.connections.get(connection.connectionId) !== connection ||
         connection.stage !== "registered" ||
         connection.binding?.connectionEpoch !== connectionEpoch ||
-        connection.pendingDispatch !== pending
+        connection.pendingDispatch !== pending ||
+        !(await this.isCurrentConnectionOwner(connection))
       ) {
+        if (!(await this.isCurrentConnectionOwner(connection))) {
+          await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+        }
         return;
       }
       if (grant.artifactIntentId !== intent.artifactIntentId || grant.operationId !== intent.operationId) {
@@ -1032,8 +1137,8 @@ export class DesktopBrowserRelayService {
       }
       const history = this.dispatchHistoryById.get(pending.dispatchId);
       if (history) history.state = "accepted";
-      if (this.operationStore) await this.operationStore.recordAccepted(message);
       pending.accepted = message;
+      if (this.operationStore) await this.operationStore.recordAccepted(message);
       return;
     }
     if (message.kind === "host.result") {
@@ -1081,6 +1186,7 @@ export class DesktopBrowserRelayService {
       }
       if (this.operationStore) await this.operationStore.recordTerminal(message);
       connection.pendingDispatch = null;
+      pending.settle();
       this.options.clock.clearTimeout(pending.timeout);
       this.settleDispatch(pending.dispatchId, "terminal");
       pending.resolve({
@@ -1094,6 +1200,20 @@ export class DesktopBrowserRelayService {
       `desktop browser relay operations are not implemented in Ticket04: ${JSON.stringify(message.kind)}`,
     );
   }
+
+    private async withCurrentConnectionOwner<T>(connection: RelayConnectionState, run: () => Promise<T>): Promise<boolean> {
+    if (!connection.binding) return false;
+    const result = await this.connectionOwnerStore.withConnectionOwner(
+      {
+      connectionId: connection.connectionId,
+      connectionEpoch: connection.binding.connectionEpoch,
+      devicePublicKey: connection.binding.devicePublicKey,
+      brokerInstanceId: connection.binding.brokerInstanceId,
+      },
+      run,
+    );
+    return result.status === "ok";
+    }
 
   private async handleHello(connection: RelayConnectionState, message: HostHelloMessage): Promise<void> {
     const binding = await this.options.registry.resolveBinding({
@@ -1119,6 +1239,10 @@ export class DesktopBrowserRelayService {
       message.payload.supportedPolicyGrammarVersions,
       this.options.supportedPolicyGrammarVersions,
     );
+    const owner = await this.connectionOwnerStore.connectionOwner({
+      devicePublicKey: binding.devicePublicKey,
+      brokerInstanceId: binding.brokerInstanceId,
+    });
     const challenge: RelayChallengeMessage = {
       protocolVersion: connection.negotiatedProtocolVersion,
       kind: "relay.challenge",
@@ -1128,7 +1252,10 @@ export class DesktopBrowserRelayService {
         deploymentCanonicalId: this.options.deploymentCanonicalId,
         brokerInstanceId: binding.brokerInstanceId,
         browserInstanceId: binding.browserInstanceId,
-        connectionEpoch: binding.connectionEpoch,
+        connectionEpoch:
+          owner && owner.connectionId !== connection.connectionId
+            ? owner.connectionEpoch + 1
+            : owner?.connectionEpoch ?? binding.connectionEpoch,
       },
     };
     connection.challenge = challenge;
@@ -1179,16 +1306,30 @@ export class DesktopBrowserRelayService {
     if (payload.challengeNonce !== expected.challengeNonce) {
       throw new Error("host challenge-response nonce is stale or does not match the issued challenge");
     }
-    const latest = await this.options.registry.resolveBinding({
+    const claimed = await this.connectionOwnerStore.claimConnectionOwner({
       devicePublicKey: connection.binding.devicePublicKey,
       brokerInstanceId: connection.binding.brokerInstanceId,
+      connectionId: connection.connectionId,
+      connectionEpoch: expected.connectionEpoch,
+      initialEpoch: connection.binding.connectionEpoch,
     });
-    if (!latest) {
+    if (!claimed) {
+      const currentOwner = await this.connectionOwnerStore.connectionOwner({
+        devicePublicKey: connection.binding.devicePublicKey,
+        brokerInstanceId: connection.binding.brokerInstanceId,
+      });
+      if (currentOwner && currentOwner.connectionEpoch >= expected.connectionEpoch) {
+        throw new Error("host challenge-response arrived for a stale connection epoch");
+      }
       throw new Error("desktop browser binding expired before the host answered the challenge");
+    }
+    const latest = { ...connection.binding, connectionEpoch: expected.connectionEpoch };
+    if (expected.connectionEpoch > connection.binding.connectionEpoch) {
+      this.metricValues.reconnects += 1;
     }
     if (
       latest.browserInstanceId !== connection.binding.browserInstanceId ||
-      latest.connectionEpoch !== connection.binding.connectionEpoch
+      latest.connectionEpoch !== expected.connectionEpoch
     ) {
       if (latest.connectionEpoch > connection.binding.connectionEpoch) {
         throw new Error("host challenge-response arrived for a stale connection epoch");
@@ -1211,22 +1352,49 @@ export class DesktopBrowserRelayService {
     this.currentByIdentity.set(key, connection.connectionId);
     this.clearStageTimer(connection);
     this.startHeartbeat(connection);
-    await this.publishProjection(connection);
+    this.metricValues.authenticatedConnections += 1;
+    void this.publishProjection(connection);
   }
 
   private startHeartbeat(connection: RelayConnectionState): void {
     this.clearHeartbeat(connection);
     connection.heartbeatTimer = this.options.clock.setInterval(() => {
-      connection.socket.ping();
-      this.clearHeartbeatDeadline(connection);
-      connection.heartbeatDeadlineTimer = this.options.clock.setTimeout(() => {
-        void this.failConnection(connection, "desktop browser relay heartbeat timed out");
-      }, this.options.heartbeatGraceMs);
+      void this.sendHeartbeat(connection);
     }, this.options.heartbeatIntervalMs);
+  }
+
+  private async sendHeartbeat(connection: RelayConnectionState): Promise<void> {
+    if (!(await this.isCurrentConnectionOwner(connection))) {
+      await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+      return;
+    }
+    connection.socket.ping();
+    this.clearHeartbeatDeadline(connection);
+    connection.heartbeatDeadlineTimer = this.options.clock.setTimeout(() => {
+      this.metricValues.heartbeatTimeouts += 1;
+      void this.failConnection(connection, "desktop browser relay heartbeat timed out");
+    }, this.options.heartbeatGraceMs);
+  }
+
+  private isCurrentConnectionOwner(connection: RelayConnectionState): Promise<boolean> {
+    if (!connection.binding) return Promise.resolve(false);
+    return this.connectionOwnerStore.isConnectionOwner({
+      connectionId: connection.connectionId,
+      connectionEpoch: connection.binding.connectionEpoch,
+      devicePublicKey: connection.binding.devicePublicKey,
+      brokerInstanceId: connection.binding.brokerInstanceId,
+    });
   }
 
   private async recordHeartbeat(connection: RelayConnectionState): Promise<void> {
     if (connection.stage !== "pending" && connection.stage !== "registered") return;
+    if (
+      !connection.binding ||
+      !(await this.isCurrentConnectionOwner(connection))
+    ) {
+      await this.closeConnection(connection, 1008, "connection superseded by a newer Relay owner");
+      return;
+    }
     connection.lastSeenAt = this.options.clock.now();
     this.clearHeartbeatDeadline(connection);
     await this.publishProjection(connection);
@@ -1242,31 +1410,41 @@ export class DesktopBrowserRelayService {
       return;
     }
     const projection = this.snapshot(connection);
-    await this.options.registry.publishConnection({
-      connectionId: projection.connectionId,
-      publicDeviceFingerprint: projection.publicDeviceFingerprint,
-      brokerInstanceId: projection.brokerInstanceId,
-      browserInstanceId: projection.browserInstanceId,
-      connectionEpoch: projection.connectionEpoch,
-      registrationState: projection.registrationState,
-      protocolVersion: projection.protocolVersion,
-      policyGrammarVersion: projection.policyGrammarVersion,
-      brokerVersion: projection.brokerVersion,
-      bskVersion: projection.bskVersion,
-      extensionVersion: projection.extensionVersion,
-      cliShapeHash: projection.cliShapeHash,
-      lastSeenAt: projection.lastSeenAt,
-    });
-    connection.projectionPublished = true;
+    try {
+      await this.options.registry.publishConnection({
+        connectionId: projection.connectionId,
+        publicDeviceFingerprint: projection.publicDeviceFingerprint,
+        brokerInstanceId: projection.brokerInstanceId,
+        browserInstanceId: projection.browserInstanceId,
+        connectionEpoch: projection.connectionEpoch,
+        registrationState: projection.registrationState,
+        protocolVersion: projection.protocolVersion,
+        policyGrammarVersion: projection.policyGrammarVersion,
+        brokerVersion: projection.brokerVersion,
+        bskVersion: projection.bskVersion,
+        extensionVersion: projection.extensionVersion,
+        cliShapeHash: projection.cliShapeHash,
+        lastSeenAt: projection.lastSeenAt,
+      });
+      connection.projectionPublished = true;
+    } catch {
+      this.metricValues.projectionFailures += 1;
+    }
   }
 
   private async failConnection(connection: RelayConnectionState, reason: string): Promise<void> {
     if (connection.stage === "closing") return;
+    if (connection.stage === "awaiting_hello" || connection.stage === "awaiting_challenge_response") {
+      this.metricValues.authenticationFailures += 1;
+    }
     await this.closeConnection(connection, 1008, reason);
   }
 
   private async closeConnection(connection: RelayConnectionState, code: number, reason: string): Promise<void> {
     if (connection.stage === "closing") return;
+    if (reason.includes("replaced by a newer") || reason.includes("superseded")) {
+      this.metricValues.replacements += 1;
+    }
     connection.stage = "closing";
     connection.closeReason = reason;
     connection.socket.close(code, reason);
@@ -1281,6 +1459,7 @@ export class DesktopBrowserRelayService {
     if (connection.pendingDispatch) {
       const pending = connection.pendingDispatch;
       connection.pendingDispatch = null;
+      pending.settle();
       this.options.clock.clearTimeout(pending.timeout);
       this.settleDispatch(pending.dispatchId, pending.accepted ? "accepted" : "unknown");
       const error = this.relayDeliveryUnknown(
@@ -1297,6 +1476,7 @@ export class DesktopBrowserRelayService {
           console.error(`[qm-broker-relay] failed to persist accepted-unknown operationId=${pending.operationId}`);
         }
       }
+      if (pending.accepted) this.metricValues.unknownEffects += 1;
       pending.resolve(
         pending.accepted
           ? {
@@ -1321,7 +1501,9 @@ export class DesktopBrowserRelayService {
       }
     }
     if (connection.projectionPublished) {
-      await this.options.registry.clearConnection(connection.connectionId);
+      await this.options.registry.clearConnection(connection.connectionId).catch(() => {
+        this.metricValues.projectionFailures += 1;
+      });
       connection.projectionPublished = false;
     }
   }

@@ -1,4 +1,5 @@
 import pg, { type PoolClient } from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type {
   HostAcceptedMessage,
@@ -135,6 +136,9 @@ function schemaStatements(schema: string): string[] {
     `CREATE TABLE IF NOT EXISTS ${schema}.core_request_nonces(
       nonce TEXT PRIMARY KEY, expires_at BIGINT NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS ${schema}.connection_owners(
+      identity_key TEXT PRIMARY KEY, connection_id TEXT NOT NULL, connection_epoch BIGINT NOT NULL
+    )`,
     `CREATE TABLE IF NOT EXISTS ${schema}.local_stop_evidence(
       receipt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
       operation_id TEXT NOT NULL, message JSONB NOT NULL, received_at BIGINT NOT NULL
@@ -178,6 +182,14 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
   const schema = schemaName(options.schema);
   const pool = new pg.Pool({ connectionString: options.connectionString });
   const ready = Promise.resolve();
+  const transactionClient = new AsyncLocalStorage<PoolClient>();
+  const runTransaction = <T>(run: (client: PoolClient) => Promise<T>): Promise<T> => {
+    const active = transactionClient.getStore();
+    if (active) return run(active);
+    return transaction(pool, (client) => transactionClient.run(client, () => run(client)));
+  };
+  const connectionKey = (input: { devicePublicKey: string; brokerInstanceId: string }) =>
+    createHash("sha256").update(`${input.devicePublicKey}\0${input.brokerInstanceId}`).digest("hex");
 
   const getOperation = async (client: PoolClient, operationId: string) => {
     const selected = await client.query(`SELECT * FROM ${schema}.operations WHERE operation_id = $1 FOR UPDATE`, [
@@ -189,8 +201,68 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
   };
 
   return {
+    async connectionOwner(input) {
+      await ready;
+      const query = transactionClient.getStore() ?? pool;
+      const result = await query.query(
+        `SELECT connection_id, connection_epoch FROM ${schema}.connection_owners WHERE identity_key=$1`,
+        [connectionKey(input)],
+      );
+      const row = result.rows[0];
+      return row
+        ? { connectionId: String(row.connection_id), connectionEpoch: Number(row.connection_epoch) }
+        : null;
+    },
+    async claimConnectionOwner(input) {
+      await ready;
+      return runTransaction(async (client) => {
+        const key = connectionKey(input);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [key]);
+        const selected = await client.query(
+          `SELECT connection_id, connection_epoch FROM ${schema}.connection_owners WHERE identity_key=$1 FOR UPDATE`,
+          [key],
+        );
+        const current = selected.rows[0];
+        let expected = input.initialEpoch;
+        if (current && String(current.connection_id) === input.connectionId) expected = Number(current.connection_epoch);
+        else if (current) expected = Number(current.connection_epoch) + 1;
+        if (input.connectionEpoch !== expected) return false;
+        await client.query(
+          `INSERT INTO ${schema}.connection_owners(identity_key, connection_id, connection_epoch)
+           VALUES($1,$2,$3)
+           ON CONFLICT(identity_key) DO UPDATE SET connection_id=EXCLUDED.connection_id,
+             connection_epoch=EXCLUDED.connection_epoch`,
+          [key, input.connectionId, input.connectionEpoch],
+        );
+        return true;
+      });
+    },
+    async isConnectionOwner(input) {
+      const owner = await this.connectionOwner(input);
+      return owner?.connectionId === input.connectionId && owner.connectionEpoch === input.connectionEpoch;
+    },
+    async withConnectionOwner(input, run) {
+      await ready;
+      return runTransaction(async (client) => {
+        const key = connectionKey(input);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [key]);
+        const selected = await client.query(
+          `SELECT connection_id, connection_epoch FROM ${schema}.connection_owners WHERE identity_key=$1`,
+          [key],
+        );
+        const owner = selected.rows[0];
+        if (
+          !owner ||
+          String(owner.connection_id) !== input.connectionId ||
+          Number(owner.connection_epoch) !== input.connectionEpoch
+        ) {
+          return { status: "superseded" as const };
+        }
+        return { status: "ok" as const, result: await run() };
+      });
+    },
     async consumeCoreNonce(nonce, expiresAt, now) {
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         await client.query(`DELETE FROM ${schema}.core_request_nonces WHERE expires_at <= $1`, [now]);
         const inserted = await client.query(
           `INSERT INTO ${schema}.core_request_nonces(nonce, expires_at) VALUES($1, $2)
@@ -202,7 +274,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async prepare(invocation) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const authority = invocation.payload.authority;
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [authority.attemptId]);
         const selected = await client.query(
@@ -259,9 +331,13 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
         return { status: "prepared" as const, checkpoint: checkpoint(saved.rows[0] as Record<string, unknown>) };
       });
     },
+    async markDeliveryStartedIfOwner(owner, attemptId, dispatchId) {
+      const result = await this.withConnectionOwner(owner, () => this.markDeliveryStarted(attemptId, dispatchId));
+      return result.status === "ok" ? result.result : null;
+    },
     async markDeliveryStarted(attemptId, dispatchId) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const selected = await client.query(
           `SELECT * FROM ${schema}.operation_checkpoints WHERE attempt_id=$1 FOR UPDATE`,
           [attemptId],
@@ -284,7 +360,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async markDeliveryNotStarted(attemptId, dispatchId) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const selected = await client.query(
           `SELECT * FROM ${schema}.operation_checkpoints WHERE attempt_id=$1 FOR UPDATE`,
           [attemptId],
@@ -305,7 +381,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async recordAccepted(message) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const operation = await getOperation(client, message.payload.operationId);
         if (
           operation.request_hash !== message.payload.requestHash ||
@@ -352,7 +428,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async recordAcceptedUnknown(message) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const operation = await getOperation(client, message.payload.operationId);
         if (
           operation.request_hash !== message.payload.requestHash ||
@@ -403,7 +479,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async recordLeaseRevocation(input) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const selected = await client.query(
           `SELECT o.* FROM ${schema}.operation_checkpoints c
            JOIN ${schema}.operations o ON o.operation_id=c.operation_id
@@ -429,7 +505,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async recordLocalStopReceipt(message, host) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [message.payload.receiptId]);
         const operation = await getOperation(client, message.payload.operationId);
         const expectedCategory = localStopCategory(operation.effect_class);
@@ -528,7 +604,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
       if (!owner || !Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
         throw new Error("desktop browser Local Stop callback claim bounds are invalid");
       }
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const at = now();
         const selected = await client.query(
           `WITH candidates AS (
@@ -574,7 +650,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     },
     async recordTerminal(message) {
       await ready;
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const operation = await getOperation(client, message.payload.operationId);
         if (operation.dispatch_id !== message.payload.dispatchId) {
           throw new Error("desktop browser Relay terminal dispatch does not match checkpoint");
@@ -723,7 +799,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
       if (!owner || !Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
         throw new Error("desktop browser Relay callback claim bounds are invalid");
       }
-      return transaction(pool, async (client) => {
+      return runTransaction(async (client) => {
         const at = now();
         const selected = await client.query(
           `WITH candidates AS (
@@ -765,6 +841,7 @@ export function createPostgresDesktopBrowserRelayOperationStore(options: {
     async check() {
       await ready;
       await pool.query(`SELECT 1 FROM ${schema}.operation_checkpoints LIMIT 1`);
+      await pool.query(`SELECT 1 FROM ${schema}.connection_owners LIMIT 1`);
     },
     async close() {
       await ready.catch(() => undefined);

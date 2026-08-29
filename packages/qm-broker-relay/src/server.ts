@@ -27,7 +27,7 @@ export interface DesktopBrowserRelayServerOptions {
 
 export interface DesktopBrowserRelayReadyState {
   ok: boolean;
-  config: { ok: boolean };
+  config: { ok: boolean; message?: string };
   adapter: { ok: boolean; message?: string };
   storage: { ok: boolean; message?: string };
 }
@@ -104,17 +104,25 @@ export function createDesktopBrowserRelayServer(
   const detach = attachDesktopBrowserRelayWebSocketServer(wsServer, options.service);
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | null = null;
+  let healthChecks = 0;
+  let readinessChecks = 0;
 
   const server = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://relay.local");
     const pathname = url.pathname;
     if (req.method === "GET" && pathname === "/healthz") {
+      healthChecks += 1;
       sendJson(res, 200, { ok: true });
       return;
     }
     if (req.method === "GET" && pathname === "/readyz") {
+      readinessChecks += 1;
       const state = await runtime.ready();
       sendJson(res, state.ok ? 200 : 503, state);
+      return;
+    }
+    if (req.method === "GET" && pathname === "/metrics") {
+      sendJson(res, 200, { ...options.service.metrics(), healthChecks, readinessChecks });
       return;
     }
     if (req.method === "POST" && pathname === "/v1/invocations" && options.coreAuthSecret) {
@@ -220,7 +228,7 @@ export function createDesktopBrowserRelayServer(
   });
 
   server.on("upgrade", (req, socket, head) => {
-    if (shuttingDown) {
+    if (shuttingDown || options.service.isDraining()) {
       rejectUpgrade(socket);
       return;
     }
@@ -244,7 +252,9 @@ export function createDesktopBrowserRelayServer(
     },
 
     async ready() {
-      const config = { ok: true };
+      const config = options.service.isDraining()
+        ? { ok: false, message: "Relay is draining" }
+        : { ok: true };
       const adapter = await probe(options.adapterReadiness);
       const storage = await probe(options.storageReadiness);
       return { ok: config.ok && adapter.ok && storage.ok, config, adapter, storage };
@@ -269,6 +279,7 @@ export function createDesktopBrowserRelayServer(
     async shutdown() {
       if (shutdownPromise) return shutdownPromise;
       shuttingDown = true;
+      options.service.beginDrain();
       shutdownPromise = (async () => {
         detach();
         server.closeIdleConnections();
@@ -276,7 +287,7 @@ export function createDesktopBrowserRelayServer(
           server.closeAllConnections();
         }, options.shutdownDrainMs);
         try {
-          await options.service.drain();
+          await options.service.drain(options.shutdownDrainMs);
           await new Promise<void>((resolve) => wsServer.close(() => resolve()));
           await new Promise<void>((resolve) => server.close(() => resolve()));
         } finally {

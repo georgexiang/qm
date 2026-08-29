@@ -171,6 +171,70 @@ test("confirm verifies the shared canonical bytes with Ed25519, spends the reser
   assert.equal(await registry.challengeBinding(reserved.reservation.registrationTuple.registrationId), null);
 });
 
+test("Ticket 14 mirrors only monotonic Relay owner projections and marks disconnect offline", async () => {
+  const { registry } = createRegistry();
+  const identity = createKeyMaterial();
+  const reserved = assertReserved(
+    await registry.reserve({
+      waitingTaskId: "task-owner",
+      actorId: "owner",
+      projectId: "project-owner",
+      membershipEpoch: 42,
+      authorityId: "authority-owner",
+      authorityExpiresAt: 1_725_000_600_000,
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-owner",
+      browserInstanceId: "browser-owner",
+      connectionEpoch: 7,
+      operatingSystem: "macos-arm64",
+    }),
+  );
+  assert.equal(
+    (
+      await registry.confirm({
+        registrationId: reserved.reservation.registrationTuple.registrationId,
+        authorityId: "authority-owner",
+        browserRuntimeStatus: "ready",
+        envelope: confirmationEnvelope(reserved.reservation, identity.signEnvelope),
+      })
+    ).status,
+    "ok",
+  );
+
+  const projection = (connectionId: string, connectionEpoch: number) => ({
+    connectionId,
+    publicDeviceFingerprint: reserved.reservation.publicDeviceFingerprint,
+    brokerInstanceId: "broker-owner",
+    browserInstanceId: "browser-owner",
+    connectionEpoch,
+    registrationState: "registered" as const,
+    protocolVersion: "1.2",
+    policyGrammarVersion: "1.0",
+    brokerVersion: "1.0.0",
+    bskVersion: "1.0.0",
+    extensionVersion: "1.0.0",
+    cliShapeHash: "sha256:shape",
+    lastSeenAt: `2024-08-30T06:40:0${connectionEpoch - 7}.000Z`,
+  });
+  await registry.publishRelayConnection(projection("connection-1", 7));
+  await registry.publishRelayConnection(projection("connection-2", 9));
+  await assert.rejects(
+    registry.publishRelayConnection(projection("connection-1", 7)),
+    /current durable owner/,
+  );
+  await registry.clearRelayConnection("connection-1");
+  assert.equal(
+    (await registry.relayBinding({
+      devicePublicKey: identity.devicePublicKey,
+      brokerInstanceId: "broker-owner",
+    }))?.connectionEpoch,
+    9,
+  );
+  assert.equal((await registry.projectProjection("project-owner"))?.device.status, "online");
+  await registry.clearRelayConnection("connection-2");
+  assert.equal((await registry.projectProjection("project-owner"))?.device.status, "offline");
+});
+
 test("Ticket 09 one Device accepts only one Task claim without disclosing its owner", async () => {
   const { registry } = createRegistry();
   const { devicePublicKey, signEnvelope } = createKeyMaterial();

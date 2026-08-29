@@ -45,6 +45,10 @@ import {
   desktopBrowserSessionStartCompletedResultFixture,
 } from "../packages/desktop-browser-contracts/src/fixtures.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "../src/desktop-browser/relay-dispatcher.ts";
+import { createPostgresDesktopBrowserRelayOperationStore } from "../packages/qm-broker-relay/src/operation-postgres.ts";
+
+const POSTGRES_URL = process.env.DATABASE_URL;
+const postgresSkip = POSTGRES_URL ? false : "set DATABASE_URL to run Relay PostgreSQL ownership tests";
 
 class Probe implements DesktopBrowserRelayReadinessProbe {
   error: string | null = null;
@@ -54,9 +58,65 @@ class Probe implements DesktopBrowserRelayReadinessProbe {
   }
 }
 
+test("Ticket 14 PostgreSQL owner claims have one monotonic concurrent winner", { skip: postgresSkip }, async () => {
+  const schema = `desktop_relay_test_${process.pid}_${Date.now()}`;
+  const store = createPostgresDesktopBrowserRelayOperationStore({ connectionString: POSTGRES_URL!, schema });
+  try {
+    await store.check();
+    const firstClaims = await Promise.all([
+      store.claimConnectionOwner({
+        devicePublicKey: "device-first",
+        brokerInstanceId: "broker-first",
+        connectionId: "connection-first-a",
+        connectionEpoch: 7,
+        initialEpoch: 7,
+      }),
+      store.claimConnectionOwner({
+        devicePublicKey: "device-first",
+        brokerInstanceId: "broker-first",
+        connectionId: "connection-first-b",
+        connectionEpoch: 7,
+        initialEpoch: 7,
+      }),
+    ]);
+    assert.deepEqual(firstClaims.sort(), [false, true]);
+    assert.equal(
+      await store.claimConnectionOwner({
+        devicePublicKey: "device-1",
+        brokerInstanceId: "broker-1",
+        connectionId: "connection-1",
+        connectionEpoch: 7,
+        initialEpoch: 7,
+      }),
+      true,
+    );
+    const raced = await Promise.all([
+      store.claimConnectionOwner({
+        devicePublicKey: "device-1",
+        brokerInstanceId: "broker-1",
+        connectionId: "connection-2",
+        connectionEpoch: 8,
+        initialEpoch: 7,
+      }),
+      store.claimConnectionOwner({
+        devicePublicKey: "device-1",
+        brokerInstanceId: "broker-1",
+        connectionId: "connection-3",
+        connectionEpoch: 8,
+        initialEpoch: 7,
+      }),
+    ]);
+    assert.deepEqual(raced.sort(), [false, true]);
+    assert.equal((await store.connectionOwner({ devicePublicKey: "device-1", brokerInstanceId: "broker-1" }))?.connectionEpoch, 8);
+  } finally {
+    await store.close();
+  }
+});
+
 class MemoryRegistry implements DesktopBrowserRelayRegistryAdapter, DesktopBrowserRelayReadinessProbe {
   error: string | null = null;
   binding: DesktopBrowserRelayBinding | null = null;
+  owner: { connectionId: string; connectionEpoch: number } | null = null;
   published: DesktopBrowserRelayProjection[] = [];
   cleared: string[] = [];
 
@@ -69,10 +129,23 @@ class MemoryRegistry implements DesktopBrowserRelayRegistryAdapter, DesktopBrows
     brokerInstanceId: string;
   }): Promise<DesktopBrowserRelayBinding | null> {
     if (!this.binding) return null;
-    return this.binding.devicePublicKey === input.devicePublicKey &&
-      this.binding.brokerInstanceId === input.brokerInstanceId
-      ? this.binding
-      : null;
+    if (this.binding.devicePublicKey !== input.devicePublicKey || this.binding.brokerInstanceId !== input.brokerInstanceId) return null;
+    return this.owner
+      ? { ...this.binding, connectionEpoch: this.owner.connectionEpoch, ownerConnectionId: this.owner.connectionId }
+      : this.binding;
+  }
+
+  async claimConnection(input: { connectionId: string; connectionEpoch: number }): Promise<DesktopBrowserRelayBinding | null> {
+    let expected = this.binding?.connectionEpoch;
+    if (this.owner?.connectionId === input.connectionId) expected = this.owner.connectionEpoch;
+    else if (this.owner) expected = this.owner.connectionEpoch + 1;
+    if (!this.binding || input.connectionEpoch !== expected) return null;
+    this.owner = { connectionId: input.connectionId, connectionEpoch: input.connectionEpoch };
+    return { ...this.binding, connectionEpoch: input.connectionEpoch, ownerConnectionId: input.connectionId };
+  }
+
+  async isConnectionOwner(input: { connectionId: string; connectionEpoch: number }): Promise<boolean> {
+    return this.owner?.connectionId === input.connectionId && this.owner.connectionEpoch === input.connectionEpoch;
   }
 
   async publishConnection(projection: DesktopBrowserRelayProjection): Promise<void> {
@@ -330,6 +403,22 @@ test("relay server separates health from readiness and only upgrades the configu
     await once(ws, "open");
     ws.close();
     await once(ws, "close");
+
+    service.beginDrain();
+    const draining = await fetch(`http://127.0.0.1:${port}/readyz`);
+    assert.equal(draining.status, 503);
+    assert.match(JSON.stringify(await draining.json()), /draining/);
+    const metrics = (await fetch(`http://127.0.0.1:${port}/metrics`).then((response) => response.json())) as {
+      draining: boolean;
+      healthChecks: number;
+    };
+    assert.equal(metrics.draining, true);
+    assert.equal(metrics.healthChecks >= 1, true);
+    const rejectedDuringDrain = new Promise<void>((resolve) => {
+      const drainingWs = new WebSocket(`ws://127.0.0.1:${port}/relay`);
+      drainingWs.once("unexpected-response", () => resolve());
+    });
+    await rejectedDuringDrain;
   } finally {
     await runtime.shutdown();
   }
@@ -365,6 +454,13 @@ test("Core dispatcher signs the bounded Relay invocation endpoint", async () => 
         accepted: desktopBrowserSessionStartAcceptedFixture,
         result: desktopBrowserSessionStartCompletedResultFixture,
       };
+    },
+    beginDrain() {},
+    isDraining() {
+      return false;
+    },
+    metrics() {
+      return { draining: false };
     },
     async drain() {},
   } as unknown as DesktopBrowserRelayService;

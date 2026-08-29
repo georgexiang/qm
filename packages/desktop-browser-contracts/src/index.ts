@@ -357,6 +357,7 @@ export interface DesktopBrowserRelayRegistryBinding {
   brokerInstanceId: string;
   browserInstanceId: string;
   connectionEpoch: number;
+  ownerConnectionId?: string;
 }
 
 export interface DesktopBrowserRelayConnectionProjection {

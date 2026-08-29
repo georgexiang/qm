@@ -241,6 +241,7 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
     const response = await fetch(`${this.config.baseUrl}${path}`, {
       method: "GET",
       headers: signedRequestHeaders(this.config.sourceAuthSecret, "GET", path),
+      signal: AbortSignal.timeout(20_000),
     });
     await requireOk(response);
   }
@@ -256,6 +257,7 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
         "content-type": "application/json",
       }),
       body,
+      signal: AbortSignal.timeout(20_000),
     });
     if (response.status === 404) return null;
     await requireOk(response);
@@ -275,6 +277,7 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
         "content-type": "application/json",
       }),
       body,
+      signal: AbortSignal.timeout(20_000),
     });
     await requireOk(response);
   }
@@ -287,6 +290,7 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
     const response = await fetch(`${this.config.baseUrl}${path}`, {
       method: "DELETE",
       headers: signedRequestHeaders(this.config.sourceAuthSecret, "DELETE", path),
+      signal: AbortSignal.timeout(20_000),
     });
     await requireOk(response);
   }
@@ -305,6 +309,7 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
         "content-type": "application/json",
       }),
       body,
+      signal: AbortSignal.timeout(20_000),
     });
     await requireOk(response);
   }
@@ -428,8 +433,9 @@ export function createDesktopBrowserRelayRuntime(
       if (callbackTimer) clearInterval(callbackTimer);
       callbackTimer = null;
       callbackAbort.abort();
-      const work = Promise.allSettled([server.shutdown(), callbackDelivery, operationClose()]);
-      await waitForDesktopBrowserRelayShutdown(work, config.shutdownDrainMs);
+      await server.shutdown();
+      await waitForDesktopBrowserRelayShutdown(callbackDelivery, config.shutdownDrainMs);
+      await waitForDesktopBrowserRelayShutdown(operationClose(), config.shutdownDrainMs);
     },
   };
 }
@@ -449,8 +455,14 @@ export async function runDesktopBrowserRelayProcess(
     process.off("SIGTERM", onSigterm);
     await runtime.shutdown(signal);
   };
-  const onSigint = () => void shutdown("SIGINT");
-  const onSigterm = () => void shutdown("SIGTERM");
+  const exitAfterShutdown = (signal: string) => {
+    void shutdown(signal).then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
+  };
+  const onSigint = () => exitAfterShutdown("SIGINT");
+  const onSigterm = () => exitAfterShutdown("SIGTERM");
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
 

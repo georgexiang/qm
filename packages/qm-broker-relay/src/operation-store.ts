@@ -96,6 +96,38 @@ export interface DesktopBrowserRelayOperationState {
   localStopEvidence?: DesktopBrowserRelayLocalStopEvidence[];
   localStopCallbackOutbox?: DesktopBrowserRelayLocalStopCallbackEntry[];
   coreNonceExpirations?: Record<string, number>;
+  connectionOwners?: Record<string, DesktopBrowserRelayConnectionOwner>;
+}
+
+export interface DesktopBrowserRelayConnectionOwner {
+  connectionId: string;
+  connectionEpoch: number;
+}
+
+export interface DesktopBrowserRelayConnectionOwnerStore {
+  connectionOwner(input: { devicePublicKey: string; brokerInstanceId: string }): Promise<DesktopBrowserRelayConnectionOwner | null>;
+  claimConnectionOwner(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+    connectionId: string;
+    connectionEpoch: number;
+    initialEpoch: number;
+  }): Promise<boolean>;
+  isConnectionOwner(input: {
+    devicePublicKey: string;
+    brokerInstanceId: string;
+    connectionId: string;
+    connectionEpoch: number;
+  }): Promise<boolean>;
+  withConnectionOwner<T>(
+    input: {
+      devicePublicKey: string;
+      brokerInstanceId: string;
+      connectionId: string;
+      connectionEpoch: number;
+    },
+    run: () => Promise<T>,
+  ): Promise<{ status: "ok"; result: T } | { status: "superseded" }>;
 }
 
 export interface DesktopBrowserRelayOperationBacking {
@@ -103,13 +135,23 @@ export interface DesktopBrowserRelayOperationBacking {
   snapshot(): Promise<DesktopBrowserRelayOperationState>;
 }
 
-export interface DesktopBrowserRelayOperationStore {
+export interface DesktopBrowserRelayOperationStore extends DesktopBrowserRelayConnectionOwnerStore {
   consumeCoreNonce(nonce: string, expiresAt: number, now: number): Promise<boolean>;
   prepare(invocation: RelayInvocationMessage): Promise<{
     status: "prepared" | "existing";
     checkpoint: DesktopBrowserRelayOperationCheckpoint;
   }>;
   markDeliveryStarted(attemptId: string, dispatchId: string): Promise<DesktopBrowserRelayOperationCheckpoint>;
+  markDeliveryStartedIfOwner(
+    owner: {
+      devicePublicKey: string;
+      brokerInstanceId: string;
+      connectionId: string;
+      connectionEpoch: number;
+    },
+    attemptId: string,
+    dispatchId: string,
+  ): Promise<DesktopBrowserRelayOperationCheckpoint | null>;
   markDeliveryNotStarted(attemptId: string, dispatchId: string): Promise<DesktopBrowserRelayOperationCheckpoint>;
   recordAccepted(message: HostAcceptedMessage): Promise<DesktopBrowserRelayOperationCheckpoint>;
   recordAcceptedUnknown(message: HostAcceptedMessage): Promise<HostResultMessage>;
@@ -228,7 +270,52 @@ export function createDesktopBrowserRelayOperationStore(
   options: { now?: () => number } = {},
 ): DesktopBrowserRelayOperationStore {
   const now = options.now ?? Date.now;
+  const connectionKey = (input: { devicePublicKey: string; brokerInstanceId: string }) =>
+    createHash("sha256").update(`${input.devicePublicKey}\0${input.brokerInstanceId}`).digest("hex");
+  const ownerQueues = new Map<string, Promise<void>>();
   return {
+    async connectionOwner(input) {
+      const state = await backing.snapshot();
+      return state.connectionOwners?.[connectionKey(input)] ?? null;
+    },
+    async claimConnectionOwner(input) {
+      return backing.transaction((state) => {
+        state.connectionOwners ??= {};
+        const key = connectionKey(input);
+        const current = state.connectionOwners[key];
+        let expected = input.initialEpoch;
+        if (current?.connectionId === input.connectionId) expected = current.connectionEpoch;
+        else if (current) expected = current.connectionEpoch + 1;
+        if (input.connectionEpoch !== expected) return false;
+        state.connectionOwners[key] = {
+          connectionId: input.connectionId,
+          connectionEpoch: input.connectionEpoch,
+        };
+        return true;
+      });
+    },
+    async isConnectionOwner(input) {
+      const owner = await this.connectionOwner(input);
+      return owner?.connectionId === input.connectionId && owner.connectionEpoch === input.connectionEpoch;
+    },
+    async withConnectionOwner(input, run) {
+      const key = connectionKey(input);
+      const previous = ownerQueues.get(key) ?? Promise.resolve();
+      let release!: () => void;
+      const current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const queued = previous.then(() => current);
+      ownerQueues.set(key, queued);
+      await previous;
+      try {
+        if (!(await this.isConnectionOwner(input))) return { status: "superseded" };
+        return { status: "ok", result: await run() };
+      } finally {
+        release();
+        if (ownerQueues.get(key) === queued) ownerQueues.delete(key);
+      }
+    },
     async consumeCoreNonce(nonce, expiresAt, now) {
       return backing.transaction((state) => {
         state.coreNonceExpirations ??= {};
@@ -283,6 +370,10 @@ export function createDesktopBrowserRelayOperationStore(
         };
         return { status: "prepared" as const, checkpoint };
       });
+    },
+    async markDeliveryStartedIfOwner(owner, attemptId, dispatchId) {
+      const result = await this.withConnectionOwner(owner, () => this.markDeliveryStarted(attemptId, dispatchId));
+      return result.status === "ok" ? result.result : null;
     },
     async markDeliveryStarted(attemptId, dispatchId) {
       return backing.transaction((state) => {

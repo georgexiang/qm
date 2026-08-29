@@ -102,6 +102,7 @@ interface DesktopBrowserDeviceRegistryState {
   >;
   projectHeads: Record<string, DesktopBrowserProjectHeadRecord>;
   relayConnections: Record<string, DesktopBrowserRelayConnectionProjection>;
+  relayConnectionOwners?: Record<string, { connectionId: string; connectionEpoch: number }>;
   reconciliations?: Record<string, number>;
 }
 
@@ -238,7 +239,14 @@ export type DesktopBrowserConfirmMutationPoint =
 const REGISTRY_STATE_ID = "desktop-browser-device-registry";
 
 function emptyRegistryState(): DesktopBrowserDeviceRegistryState {
-  return { registrations: {}, taskClaims: {}, deviceClaims: {}, projectHeads: {}, relayConnections: {} };
+  return {
+    registrations: {},
+    taskClaims: {},
+    deviceClaims: {},
+    projectHeads: {},
+    relayConnections: {},
+    relayConnectionOwners: {},
+  };
 }
 
 function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBrowserDeviceRegistryState {
@@ -248,6 +256,7 @@ function cloneRegistryState(state: DesktopBrowserDeviceRegistryState): DesktopBr
     deviceClaims: { ...state.deviceClaims },
     projectHeads: { ...state.projectHeads },
     relayConnections: { ...state.relayConnections },
+    relayConnectionOwners: { ...state.relayConnectionOwners },
     reconciliations: { ...state.reconciliations },
   };
 }
@@ -263,7 +272,7 @@ function relayBindingFromRecord(record: DesktopBrowserRegistrationRecord): Deskt
       connectionEpoch: record.registrationTuple.connectionEpoch,
     };
   }
-  if (record.status !== "online") return null;
+  if (record.status !== "online" && record.status !== "offline") return null;
   return {
     registrationId: record.registrationId,
     registrationState: "registered",
@@ -272,6 +281,10 @@ function relayBindingFromRecord(record: DesktopBrowserRegistrationRecord): Deskt
     browserInstanceId: record.registrationTuple.browserInstanceId,
     connectionEpoch: record.registrationTuple.connectionEpoch,
   };
+}
+
+function relayOwnerKey(input: { devicePublicKey: string; brokerInstanceId: string }): string {
+  return createHash("sha256").update(`${input.devicePublicKey}\0${input.brokerInstanceId}`).digest("hex");
 }
 
 function compareRelayBindings(
@@ -300,7 +313,7 @@ function reservationStillCurrent(record: DesktopBrowserRegistrationRecord, at: n
 }
 
 function relayBindingStillCurrent(record: DesktopBrowserRegistrationRecord, at: number): boolean {
-  if (record.status === "online") return true;
+  if (record.status === "online" || record.status === "offline") return true;
   return reservationStillCurrent(record, at);
 }
 
@@ -529,6 +542,13 @@ function sessionStartAuthorityStateFromState(
   if (registration.status !== "online" || registration.browserRuntimeStatus !== "ready") {
     return { status: "refused", reason: "Desktop Browser device is not online" };
   }
+  const owner = state.relayConnectionOwners?.[
+    relayOwnerKey({
+      devicePublicKey: registration.registrationTuple.devicePublicKey,
+      brokerInstanceId: registration.registrationTuple.brokerInstanceId,
+    })
+  ];
+  const currentConnectionEpoch = owner?.connectionEpoch ?? registration.registrationTuple.connectionEpoch;
   const relayConnection = Object.values(state.relayConnections)
     .filter(
       (connection) =>
@@ -536,7 +556,8 @@ function sessionStartAuthorityStateFromState(
         connection.publicDeviceFingerprint === registration.publicDeviceFingerprint &&
         connection.brokerInstanceId === registration.registrationTuple.brokerInstanceId &&
         connection.browserInstanceId === registration.registrationTuple.browserInstanceId &&
-        connection.connectionEpoch === registration.registrationTuple.connectionEpoch,
+        connection.connectionEpoch === currentConnectionEpoch &&
+        (!owner || connection.connectionId === owner.connectionId),
     )
     .sort(
       (left, right) =>
@@ -1085,11 +1106,54 @@ export function createDesktopBrowserDeviceRegistry(
         .map(relayBindingFromRecord)
         .filter((binding): binding is DesktopBrowserRelayRegistryBinding => binding !== null)
         .sort(compareRelayBindings);
-      return bindings[0] ?? null;
+      const binding = bindings[0] ?? null;
+      if (!binding) return null;
+      const owner = state.relayConnectionOwners?.[relayOwnerKey(input)];
+      return owner
+        ? { ...binding, connectionEpoch: owner.connectionEpoch, ownerConnectionId: owner.connectionId }
+        : binding;
     },
 
     async publishRelayConnection(projection) {
       return updateState((state) => {
+        const registration = Object.values(state.registrations).find(
+          (candidate) =>
+            candidate.publicDeviceFingerprint === projection.publicDeviceFingerprint &&
+            candidate.registrationTuple.brokerInstanceId === projection.brokerInstanceId &&
+            candidate.registrationTuple.browserInstanceId === projection.browserInstanceId,
+        );
+        if (!registration) throw new Error("Desktop Browser Relay connection has no current registration");
+        const owner = state.relayConnectionOwners?.[
+          relayOwnerKey({
+            devicePublicKey: registration.registrationTuple.devicePublicKey,
+            brokerInstanceId: registration.registrationTuple.brokerInstanceId,
+          })
+        ];
+        let expectedEpoch = registration.registrationTuple.connectionEpoch;
+        if (owner?.connectionId === projection.connectionId) expectedEpoch = owner.connectionEpoch;
+        else if (owner) expectedEpoch = owner.connectionEpoch + 1;
+        const validEpoch = owner?.connectionId === projection.connectionId
+          ? projection.connectionEpoch === expectedEpoch
+          : projection.connectionEpoch >= expectedEpoch;
+        if (!validEpoch) {
+          throw new Error("Desktop Browser Relay connection is not the current durable owner");
+        }
+        state.relayConnectionOwners ??= {};
+        state.relayConnectionOwners[
+          relayOwnerKey({
+            devicePublicKey: registration.registrationTuple.devicePublicKey,
+            brokerInstanceId: registration.registrationTuple.brokerInstanceId,
+          })
+        ] = { connectionId: projection.connectionId, connectionEpoch: projection.connectionEpoch };
+        if (projection.registrationState === "registered" && registration.status === "offline") {
+          state.registrations[registration.registrationId] = {
+            ...registration,
+            status: "online",
+            browserRuntimeStatus: "ready",
+            lastSeenAt: projection.lastSeenAt,
+            updatedAt: now(),
+          };
+        }
         state.relayConnections[projection.connectionId] = { ...projection };
         return Object.values(state.registrations)
           .filter(
@@ -1105,7 +1169,25 @@ export function createDesktopBrowserDeviceRegistry(
 
     async clearRelayConnection(connectionId) {
       await updateState((state) => {
+        const projection = state.relayConnections[connectionId];
         delete state.relayConnections[connectionId];
+        if (!projection) return;
+        const registration = Object.values(state.registrations).find(
+          (candidate) =>
+            candidate.publicDeviceFingerprint === projection.publicDeviceFingerprint &&
+            candidate.registrationTuple.brokerInstanceId === projection.brokerInstanceId &&
+            candidate.registrationTuple.browserInstanceId === projection.browserInstanceId,
+        );
+        if (!registration) return;
+        const owner = state.relayConnectionOwners?.[
+          relayOwnerKey({
+            devicePublicKey: registration.registrationTuple.devicePublicKey,
+            brokerInstanceId: registration.registrationTuple.brokerInstanceId,
+          })
+        ];
+        if (owner?.connectionId === connectionId) {
+          state.registrations[registration.registrationId] = offlineRecord(registration, now());
+        }
       });
     },
 
