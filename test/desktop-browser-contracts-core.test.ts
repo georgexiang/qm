@@ -176,10 +176,14 @@ test("Core publishes one schema for every Phase F message kind", () => {
     "core.authority",
     "host.accepted",
     "host.challenge-response",
+    "host.device-reconciled",
     "host.hello",
+    "host.local-stop-receipt",
     "host.result",
     "relay.challenge",
+    "relay.device-reconcile-ack",
     "relay.invoke",
+    "relay.local-stop-ack",
   ]);
 });
 

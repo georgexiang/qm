@@ -782,7 +782,7 @@ export function createDesktopBrowserTaskStore(
           }
           bound = {
             ...task,
-            ...(result.payload.outcome === "unknown"
+            ...(result.payload.outcome === "unknown" && task.status === "waiting_for_broker" && !task.outcome
               ? { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }
               : {}),
             execution: {
@@ -1146,7 +1146,7 @@ export function createDesktopBrowserTaskStore(
           completedResult && "schemaVersion" in completedResult && completedResult.command === "session.stop";
         recorded = {
           ...task,
-          ...(status === "unknown"
+          ...(status === "unknown" && task.status === "waiting_for_broker" && !task.outcome
             ? { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }
             : {}),
           operations,
@@ -1191,7 +1191,9 @@ export function createDesktopBrowserTaskStore(
         operations[index] = { ...operation, status: "unknown", resultRecordedAt: at };
         recorded = {
           ...task,
-          ...(operation.operation.authority.effectClass === "observation"
+          ...(operation.operation.authority.effectClass === "observation" ||
+          task.status !== "waiting_for_broker" ||
+          task.outcome
             ? {}
             : { status: "canceled_with_unknown_effects" as const, recoveryExpiresAt: at + 15 * 60_000 }),
           operations,

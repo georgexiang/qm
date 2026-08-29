@@ -851,7 +851,7 @@ test("final confirm waits for a staged host envelope and binds the owner task an
       desktopBrowserActivity?: { status?: string; actions?: string[] };
     };
     assert.equal(confirmedJson.desktopBrowserActivity?.status, "registration_confirmed");
-    assert.deepEqual(confirmedJson.desktopBrowserActivity?.actions, ["cancel"]);
+    assert.deepEqual(confirmedJson.desktopBrowserActivity?.actions, ["continue", "cancel"]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

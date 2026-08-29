@@ -864,6 +864,77 @@ test("Ticket 08 persists Stop and Lease revoke before late result evidence witho
   assert.equal(recorded.task.operations?.at(-1)?.hostResult?.payload.resultHash, "sha256:late-stop-result");
 });
 
+test("late unknown operation evidence never rewrites a persisted terminal outcome", async () => {
+  for (const terminalStatus of ["completed", "failed", "canceled"] as const) {
+    const backing = createMemoryMap<DesktopBrowserTask>();
+    const task = readyTask(`task-late-unknown-${terminalStatus}`, `start-late-unknown-${terminalStatus}`);
+    await backing.put(task.id, task);
+    const ids = [`navigate-late-unknown-${terminalStatus}`, `nonce-late-unknown-${terminalStatus}`];
+    const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => 21_000 });
+    const prepared = await store.prepareOperation(
+      task.id,
+      buildDesktopBrowserNavigateArgv("https://example.test", task.browserSkillSessionId!),
+    );
+    assert.equal(prepared.status, "ok");
+    if (prepared.status !== "ok") continue;
+    const accepted = acceptedFor(prepared.operation, `dispatch-late-unknown-${terminalStatus}`);
+    assert.equal((await store.consumeOperationAccepted(task.id, accepted)).status, "ok");
+    await backing.update?.(task.id, (current) => ({
+      ...current,
+      status: terminalStatus,
+      ...(terminalStatus === "canceled"
+        ? {}
+        : { outcome: { outcome: terminalStatus, summary: "First outcome", finalizedAt: 20_000 } }),
+    }));
+
+    const recorded = await store.consumeOperationResult(task.id, {
+      protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      kind: "host.result",
+      payload: {
+        dispatchId: accepted.payload.dispatchId,
+        operationId: accepted.payload.operationId,
+        outcome: "unknown",
+        resultHash: `sha256:late-unknown-${terminalStatus}`,
+      },
+    });
+
+    assert.equal(recorded.status, "ok");
+    assert.equal(recorded.task.status, terminalStatus);
+    assert.equal(recorded.task.recoveryExpiresAt, undefined);
+    assert.equal(recorded.task.operations?.at(-1)?.status, "unknown");
+  }
+});
+
+test("late operation delivery uncertainty never rewrites a persisted terminal outcome", async () => {
+  for (const terminalStatus of ["completed", "failed", "canceled"] as const) {
+    const backing = createMemoryMap<DesktopBrowserTask>();
+    const task = readyTask(`task-late-delivery-${terminalStatus}`, `start-late-delivery-${terminalStatus}`);
+    await backing.put(task.id, task);
+    const ids = [`navigate-late-delivery-${terminalStatus}`, `nonce-late-delivery-${terminalStatus}`];
+    const store = createDesktopBrowserTaskStore(backing, { id: () => ids.shift()!, now: () => 22_000 });
+    const prepared = await store.prepareOperation(
+      task.id,
+      buildDesktopBrowserNavigateArgv("https://example.test", task.browserSkillSessionId!),
+    );
+    assert.equal(prepared.status, "ok");
+    if (prepared.status !== "ok") continue;
+    await backing.update?.(task.id, (current) => ({
+      ...current,
+      status: terminalStatus,
+      ...(terminalStatus === "canceled"
+        ? {}
+        : { outcome: { outcome: terminalStatus, summary: "First outcome", finalizedAt: 20_000 } }),
+    }));
+
+    const recorded = await store.markOperationDeliveryUnknown(task.id, prepared.operation.authority.operationId);
+
+    assert.equal(recorded.status, "ok");
+    assert.equal(recorded.task.status, terminalStatus);
+    assert.equal(recorded.task.recoveryExpiresAt, undefined);
+    assert.equal(recorded.task.operations?.at(-1)?.status, "unknown");
+  }
+});
+
 test("Ticket 11 Local Stop Receipt terminalizes active work once and never rewrites an earlier outcome", async () => {
   const backing = createMemoryMap<DesktopBrowserTask>();
   const active = readyTask("task-local-receipt-active", "operation-local-receipt-active");
