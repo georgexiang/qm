@@ -428,7 +428,7 @@ test("Ticket 06 never retries unknown navigate and retries lost observation once
       "navigate-task",
       buildDesktopBrowserNavigateArgv("https://example.test", "browser-session-navigate-task"),
     ),
-    { status: "refused", reason: "Desktop Browser Task has an unknown browser effect" },
+    { status: "refused", reason: "Desktop Browser Task already has a terminal outcome" },
   );
   assert.deepEqual(navigateIds, []);
 

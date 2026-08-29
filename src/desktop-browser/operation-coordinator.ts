@@ -333,7 +333,28 @@ export function createDesktopBrowserOperationCoordinator(options: {
     },
     async finalizeForSession(input) {
       if (!options.auditLog) return { status: "refused", reason: "Desktop Browser finalization audit is unavailable" };
-      const task = scopedTask(await options.tasks.listForSession(input.sessionId), input);
+      const sessionTasks = await options.tasks.listForSession(input.sessionId);
+      const currentTaskExists = sessionTasks.some(
+        (candidate) =>
+          candidate.actorId === input.actorId &&
+          projectScopeId(candidate.projectId) === input.projectScopeLabel &&
+          candidate.projectMembershipVersion === input.projectMembershipVersion &&
+          candidate.status === "waiting_for_broker",
+      );
+      const terminalMatches = currentTaskExists
+        ? []
+        : sessionTasks.filter(
+            (candidate) =>
+              candidate.actorId === input.actorId &&
+              projectScopeId(candidate.projectId) === input.projectScopeLabel &&
+              candidate.projectMembershipVersion === input.projectMembershipVersion &&
+              candidate.outcome?.outcome === input.outcome &&
+              candidate.outcome.summary === input.summary.trim(),
+          );
+      const task =
+        scopedTask(sessionTasks, input) ??
+        (terminalMatches.length === 1 ? terminalMatches[0]! : null) ??
+        null;
       if (!task) return { status: "refused", reason: "No active Desktop Browser Task belongs to this Agent session" };
       if (task.browserSkillSessionStoppedAt === undefined) {
         return { status: "refused", reason: "Desktop Browser Task session cleanup is required before finalization" };
