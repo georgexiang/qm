@@ -3,7 +3,7 @@
   "kind": "security",
   "status": "approved",
   "sourceCommit": "26c498174d106f9da04e581db23307aa9da26b48",
-  "reviewedDiffSha256": "6b4a38aceee1127168915acf735608b3db209a63967f603278a2e0709abcd98d",
+  "reviewedDiffSha256": "d8809594aee379d453ed02c3de8d91809b7159e3c6addc5c073acc36f64612f9",
   "reviewedPaths": [
     ".github/workflows/desktop-browser-conformance.yml",
     "adrs/0001-desktop-browser-replaces-local-browser-control.md",

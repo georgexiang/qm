@@ -223,7 +223,7 @@ test("Ticket 13 issues a source-authenticated grant and redeems bytes outside Re
     projectId: "project-1",
     leaseId: "lease-1",
     leaseVersion: 3,
-    leaseExpiresAt: "2026-08-29T12:01:00.000Z",
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
     name: "capture.bin",
     contentType: "application/octet-stream",
     sizeBytes: bytes.length,
