@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "platform": "darwin-arm64",
+  "hostBroker": {
+    "repository": "https://github.com/yc-software/qm.git",
+    "sourceCommit": "936dd2b232e3b143e00f269d18b8c061167024c6",
+    "compiledArtifactSha256": "5d6eac8a2a739a8fee0d4dc803791e83c188c46edeaf475e28a83448a0128105",
+    "toolchain": {
+      "node": "v24.20.0",
+      "npm": "11.19.0",
+      "typescript": "5.9.3"
+    }
+  },
+  "companion": {
+    "extensionId": "nciggffamocnffbemkbjefanopmelkgm",
+    "version": "0.1.0",
+    "browsers": [
+      "chrome",
+      "edge"
+    ],
+    "distribution": "unpacked"
+  },
+  "browserSkill": {
+    "repository": "https://github.com/Tencent/BrowserSkill.git",
+    "sourceCommit": "4b6cdde168f9e46ebff78e8cccaa75c75814cb7c",
+    "target": "aarch64-apple-darwin",
+    "cliSha256": "99bb88401742848e032fd6f51709415fb6be169a72d2e5d7fc44289255160d3c",
+    "extensionArchiveSha256": "26f1de33979d065ba8d86789de634228e3540fee2f6e5a66eebf93f78d83077d"
+  },
+  "commands": [
+    "session.start",
+    "navigate",
+    "observe",
+    "session.stop"
+  ],
+  "autoUpdate": {
+    "hostBroker": false,
+    "browserSkill": false
+  },
+  "install": {
+    "scope": "user-local",
+    "systemService": false,
+    "loginAgent": false,
+    "updater": false
+  }
+}

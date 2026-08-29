@@ -6,8 +6,16 @@ on:
     paths:
       - .github/workflows/desktop-browser-conformance.yml
       - scripts/desktop-browser-conformance.ts
-      - scripts/run-browser-skill-conformance.mjs
+      - scripts/run-browser-skill-conformance.ts
+      - scripts/desktop-browser-phase-f-bundle.ts
+      - scripts/desktop-browser-phase-f-cli.ts
+      - scripts/build-desktop-browser-phase-f-bundle.ts
+      - scripts/install-desktop-browser-phase-f-bundle.ts
+      - scripts/smoke-desktop-browser-phase-f-bundle.ts
+      - packages/qm-host-broker/**
+      - packages/desktop-browser-contracts/**
       - test/desktop-browser-conformance.test.ts
+      - test/desktop-browser-phase-f-bundle.test.ts
 
 permissions:
   contents: read
@@ -89,6 +97,43 @@ jobs:
             --chrome-archive-sha256 "$CHROME_FOR_TESTING_SHA256" \
             --out-dir "$RUNNER_TEMP/conformance-baseline" \
             --mode baseline-source-build
+      - name: Build pinned Phase F bundle
+        run: |
+          npm run build:desktop-browser-phase-f -- \
+            --output "$RUNNER_TEMP/desktop-browser-phase-f.tar.gz" \
+            --fixture "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json" \
+            --host-source-commit 936dd2b232e3b143e00f269d18b8c061167024c6 \
+            --host-artifact-sha256 5d6eac8a2a739a8fee0d4dc803791e83c188c46edeaf475e28a83448a0128105 \
+            --browser-skill-source-commit "$BROWSERSKILL_COMMIT" \
+            --host-source-dir "$GITHUB_WORKSPACE/packages/qm-host-broker" \
+            --contracts-source-dir "$GITHUB_WORKSPACE/packages/desktop-browser-contracts" \
+            --zod-source-dir "$GITHUB_WORKSPACE/node_modules/zod" \
+            --companion-dir "$GITHUB_WORKSPACE/packages/qm-host-broker/companion" \
+            --browser-skill-cli "$RUNNER_TEMP/BrowserSkill/target/aarch64-apple-darwin/release/bsk" \
+            --browser-skill-extension-dir "$RUNNER_TEMP/BrowserSkill/apps/extension/dist/chrome-mv3" \
+            --browser-skill-extension-archive "$RUNNER_TEMP/BrowserSkill/apps/extension/dist/browser-skillextension-0.1.6-chrome.zip" \
+            --conformance-manifest "$RUNNER_TEMP/conformance-baseline/manifest.json" \
+            --node-version "$(node --version)" \
+            --npm-version "$(npm --version)"
+      - name: Smoke installed bundle in Chrome and Edge
+        run: |
+          edge="/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+          test -x "$edge"
+          sha="$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).bundleSha256" "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json")"
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP" >/dev/null 2>&1 &
+          fixture_server=$!
+          trap 'kill "$fixture_server" 2>/dev/null || true' EXIT
+          for browser in chrome edge; do
+            if [ "$browser" = chrome ]; then executable="$CHROME_FOR_TESTING"; else executable="$edge"; fi
+            npm run smoke:desktop-browser-phase-f -- \
+              --bundle "$RUNNER_TEMP/desktop-browser-phase-f.tar.gz" \
+              --sha256 "$sha" \
+              --install-dir "$HOME/.qm/desktop-browser-phase-f-$browser" \
+              --qm-url offline \
+              --browser "$browser" \
+              --browser-executable "$executable" \
+              --fixture-url "http://127.0.0.1:8765/"
+          done
       - name: Download released smoke artifacts
         run: |
           mkdir -p "$RUNNER_TEMP/release-cli" "$RUNNER_TEMP/release-extension"
@@ -143,4 +188,6 @@ jobs:
           path: |
             ${{ runner.temp }}/conformance-baseline
             ${{ runner.temp }}/conformance-release-smoke
+            ${{ runner.temp }}/desktop-browser-phase-f.tar.gz
+            ${{ runner.temp }}/desktop-browser-phase-f.fixture.json
           if-no-files-found: error
