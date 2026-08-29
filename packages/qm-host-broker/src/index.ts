@@ -45,6 +45,8 @@ import {
   projectDesktopBrowserPublicIdentity,
   validateDesktopBrowserPhaseFArgv,
   type DesktopBrowserCompletedResult,
+  type DesktopBrowserArtifactReference,
+  type DesktopBrowserArtifactWarning,
   type DesktopBrowserEffectClass,
   type DesktopBrowserHostFailure,
   type DesktopBrowserOperationAuthorityEnvelope,
@@ -53,6 +55,7 @@ import {
   type DesktopBrowserRegistrationReservationTuple,
   type HostAcceptedMessage,
   type HostResultMessage,
+  type RelayArtifactGrantMessage,
   type HostChallengeResponseMessage,
   type RelayChallengeMessage,
 } from "qm-desktop-browser-contracts";
@@ -167,7 +170,21 @@ export interface HostBrokerConnectionOptions {
   writeObserver?: HostBrokerWriteObserver;
   localControl?: HostBrokerLocalControl;
   deviceStatus?: "ready" | "needs_local_reconciliation";
+  artifactProducer?: HostBrokerArtifactProducer;
+  artifactUploader?: HostBrokerArtifactUploader;
 }
+
+export type HostBrokerArtifactProducer = (input: {
+  authority: DesktopBrowserOperationAuthorityEnvelope;
+  result: DesktopBrowserCompletedResult;
+}) => Promise<{ bytes: Uint8Array; name: string; contentType: string } | null>;
+
+export type HostBrokerArtifactUploader = (input: {
+  grant: RelayArtifactGrantMessage["payload"];
+  deviceId: string;
+  contentType: string;
+  bytes: Uint8Array;
+}) => Promise<DesktopBrowserArtifactReference>;
 
 export interface HostBrokerWriteObserver {
   onFenceCreated?(fence: HostOperationFence): void;
@@ -200,6 +217,19 @@ export interface HostBrokerCliDeps {
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
   companionPort?: number;
+  artifactProducer?: HostBrokerArtifactProducer;
+  artifactUploader?: HostBrokerArtifactUploader;
+}
+
+export function createPhaseFFakeArtifactProducer(): HostBrokerArtifactProducer {
+  return async ({ result }) =>
+    "schemaVersion" in result && result.command === "observe"
+      ? {
+          bytes: Buffer.from("qm-desktop-browser-phase-f-artifact", "utf8"),
+          name: "phase-f-artifact.bin",
+          contentType: "application/octet-stream",
+        }
+      : null;
 }
 
 export interface HostBrokerScheduler {
@@ -290,6 +320,8 @@ type PersistedHostTerminalPayload =
       outcome: "completed";
       resultHash?: string;
       result: DesktopBrowserCompletedResult;
+      artifact?: DesktopBrowserArtifactReference;
+      artifactWarning?: DesktopBrowserArtifactWarning;
     }
   | {
       dispatchId?: string;
@@ -1435,6 +1467,14 @@ function materializeHostResultPayload(
   terminalPayload: PersistedHostTerminalPayload,
 ): HostResultMessage["payload"] {
   if (terminalPayload.outcome === "completed") {
+    let artifactMetadata:
+      | { artifact: DesktopBrowserArtifactReference }
+      | { artifactWarning: DesktopBrowserArtifactWarning }
+      | Record<string, never> = {};
+    if (terminalPayload.artifact) artifactMetadata = { artifact: terminalPayload.artifact };
+    else if (terminalPayload.artifactWarning) {
+      artifactMetadata = { artifactWarning: terminalPayload.artifactWarning };
+    }
     return {
       dispatchId,
       operationId,
@@ -1444,8 +1484,10 @@ function materializeHostResultPayload(
         operationId,
         outcome: "completed",
         result: terminalPayload.result,
+        ...artifactMetadata,
       }),
       result: terminalPayload.result,
+      ...artifactMetadata,
     };
   }
   return {
@@ -1689,6 +1731,17 @@ export class HostBrokerConnection {
   private readonly browserSkillTimeoutMs: number;
   private readonly writeObserver: HostBrokerWriteObserver | null;
     private readonly localControl: HostBrokerLocalControl | null;
+    private readonly artifactProducer: HostBrokerArtifactProducer | null;
+    private readonly artifactUploader: HostBrokerArtifactUploader;
+    private readonly pendingArtifactGrants = new Map<
+      string,
+      {
+        operationId: string;
+        resolve: (grant: RelayArtifactGrantMessage["payload"]) => void;
+        reject: (error: Error) => void;
+        timeout: ReturnType<typeof setTimeout>;
+      }
+    >();
   private readonly activeSessionRuns = new Set<HostBrokerSessionRunHandle>();
   private lastTaskId: string | null = null;
 
@@ -1705,6 +1758,25 @@ export class HostBrokerConnection {
     this.browserSkillTimeoutMs = options.browserSkillTimeoutMs ?? MAX_BROWSER_SKILL_RUN_MS;
     this.writeObserver = options.writeObserver ?? null;
       this.localControl = options.localControl ?? null;
+    this.artifactProducer = options.artifactProducer ?? null;
+    this.artifactUploader = options.artifactUploader ?? (async ({ grant, deviceId, contentType, bytes }) => {
+      const uploadUrl = new URL(grant.uploadUrl);
+      if (uploadUrl.protocol !== "https:") throw new Error("Desktop Browser artifact upload requires HTTPS");
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${grant.bearerToken}`,
+          "content-type": contentType,
+          "x-desktop-browser-device-id": deviceId,
+        },
+        body: bytes,
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) throw new Error("Desktop Browser artifact upload was refused");
+      const payload = (await response.json()) as { artifact?: DesktopBrowserArtifactReference };
+      if (!payload.artifact) throw new Error("Desktop Browser artifact upload response is invalid");
+      return payload.artifact;
+    });
     this.snapshotState = createInitialState({
       qmUrl: options.qmUrl,
       relayUrl: options.relayUrl,
@@ -1895,10 +1967,83 @@ export class HostBrokerConnection {
         this.maxBrowserSkillOutputBytes,
         new Date(input.now()).toISOString(),
       );
+      if (!("schemaVersion" in result) && result.browser_instance_id !== authority.browserInstanceId) {
+        throw new Error("BrowserSkill returned a browser outside the authority binding");
+      }
+      let artifactMetadata:
+        | { artifact: DesktopBrowserArtifactReference }
+        | { artifactWarning: DesktopBrowserArtifactWarning }
+        | Record<string, never> = {};
+      if (this.artifactProducer) {
+        try {
+          const produced = await this.artifactProducer({ authority, result });
+          if (produced) {
+            const artifactIntentId = randomUUID();
+            const expectedSha256 = createHash("sha256").update(produced.bytes).digest("hex");
+            const grantPromise = new Promise<RelayArtifactGrantMessage["payload"]>((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                this.pendingArtifactGrants.delete(artifactIntentId);
+                reject(new Error("Desktop Browser artifact grant timed out"));
+              }, 20_000);
+              timeout.unref?.();
+              this.pendingArtifactGrants.set(artifactIntentId, {
+                operationId: authority.operationId,
+                resolve,
+                reject,
+                timeout,
+              });
+            });
+            input.socket.send(
+              encodeDesktopBrowserMessage({
+                protocolVersion: input.protocolVersion,
+                kind: "host.artifact-intent",
+                payload: {
+                  artifactIntentId,
+                  taskId: authority.taskId,
+                  attemptId: authority.attemptId,
+                  operationId: authority.operationId,
+                  requestHash: message.payload.requestHash,
+                  deviceId: authority.deviceId,
+                  actorId: authority.actorId,
+                  projectId: authority.projectId,
+                  leaseId: authority.leaseId,
+                  leaseVersion: authority.leaseVersion,
+                  leaseExpiresAt: authority.leaseExpiresAt,
+                  name: produced.name,
+                  contentType: produced.contentType,
+                  sizeBytes: produced.bytes.byteLength,
+                  expectedSha256,
+                },
+              }),
+            );
+            const grant = await grantPromise;
+            const artifact = await this.artifactUploader({
+              grant,
+              deviceId: authority.deviceId,
+              contentType: produced.contentType,
+              bytes: produced.bytes,
+            });
+            if (
+              artifact.name !== produced.name ||
+              artifact.contentType !== produced.contentType ||
+              artifact.sizeBytes !== produced.bytes.byteLength ||
+              artifact.sha256 !== expectedSha256
+            ) {
+              throw new Error("Desktop Browser artifact upload response does not match intent");
+            }
+            artifactMetadata = { artifact };
+          }
+        } catch {
+          artifactMetadata = {
+            artifactWarning: { code: "artifact_upload_failed", message: "Artifact upload failed" },
+          };
+        }
+      }
       const completedTerminalPayload: PersistedHostTerminalPayload = {
         dispatchId: message.payload.dispatchId,
         outcome: "completed",
         result,
+        ...artifactMetadata,
       };
       const completed = terminalResult(
         input.protocolVersion,
@@ -1907,9 +2052,6 @@ export class HostBrokerConnection {
         completedTerminalPayload,
       );
       if (!("schemaVersion" in result)) {
-        if (result.browser_instance_id !== authority.browserInstanceId) {
-          throw new Error("BrowserSkill returned a browser outside the authority binding");
-        }
         const sessionOwnership = {
           taskId: authority.taskId,
           attemptId: authority.attemptId,
@@ -2036,6 +2178,36 @@ export class HostBrokerConnection {
             payload?: { policyGrammarVersion?: unknown };
           };
           if (challenged) {
+            if (rawEnvelope.kind === "relay.artifact-grant") {
+              if (!negotiatedProtocolVersion) {
+                throw new Error("Artifact grant arrived before Host registration");
+              }
+              const message = decodeDesktopBrowserMessage(raw, negotiatedProtocolVersion);
+              if (message.kind !== "relay.artifact-grant") throw new Error("invalid artifact grant");
+              const pending = this.pendingArtifactGrants.get(message.payload.artifactIntentId);
+              if (!pending || pending.operationId !== message.payload.operationId) {
+                throw new Error("Artifact grant does not match an outstanding intent");
+              }
+              clearTimeout(pending.timeout);
+              this.pendingArtifactGrants.delete(message.payload.artifactIntentId);
+              pending.resolve(message.payload);
+              return;
+            }
+            if (rawEnvelope.kind === "relay.artifact-grant-failed") {
+              if (!negotiatedProtocolVersion) {
+                throw new Error("Artifact grant failure arrived before Host registration");
+              }
+              const message = decodeDesktopBrowserMessage(raw, negotiatedProtocolVersion);
+              if (message.kind !== "relay.artifact-grant-failed") throw new Error("invalid artifact grant failure");
+              const pending = this.pendingArtifactGrants.get(message.payload.artifactIntentId);
+              if (!pending || pending.operationId !== message.payload.operationId) {
+                throw new Error("Artifact grant failure does not match an outstanding intent");
+              }
+              clearTimeout(pending.timeout);
+              this.pendingArtifactGrants.delete(message.payload.artifactIntentId);
+              pending.reject(new Error(message.payload.error.message));
+              return;
+            }
             if (rawEnvelope.kind === "relay.local-stop-ack") {
               if (!negotiatedProtocolVersion || !this.dataDir) {
                 throw new Error("Local Stop acknowledgement arrived before Host registration");
@@ -2535,6 +2707,8 @@ export async function runHostBrokerCli(argv: string[], deps: HostBrokerCliDeps):
         deviceId: deps.deviceId,
         browserSkillExecutable: deps.browserSkillExecutable,
         sessionRunner: deps.sessionRunner,
+        artifactProducer: deps.artifactProducer,
+        artifactUploader: deps.artifactUploader,
         connectionEpoch: state.connectionEpoch,
         publicDeviceFingerprint: state.publicDeviceFingerprint,
         confirmationFingerprint: state.confirmationFingerprint,

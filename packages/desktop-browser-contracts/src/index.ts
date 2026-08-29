@@ -137,6 +137,65 @@ export interface HostAcceptedMessage {
   };
 }
 
+export interface DesktopBrowserArtifactIntent {
+  artifactIntentId: string;
+  taskId: string;
+  attemptId: string;
+  operationId: string;
+  requestHash: string;
+  deviceId: string;
+  actorId: string;
+  projectId: string;
+  leaseId: string;
+  leaseVersion: number;
+  leaseExpiresAt: string;
+  name: string;
+  contentType: string;
+  sizeBytes: number;
+  expectedSha256: string;
+}
+
+export interface HostArtifactIntentMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "host.artifact-intent";
+  payload: DesktopBrowserArtifactIntent;
+}
+
+export interface RelayArtifactGrantMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "relay.artifact-grant";
+  payload: {
+    artifactIntentId: string;
+    operationId: string;
+    uploadUrl: string;
+    bearerToken: string;
+    expiresAt: string;
+  };
+}
+
+export interface RelayArtifactGrantFailedMessage {
+  protocolVersion: `${number}.${number}`;
+  kind: "relay.artifact-grant-failed";
+  payload: {
+    artifactIntentId: string;
+    operationId: string;
+    error: DesktopBrowserArtifactWarning;
+  };
+}
+
+export interface DesktopBrowserArtifactReference {
+  artifactId: string;
+  name: string;
+  contentType: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface DesktopBrowserArtifactWarning {
+  code: string;
+  message: string;
+}
+
 export interface DesktopBrowserSessionStartResult {
   session_id: string;
   browser_instance_id: string;
@@ -197,6 +256,8 @@ export type HostResultMessage = {
         outcome: "completed";
         resultHash: string;
         result: DesktopBrowserCompletedResult;
+        artifact?: DesktopBrowserArtifactReference;
+        artifactWarning?: DesktopBrowserArtifactWarning;
       }
     | {
         dispatchId: string;
@@ -334,6 +395,9 @@ export type DesktopBrowserMessage =
   | HostChallengeResponseMessage
   | RelayInvocationMessage
   | HostAcceptedMessage
+  | HostArtifactIntentMessage
+  | RelayArtifactGrantMessage
+  | RelayArtifactGrantFailedMessage
   | HostResultMessage
   | HostLocalStopReceiptMessage
   | RelayLocalStopAckMessage
@@ -361,6 +425,7 @@ export const DESKTOP_BROWSER_AUTHORITY_VERSION = "1.0" as const;
 export const DESKTOP_BROWSER_RELAY_AUDIENCE = "qm-desktop-broker-relay" as const;
 export const DESKTOP_BROWSER_RELAY_WSS_PATH = "/v1/device" as const;
 export const DESKTOP_BROWSER_TASK_LEASE_DURATION_MS = 60_000 as const;
+export const DESKTOP_BROWSER_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 
 const PROTOCOL_VERSION_PATTERN = "^([0-9]{1,9})\\.([0-9]{1,9})$";
 const CANONICAL_PROTOCOL_VERSION_PATTERN = "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$";
@@ -889,6 +954,63 @@ export const desktopBrowserMessageSchemas = {
       requestHash: nonEmptyStringSchema,
     }),
   ),
+  "host.artifact-intent": strictMessageSchema(
+    "host.artifact-intent",
+    strictObjectSchema(
+      [
+        "artifactIntentId",
+        "taskId",
+        "attemptId",
+        "operationId",
+        "requestHash",
+        "deviceId",
+        "actorId",
+        "projectId",
+        "leaseId",
+        "leaseVersion",
+        "leaseExpiresAt",
+        "name",
+        "contentType",
+        "sizeBytes",
+        "expectedSha256",
+      ],
+      {
+        artifactIntentId: canonicalLexicalStringSchema,
+        taskId: canonicalLexicalStringSchema,
+        attemptId: canonicalLexicalStringSchema,
+        operationId: canonicalLexicalStringSchema,
+        requestHash: canonicalLexicalStringSchema,
+        deviceId: canonicalLexicalStringSchema,
+        actorId: canonicalLexicalStringSchema,
+        projectId: canonicalLexicalStringSchema,
+        leaseId: canonicalLexicalStringSchema,
+        leaseVersion: positiveIntegerSchema,
+        leaseExpiresAt: canonicalUtcMillisecondInstantSchema,
+        name: canonicalLexicalStringSchema,
+        contentType: canonicalLexicalStringSchema,
+        sizeBytes: { type: "integer", minimum: 1, maximum: DESKTOP_BROWSER_MAX_ARTIFACT_BYTES },
+        expectedSha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+      },
+    ),
+  ),
+  "relay.artifact-grant": strictMessageSchema(
+    "relay.artifact-grant",
+    strictObjectSchema(["artifactIntentId", "operationId", "uploadUrl", "bearerToken", "expiresAt"], {
+      artifactIntentId: canonicalLexicalStringSchema,
+      operationId: canonicalLexicalStringSchema,
+      uploadUrl: { type: "string", pattern: "^https://\\S+$" },
+      bearerToken: canonicalLexicalStringSchema,
+      expiresAt: canonicalUtcMillisecondInstantSchema,
+    }),
+  ),
+  "relay.artifact-grant-failed": strictMessageSchema(
+    "relay.artifact-grant-failed",
+    strictObjectSchema(["artifactIntentId", "operationId", "error"], {
+      artifactIntentId: canonicalLexicalStringSchema,
+      operationId: canonicalLexicalStringSchema,
+      error: desktopBrowserHostFailureSchema,
+    }),
+  ),
   "host.result": strictMessageSchema(
     "host.result",
     strictObjectSchema(["dispatchId", "operationId", "outcome", "resultHash"], {
@@ -898,6 +1020,14 @@ export const desktopBrowserMessageSchemas = {
       resultHash: nonEmptyStringSchema,
       result: desktopBrowserSessionStartResultSchema,
       error: desktopBrowserHostFailureSchema,
+      artifact: strictObjectSchema(["artifactId", "name", "contentType", "sizeBytes", "sha256"], {
+        artifactId: { type: "string", pattern: "^[0-9a-f]{32}$" },
+        name: canonicalLexicalStringSchema,
+        contentType: canonicalLexicalStringSchema,
+        sizeBytes: positiveIntegerSchema,
+        sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+      }),
+      artifactWarning: desktopBrowserHostFailureSchema,
     }),
   ),
   "host.local-stop-receipt": strictMessageSchema(
@@ -989,6 +1119,14 @@ const hostResultAdditiveMessageSchema = messageSchema(
       ],
     },
     error: desktopBrowserHostFailureSchema,
+    artifact: strictObjectSchema(["artifactId", "name", "contentType", "sizeBytes", "sha256"], {
+      artifactId: { type: "string", pattern: "^[0-9a-f]{32}$" },
+      name: canonicalLexicalStringSchema,
+      contentType: canonicalLexicalStringSchema,
+      sizeBytes: positiveIntegerSchema,
+      sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    }),
+    artifactWarning: desktopBrowserHostFailureSchema,
   }),
 );
 
@@ -1235,6 +1373,22 @@ function canonicalizeDesktopBrowserHostAccepted(message: HostAcceptedMessage): H
 function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostResultMessage {
   const payload = message.payload;
   if (payload.outcome === "completed") {
+    let artifactMetadata: Pick<typeof payload, "artifact" | "artifactWarning"> = {};
+    if (payload.artifact) {
+      artifactMetadata = {
+        artifact: {
+          artifactId: payload.artifact.artifactId,
+          name: payload.artifact.name,
+          contentType: payload.artifact.contentType,
+          sizeBytes: payload.artifact.sizeBytes,
+          sha256: payload.artifact.sha256,
+        },
+      };
+    } else if (payload.artifactWarning) {
+      artifactMetadata = {
+        artifactWarning: { code: payload.artifactWarning.code, message: payload.artifactWarning.message },
+      };
+    }
     if ("schemaVersion" in payload.result && payload.result.command === "session.stop") {
       return {
         protocolVersion: message.protocolVersion,
@@ -1244,6 +1398,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
           operationId: payload.operationId,
           outcome: "completed",
           resultHash: payload.resultHash,
+          ...artifactMetadata,
           result: {
             schemaVersion: payload.result.schemaVersion,
             command: payload.result.command,
@@ -1268,6 +1423,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
           operationId: payload.operationId,
           outcome: "completed",
           resultHash: payload.resultHash,
+          ...artifactMetadata,
           result: {
             schemaVersion: payload.result.schemaVersion,
             command: payload.result.command,
@@ -1289,6 +1445,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
           operationId: payload.operationId,
           outcome: "completed",
           resultHash: payload.resultHash,
+          ...artifactMetadata,
           result: {
             schemaVersion: payload.result.schemaVersion,
             command: payload.result.command,
@@ -1311,6 +1468,7 @@ function canonicalizeDesktopBrowserHostResult(message: HostResultMessage): HostR
         operationId: payload.operationId,
         outcome: "completed",
         resultHash: payload.resultHash,
+        ...artifactMetadata,
         result: {
           session_id: payload.result.session_id,
           browser_instance_id: payload.result.browser_instance_id,
@@ -1341,9 +1499,12 @@ function assertDesktopBrowserHostResult(message: HostResultMessage): void {
     if (payload.error !== undefined) {
       throw new Error("host.result message does not match its schema: completed session start cannot include error");
     }
+    if (payload.artifact !== undefined && payload.artifactWarning !== undefined) {
+      throw new Error("host.result message cannot include both artifact and artifactWarning");
+    }
     return;
   }
-  if (payload.result !== undefined) {
+  if (payload.result !== undefined || payload.artifact !== undefined || payload.artifactWarning !== undefined) {
     throw new Error("host.result message does not match its schema: result is only valid for completed session start");
   }
 }

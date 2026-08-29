@@ -8,6 +8,8 @@ import {
   projectDesktopBrowserPublicIdentity,
   verifyHostChallengeResponseMessage,
   type DesktopBrowserHostFailure,
+  type DesktopBrowserArtifactIntent,
+  type DesktopBrowserOperationAuthorityEnvelope,
   type DesktopBrowserRelayConnectionProjection,
   type DesktopBrowserRelayRegistryBinding,
   type HostAcceptedMessage,
@@ -15,6 +17,7 @@ import {
   type HostHelloMessage,
   type RelayInvocationMessage,
   type RelayChallengeMessage,
+  type RelayArtifactGrantMessage,
 } from "qm-desktop-browser-contracts";
 import type { WebSocket, WebSocketServer } from "ws";
 import { type DesktopBrowserRelayOperationStore } from "./operation-store.ts";
@@ -54,6 +57,10 @@ export interface DesktopBrowserRelayRegistryAdapter {
     browserInstanceId: string;
     confirmedAt: number;
   }): Promise<void>;
+}
+
+export interface DesktopBrowserRelayArtifactGrantClient {
+  requestGrant(intent: DesktopBrowserArtifactIntent): Promise<RelayArtifactGrantMessage["payload"]>;
 }
 
 export interface DesktopBrowserRelayClock {
@@ -102,6 +109,7 @@ export interface DesktopBrowserRelayServiceOptions {
   createNonce?: () => string;
   createConnectionId?: () => string;
   operationStore?: DesktopBrowserRelayOperationStore;
+  artifactGrantClient?: DesktopBrowserRelayArtifactGrantClient;
 }
 
 interface RelayConnectionState {
@@ -123,6 +131,7 @@ interface RelayConnectionState {
     dispatchId: string;
     operationId: string;
     requestHash: string;
+    authority: DesktopBrowserOperationAuthorityEnvelope;
     timeout: RelayTimerHandle;
     accepted: HostAcceptedMessage | null;
     resolve: (result: RelayDispatchResult) => void;
@@ -259,6 +268,7 @@ export class DesktopBrowserRelayService {
   private readonly dispatchTombstonesById = new Map<string, RelayDispatchTombstone>();
   private readonly dispatchTombstoneOrder: string[] = [];
   private readonly operationStore: DesktopBrowserRelayOperationStore | null;
+  private readonly artifactGrantClient: DesktopBrowserRelayArtifactGrantClient | null;
   private draining = false;
 
   constructor(options: DesktopBrowserRelayServiceOptions) {
@@ -281,6 +291,7 @@ export class DesktopBrowserRelayService {
       createConnectionId: options.createConnectionId ?? (() => randomUUID()),
     };
     this.operationStore = options.operationStore ?? null;
+    this.artifactGrantClient = options.artifactGrantClient ?? null;
     if (this.options.supportedProtocolVersions.length === 0) {
       throw new Error("at least one supported protocol version is required");
     }
@@ -514,6 +525,7 @@ export class DesktopBrowserRelayService {
         dispatchId: decoded.payload.dispatchId,
         operationId: authority.operationId,
         requestHash: canonicalRequestHash,
+        authority,
         timeout,
         accepted: null,
         resolve,
@@ -899,6 +911,12 @@ export class DesktopBrowserRelayService {
     if (message.kind === "relay.device-reconcile-ack") {
       throw new Error("unexpected relay.device-reconcile-ack frame from host");
     }
+    if (message.kind === "relay.artifact-grant") {
+      throw new Error("unexpected relay.artifact-grant frame from host");
+    }
+    if (message.kind === "relay.artifact-grant-failed") {
+      throw new Error("unexpected relay.artifact-grant-failed frame from host");
+    }
     if (message.kind === "host.device-reconciled") {
       if (!this.options.registry.reconcileDevice) {
         throw new Error("desktop browser Device reconciliation is unavailable");
@@ -930,6 +948,71 @@ export class DesktopBrowserRelayService {
           protocolVersion: message.protocolVersion,
           kind: "relay.local-stop-ack",
           payload: { receiptId: message.payload.receiptId },
+        }),
+      );
+      return;
+    }
+    if (message.kind === "host.artifact-intent") {
+      if (!this.artifactGrantClient) throw new Error("desktop browser artifact grants are unavailable");
+      const pending = connection.pendingDispatch;
+      if (!pending?.accepted) throw new Error("artifact intent requires an accepted in-flight invocation");
+      const authority = pending.authority;
+      const intent = message.payload;
+      if (
+        intent.taskId !== authority.taskId ||
+        intent.attemptId !== authority.attemptId ||
+        intent.operationId !== authority.operationId ||
+        intent.requestHash !== pending.requestHash ||
+        intent.deviceId !== authority.deviceId ||
+        intent.actorId !== authority.actorId ||
+        intent.projectId !== authority.projectId ||
+        intent.leaseId !== authority.leaseId ||
+        intent.leaseVersion !== authority.leaseVersion ||
+        intent.leaseExpiresAt !== authority.leaseExpiresAt
+      ) {
+        throw new Error("artifact intent does not match the accepted invocation authority");
+      }
+      const connectionEpoch = connection.binding!.connectionEpoch;
+      let grant: RelayArtifactGrantMessage["payload"];
+      try {
+        grant = await this.artifactGrantClient.requestGrant(intent);
+      } catch {
+        if (
+          this.connections.get(connection.connectionId) === connection &&
+          connection.stage === "registered" &&
+          connection.binding?.connectionEpoch === connectionEpoch &&
+          connection.pendingDispatch === pending
+        ) {
+          connection.socket.send(
+            encodeDesktopBrowserMessage({
+              protocolVersion: message.protocolVersion,
+              kind: "relay.artifact-grant-failed",
+              payload: {
+                artifactIntentId: intent.artifactIntentId,
+                operationId: intent.operationId,
+                error: { code: "grant_refused", message: "Artifact grant unavailable" },
+              },
+            }),
+          );
+        }
+        return;
+      }
+      if (
+        this.connections.get(connection.connectionId) !== connection ||
+        connection.stage !== "registered" ||
+        connection.binding?.connectionEpoch !== connectionEpoch ||
+        connection.pendingDispatch !== pending
+      ) {
+        return;
+      }
+      if (grant.artifactIntentId !== intent.artifactIntentId || grant.operationId !== intent.operationId) {
+        throw new Error("Core artifact grant does not match the Host intent");
+      }
+      connection.socket.send(
+        encodeDesktopBrowserMessage({
+          protocolVersion: message.protocolVersion,
+          kind: "relay.artifact-grant",
+          payload: grant,
         }),
       );
       return;

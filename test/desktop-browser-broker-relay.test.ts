@@ -23,6 +23,7 @@ import {
   type DesktopBrowserRelayClock,
   type DesktopBrowserRelayProjection,
   type DesktopBrowserRelayRegistryAdapter,
+  type DesktopBrowserRelayArtifactGrantClient,
   type RelayDispatchResult,
   type DesktopBrowserRelaySocket,
 } from "../packages/qm-broker-relay/src/index.ts";
@@ -32,6 +33,7 @@ import {
   type DesktopBrowserRelayOperationBacking,
   type DesktopBrowserRelayOperationStore,
 } from "../packages/qm-broker-relay/src/operation-store.ts";
+import { CoreHttpDesktopBrowserRelayArtifactGrantClient } from "../packages/qm-broker-relay/src/process.ts";
 
 class ManualClock implements DesktopBrowserRelayClock {
   private nowMs = 1_725_000_000_000;
@@ -384,6 +386,7 @@ async function createRegisteredTicket05Relay(
     maxSettledDispatchHistory?: number;
     settledDispatchHistoryTtlMs?: number;
     operationStore?: DesktopBrowserRelayOperationStore;
+    artifactGrantClient?: DesktopBrowserRelayArtifactGrantClient;
   } = {},
 ) {
   const protocolVersion = options.protocolVersion ?? "1.2";
@@ -413,6 +416,7 @@ async function createRegisteredTicket05Relay(
     maxSettledDispatchHistory: options.maxSettledDispatchHistory,
     settledDispatchHistoryTtlMs: options.settledDispatchHistoryTtlMs,
     operationStore: options.operationStore,
+    artifactGrantClient: options.artifactGrantClient,
   });
   const socket = new FakeSocket();
   service.acceptSocket(socket);
@@ -442,6 +446,93 @@ async function createRegisteredTicket05Relay(
   await flushMessages();
   return { adapter, clock, identity, service, socket };
 }
+
+test("Ticket 13 forwards a Core artifact grant for the accepted fenced operation", async () => {
+  const requests: unknown[] = [];
+  const artifactGrantClient: DesktopBrowserRelayArtifactGrantClient = {
+    async requestGrant(intent) {
+      requests.push(intent);
+      return {
+        artifactIntentId: intent.artifactIntentId,
+        operationId: intent.operationId,
+        uploadUrl: "https://qm.example.test/v1/desktop-browser/artifacts",
+        bearerToken: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-token",
+        expiresAt: "2026-08-29T12:01:00.000Z",
+      };
+    },
+  };
+  const { identity, service, socket } = await createRegisteredTicket05Relay({ artifactGrantClient });
+  const invocation = invocationWithDispatchId("dispatch-artifact-1");
+  const pending = service.dispatchInvocation({
+    devicePublicKey: identity.devicePublicKey,
+    brokerInstanceId: "broker-a",
+    browserInstanceId: "browser-primary",
+    invocation,
+  });
+  await flushMessages();
+  const accepted = acceptedMessageFor(invocation);
+  socket.message(JSON.stringify(accepted));
+  socket.message(
+    JSON.stringify({
+      protocolVersion: "1.2",
+      kind: "host.artifact-intent",
+      payload: {
+        artifactIntentId: "artifact-intent-1",
+        taskId: invocation.payload.authority.taskId,
+        attemptId: invocation.payload.authority.attemptId,
+        operationId: invocation.payload.authority.operationId,
+        requestHash: invocation.payload.requestHash,
+        deviceId: invocation.payload.authority.deviceId,
+        actorId: invocation.payload.authority.actorId,
+        projectId: invocation.payload.authority.projectId,
+        leaseId: invocation.payload.authority.leaseId,
+        leaseVersion: invocation.payload.authority.leaseVersion,
+        leaseExpiresAt: invocation.payload.authority.leaseExpiresAt,
+        name: "capture.bin",
+        contentType: "application/octet-stream",
+        sizeBytes: 21,
+        expectedSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      },
+    }),
+  );
+  await flushMessages();
+
+  assert.equal(requests.length, 1);
+  const grant = JSON.parse(socket.sent.at(-1)!) as { kind: string; payload: { bearerToken: string } };
+  assert.equal(grant.kind, "relay.artifact-grant");
+  assert.match(grant.payload.bearerToken, /-token$/);
+  assert.doesNotMatch(socket.sent.join("\n"), /phase-f-fake-artifact/);
+
+  socket.message(JSON.stringify(completedResultFor(invocation)));
+  await pending;
+});
+
+test("Ticket 13 rejects a malformed Core artifact grant response", async () => {
+  const client = new CoreHttpDesktopBrowserRelayArtifactGrantClient(
+    { baseUrl: "https://qm.example.test", sourceAuthSecret: "a".repeat(64) },
+    async () => new Response(JSON.stringify({ grant: { artifactIntentId: "intent-1" } }), { status: 200 }),
+  );
+  await assert.rejects(
+    client.requestGrant({
+      artifactIntentId: "intent-1",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      operationId: "operation-1",
+      requestHash: "sha256:request-1",
+      deviceId: "device-1",
+      actorId: "actor-1",
+      projectId: "project-1",
+      leaseId: "lease-1",
+      leaseVersion: 3,
+      leaseExpiresAt: "2026-08-29T12:01:00.000Z",
+      name: "capture.bin",
+      contentType: "application/octet-stream",
+      sizeBytes: 8,
+      expectedSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    }),
+    /relay\.artifact-grant message does not match its schema/,
+  );
+});
 
 test("Ticket 07 restart never redelivers an effectful operation after wire delivery started", async () => {
   const backing = createMemoryDesktopBrowserRelayOperationBacking();

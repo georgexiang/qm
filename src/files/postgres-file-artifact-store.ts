@@ -13,7 +13,7 @@ import {
   type ListOwnedOptions,
 } from "./file-artifact-store.ts";
 
-const SCHEMA = [
+export const POSTGRES_FILE_ARTIFACT_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS file_artifacts(
     id               TEXT PRIMARY KEY,
     kind             TEXT NOT NULL DEFAULT 'file',
@@ -64,7 +64,7 @@ export function createPostgresFileArtifactStore(
   connectionString: string,
   byteStore: DurableByteStore,
 ): FileArtifactStore {
-  const { q, query } = createPgPool(connectionString, SCHEMA);
+  const { q, query } = createPgPool(connectionString, POSTGRES_FILE_ARTIFACT_SCHEMA);
 
   async function getRow(id: string): Promise<FileArtifact | null> {
     const rows = await q("SELECT * FROM file_artifacts WHERE id = $1", [id]);

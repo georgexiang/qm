@@ -2,7 +2,11 @@
 import { main } from "../cli.ts";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveInstalledBrowserSkillExecutable, resolveRelayUrlFromEnv } from "../index.ts";
+import {
+  createPhaseFFakeArtifactProducer,
+  resolveInstalledBrowserSkillExecutable,
+  resolveRelayUrlFromEnv,
+} from "../index.ts";
 import { HOST_BROKER_COMPANION_PORT } from "../companion-control.ts";
 
 const controller = new AbortController();
@@ -22,6 +26,9 @@ try {
     deviceId: process.env.QM_HOST_BROKER_DEVICE_ID,
     browserSkillExecutable: resolveInstalledBrowserSkillExecutable({ env: process.env, installRoot }),
     resolveRelayUrl: (qmUrl) => resolveRelayUrlFromEnv(qmUrl, process.env),
+    ...(process.env.QM_HOST_BROKER_PHASE_F_FAKE_ARTIFACT === "1"
+      ? { artifactProducer: createPhaseFFakeArtifactProducer() }
+      : {}),
   });
 } finally {
   process.off("SIGINT", onSignal);

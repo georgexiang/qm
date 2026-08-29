@@ -11,6 +11,7 @@ import {
   parseDesktopBrowserSessionStartAuthorityEnvelope,
   validateDesktopBrowserPhaseFArgv,
   type DesktopBrowserEffectClass,
+  type DesktopBrowserArtifactIntent,
   type DesktopBrowserOperationAuthorityEnvelope,
   type DesktopBrowserPhaseFArgv,
   type DesktopBrowserRelayConnectionProjection,
@@ -163,6 +164,9 @@ export interface DesktopBrowserTaskStore {
   get(id: string): Promise<DesktopBrowserTask | null>;
   list(): Promise<DesktopBrowserTask[]>;
   listForSession(sessionId: string): Promise<DesktopBrowserTask[]>;
+  validateArtifactIntent(
+    intent: DesktopBrowserArtifactIntent,
+  ): Promise<{ status: "ok" } | { status: "refused"; reason: string }>;
   cancelWaiting(id: string): Promise<DesktopBrowserTask | null>;
   requestStop(
     id: string,
@@ -327,6 +331,50 @@ export function createDesktopBrowserTaskStore(
   const now = options.now ?? Date.now;
   const copy = (task: DesktopBrowserTask): DesktopBrowserTask => structuredClone(task);
   return {
+    async validateArtifactIntent(intent) {
+      const task = await backing.get(intent.taskId);
+      if (
+        !task ||
+        task.status !== "waiting_for_broker" ||
+        task.outcome ||
+        task.stopIntent ||
+        task.authorityExpiresAt <= Date.now()
+      ) {
+        return { status: "refused", reason: "Desktop Browser artifact Task is not active" };
+      }
+      const sessionStart = task.execution;
+      const later = task.operations?.find(
+        (entry) => entry.operation.authority.operationId === intent.operationId,
+      );
+      const operation =
+        sessionStart?.operation.authority.operationId === intent.operationId ? sessionStart.operation : later?.operation;
+      const accepted =
+        sessionStart?.operation.authority.operationId === intent.operationId
+          ? sessionStart.hostAccepted
+          : later?.hostAccepted;
+      if (!operation || !accepted) {
+        return { status: "refused", reason: "Desktop Browser artifact operation was not accepted" };
+      }
+      const authority = operation.authority;
+      if (
+        intent.attemptId !== authority.attemptId ||
+        intent.deviceId !== authority.deviceId ||
+        intent.actorId !== authority.actorId ||
+        intent.projectId !== authority.projectId ||
+        intent.taskId !== authority.taskId ||
+        intent.operationId !== authority.operationId ||
+        intent.requestHash !== operation.requestHash ||
+        intent.leaseId !== authority.leaseId ||
+        intent.leaseVersion !== authority.leaseVersion ||
+        intent.leaseExpiresAt !== authority.leaseExpiresAt ||
+        Date.parse(authority.leaseExpiresAt) <= Date.now() ||
+        task.actorSnapshot.id !== authority.actorId ||
+        task.projectSnapshot.id !== authority.projectId
+      ) {
+        return { status: "refused", reason: "Desktop Browser artifact intent does not match Task authority" };
+      }
+      return { status: "ok" };
+    },
     async createWaiting(input) {
       const taskId = id();
       const at = now();

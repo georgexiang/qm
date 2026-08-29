@@ -1,7 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +11,13 @@ import { buildApp } from "../src/wiring.ts";
 import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
 import { projectGroupRef } from "../src/projects/project-store.ts";
+import {
+  createDesktopBrowserArtifactGrantService,
+  type DesktopBrowserArtifactGrantRecord,
+} from "../src/desktop-browser/artifact-grant-service.ts";
+import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
+import { createMemoryFileArtifactStore } from "../src/files/file-artifact-store.ts";
+import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { testConfig } from "./support/test-config.ts";
 import {
   desktopBrowserRelayConnectionProjectionFixture,
@@ -169,6 +176,96 @@ test("relay terminal callback route authenticates and consumes acceptance before
     });
     assert.equal(response.status, 204);
     assert.deepEqual(calls, ["accepted:task-1:host.accepted", "result:task-1:host.result"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("Ticket 13 issues a source-authenticated grant and redeems bytes outside Relay WSS", async () => {
+  const bytes = Buffer.from("phase-f-http-artifact", "utf8");
+  const files = createMemoryFileArtifactStore(createMemoryDurableByteStore());
+  const artifacts = createDesktopBrowserArtifactGrantService({
+    grants: createMemoryMap<DesktopBrowserArtifactGrantRecord>(),
+    files,
+    validateIntent: async () => ({ status: "ok" }),
+  });
+  const server = createServer({} as any, {
+    signingSecret: SECRET,
+    publicUrl: "https://qm.example.test",
+    desktopBrowserArtifacts: artifacts,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const grantPath = "/v1/desktop-browser/relay/artifact-grants";
+  const intent = {
+    artifactIntentId: "artifact-http-1",
+    taskId: "task-1",
+    attemptId: "attempt-1",
+    operationId: "operation-1",
+    requestHash: "sha256:request-1",
+    deviceId: "device-1",
+    actorId: "actor-1",
+    projectId: "project-1",
+    leaseId: "lease-1",
+    leaseVersion: 3,
+    leaseExpiresAt: "2026-08-29T12:01:00.000Z",
+    name: "capture.bin",
+    contentType: "application/octet-stream",
+    sizeBytes: bytes.length,
+    expectedSha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  const grantBody = JSON.stringify({ intent });
+
+  try {
+    for (const malformedIntent of [
+      { ...intent, expectedSha256: undefined },
+      { ...intent, unexpected: true },
+      { ...intent, sizeBytes: 10 * 1024 * 1024 + 1 },
+    ]) {
+      const malformedBody = JSON.stringify({ intent: malformedIntent });
+      const malformedResponse = await fetch(`${base}${grantPath}`, {
+        method: "POST",
+        headers: signed("POST", grantPath, malformedBody),
+        body: malformedBody,
+      });
+      assert.equal(malformedResponse.status, 400);
+    }
+    assert.deepEqual(await artifacts.records(), []);
+
+    const issuedResponse = await fetch(`${base}${grantPath}`, {
+      method: "POST",
+      headers: signed("POST", grantPath, grantBody),
+      body: grantBody,
+    });
+    assert.equal(issuedResponse.status, 200);
+    const issued = (await issuedResponse.json()) as { grant: { bearerToken: string; uploadUrl: string } };
+    assert.equal(issued.grant.uploadUrl, "https://qm.example.test/v1/desktop-browser/artifacts");
+    assert.equal((await files.listOwnedByScopes([])).files.length, 0);
+
+    const uploadResponse = await fetch(`${base}/v1/desktop-browser/artifacts`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${issued.grant.bearerToken}`,
+        "content-type": intent.contentType,
+        "x-desktop-browser-device-id": intent.deviceId,
+      },
+      body: bytes,
+    });
+    assert.equal(uploadResponse.status, 200);
+    const uploaded = (await uploadResponse.json()) as { artifact: { artifactId: string; sha256: string } };
+    assert.equal(uploaded.artifact.sha256, intent.expectedSha256);
+    assert.ok(await files.get(uploaded.artifact.artifactId));
+
+    const duplicate = await fetch(`${base}/v1/desktop-browser/artifacts`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${issued.grant.bearerToken}`,
+        "content-type": intent.contentType,
+        "x-desktop-browser-device-id": intent.deviceId,
+      },
+      body: bytes,
+    });
+    assert.equal(duplicate.status, 409);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

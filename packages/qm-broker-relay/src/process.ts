@@ -9,6 +9,8 @@ import {
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_POLICY_GRAMMAR_VERSIONS,
   DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS,
   DESKTOP_BROWSER_RELAY_WSS_PATH,
+  DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+  decodeDesktopBrowserMessage,
 } from "qm-desktop-browser-contracts";
 import {
   DesktopBrowserRelayService,
@@ -308,11 +310,58 @@ export class CoreHttpDesktopBrowserRelayRegistryAdapter
   }
 }
 
+export class CoreHttpDesktopBrowserRelayArtifactGrantClient {
+  private readonly config: { baseUrl: string; sourceAuthSecret: string };
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(
+    config: { baseUrl: string; sourceAuthSecret: string },
+    fetchImpl: typeof fetch = fetch,
+  ) {
+    this.config = config;
+    this.fetchImpl = fetchImpl;
+  }
+
+  async requestGrant(
+    intent: import("qm-desktop-browser-contracts").DesktopBrowserArtifactIntent,
+  ): Promise<import("qm-desktop-browser-contracts").RelayArtifactGrantMessage["payload"]> {
+    const path = signedPath("/v1/desktop-browser/relay/artifact-grants", this.config.sourceAuthSecret);
+    const body = JSON.stringify({ intent });
+    const response = await this.fetchImpl(`${this.config.baseUrl}${path}`, {
+      method: "POST",
+      headers: signedRequestHeaders(this.config.sourceAuthSecret, "POST", path, body, {
+        "content-type": "application/json",
+      }),
+      body,
+      signal: AbortSignal.timeout(20_000),
+    });
+    await requireOk(response);
+    const payload = (await response.json()) as {
+      grant?: unknown;
+    };
+    const decoded = decodeDesktopBrowserMessage(
+      JSON.stringify({
+        protocolVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+        kind: "relay.artifact-grant",
+        payload: payload.grant,
+      }),
+      DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
+      "1.0",
+    );
+    if (decoded.kind !== "relay.artifact-grant") throw new Error("Core artifact grant response is invalid");
+    return decoded.payload;
+  }
+}
+
 export function createDesktopBrowserRelayRuntime(
   config: DesktopBrowserRelayRuntimeConfig,
   deps: { operationStore?: DesktopBrowserRelayOperationStore } = {},
 ): DesktopBrowserRelayRuntime {
   const registry = new CoreHttpDesktopBrowserRelayRegistryAdapter({
+    baseUrl: config.coreApiUrl,
+    sourceAuthSecret: config.sourceAuthSecret,
+  });
+  const artifactGrantClient = new CoreHttpDesktopBrowserRelayArtifactGrantClient({
     baseUrl: config.coreApiUrl,
     sourceAuthSecret: config.sourceAuthSecret,
   });
@@ -339,6 +388,7 @@ export function createDesktopBrowserRelayRuntime(
     settledDispatchHistoryTtlMs: config.settledDispatchHistoryTtlMs,
     registry,
     operationStore,
+    artifactGrantClient,
   });
   const server = createDesktopBrowserRelayServer({
     host: config.host,

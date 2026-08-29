@@ -8,6 +8,7 @@ import {
   buildDesktopBrowserSessionStopArgv,
   computeDesktopBrowserRequestHash,
   type DesktopBrowserSessionStartAuthorityEnvelope,
+  type DesktopBrowserArtifactIntent,
   type HostAcceptedMessage,
   type HostLocalStopReceiptMessage,
   type HostResultMessage,
@@ -387,6 +388,53 @@ function readyTask(id: string, operationId: string): DesktopBrowserTask {
     agentWindowId: 42,
   };
 }
+
+test("Ticket 13 validates artifact intent against the active accepted Task authority", async () => {
+  const backing = createMemoryMap<DesktopBrowserTask>();
+  const task = readyTask("task-artifact-authority", "operation-artifact-authority");
+  task.execution!.hostAccepted = acceptedFor(task.execution!.operation, "dispatch-artifact-authority");
+  await backing.put(task.id, task);
+  const store = createDesktopBrowserTaskStore(backing);
+  const authority = task.execution!.operation.authority;
+  const intent: DesktopBrowserArtifactIntent = {
+    artifactIntentId: "artifact-intent-authority",
+    taskId: authority.taskId,
+    attemptId: authority.attemptId,
+    operationId: authority.operationId,
+    requestHash: task.execution!.operation.requestHash,
+    deviceId: authority.deviceId,
+    actorId: authority.actorId,
+    projectId: authority.projectId,
+    leaseId: authority.leaseId,
+    leaseVersion: authority.leaseVersion,
+    leaseExpiresAt: authority.leaseExpiresAt,
+    name: "capture.bin",
+    contentType: "application/octet-stream",
+    sizeBytes: 8,
+    expectedSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  };
+  assert.deepEqual(await store.validateArtifactIntent(intent), { status: "ok" });
+  for (const changed of [
+    { requestHash: "sha256:other" },
+    { leaseId: "lease-other" },
+    { leaseVersion: authority.leaseVersion + 1 },
+    { actorId: "actor-other" },
+    { deviceId: "device-other" },
+  ]) {
+    assert.equal((await store.validateArtifactIntent({ ...intent, ...changed })).status, "refused");
+  }
+  await backing.update?.(task.id, (current) => ({
+    ...current,
+    stopIntent: {
+      requestedBy: "actor-1",
+      reason: "webui",
+      requestedAt: Date.now(),
+      auditStatus: "pending",
+      revocationStatus: "pending",
+    },
+  }));
+  assert.equal((await store.validateArtifactIntent(intent)).status, "refused");
+});
 
 function acceptedFor(operation: { authority: { operationId: string }; requestHash: string }, dispatchId: string) {
   return {

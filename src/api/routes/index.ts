@@ -24,7 +24,7 @@ import { contextPolicyRoutes } from "./context-policy.ts";
 import { deploymentLayerRoutes } from "./deployment-layer.ts";
 import { egressAuditRoutes } from "./egress-audit.ts";
 import { authBrokerRoutes } from "./auth-broker.ts";
-import { desktopBrowserRoutes } from "./desktop-browser.ts";
+import { desktopBrowserRawRoutes, desktopBrowserRoutes } from "./desktop-browser.ts";
 
 export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
   { method: "GET", path: "/healthz", auth: "public", handle: ({ res }) => sendJson(res, 200, { ok: true }) },
@@ -38,6 +38,7 @@ export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
   ...deploymentRawRoutes,
   ...blobRoutes,
   ...sessionStateRawRoutes,
+  ...desktopBrowserRawRoutes,
 ];
 
 export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [

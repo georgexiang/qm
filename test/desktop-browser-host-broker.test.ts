@@ -63,6 +63,7 @@ import {
   HOST_BROKER_CONTROL_NOTICE,
   HostBrokerSpawnRejectedError,
   HostBrokerConnection,
+  createPhaseFFakeArtifactProducer,
   createDefaultHostBrokerSessionRunner,
   loadOrCreateDeviceIdentity,
   createRegistrationConfirmationPreview,
@@ -307,6 +308,27 @@ function writeExecutable(path: string, body: string = "#!/bin/sh\nexit 0\n"): st
 const TEST_BROWSER_SKILL_EXECUTABLE = writeExecutable(
   join(mkdtempSync(join(tmpdir(), "host-broker-test-executable-")), "bsk"),
 );
+
+test("Ticket 13 shipped Phase F producer emits fixed bytes only for observe", async () => {
+  const producer = createPhaseFFakeArtifactProducer();
+  const authority = sessionStartAuthority("operation-fake-artifact");
+  const observation = {
+    schemaVersion: "1.0" as const,
+    command: "observe" as const,
+    completedAt: "2026-08-29T12:00:00.000Z",
+    data: { tab_id: 7, text: "secret page text", ref_count: 1, truncated: false },
+  };
+  const produced = await producer({ authority, result: observation });
+  assert.equal(produced?.name, "phase-f-artifact.bin");
+  assert.doesNotMatch(Buffer.from(produced!.bytes).toString("utf8"), /secret page text/);
+  assert.equal(
+    await producer({
+      authority,
+      result: { session_id: "session-1", browser_instance_id: "browser-primary", agent_window_id: 42 },
+    }),
+    null,
+  );
+});
 
 class FakeChildProcess extends EventEmitter {
   readonly stdout = new EventEmitter();
@@ -897,6 +919,9 @@ test("Ticket 06 rejects stale attempts and operation ordering before fencing or 
 
 test("Ticket 06 product seam reaches a visible window, sanitized observation, cleanup, and Core outcome", async () => {
   const dir = mkdtempSync(join(tmpdir(), "desktop-browser-ticket-06-product-"));
+  const failedArtifactBytes = Buffer.from("phase-f-failed-artifact", "utf8");
+  const uploadedArtifactBytes = Buffer.from("phase-f-fake-artifact", "utf8");
+  const artifactIntents: unknown[] = [];
   const identity = await loadOrCreateDeviceIdentity(dir);
   const publicDeviceFingerprint = computeDesktopBrowserPublicDeviceFingerprint({
     publicIdentityVersion: DESKTOP_BROWSER_TICKET_06_PROTOCOL_VERSION,
@@ -921,6 +946,19 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
     supportedPolicyGrammarVersions: ["1.0"],
     registry,
     operationStore: createDesktopBrowserRelayOperationStore(createMemoryDesktopBrowserRelayOperationBacking()),
+    artifactGrantClient: {
+      async requestGrant(intent) {
+        artifactIntents.push(structuredClone(intent));
+        if (intent.name === "failed.bin") throw new Error("simulated grant failure");
+        return {
+          artifactIntentId: intent.artifactIntentId,
+          operationId: intent.operationId,
+          uploadUrl: "https://qm.example.com/v1/desktop-browser/artifacts",
+          bearerToken: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-token",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        };
+      },
+    },
     createNonce: () => "relay-nonce-product",
     createConnectionId: () => "connection-product",
   });
@@ -988,6 +1026,28 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
           stderr: "",
         };
       },
+    },
+    artifactProducer: async ({ result }) => {
+      if (!("schemaVersion" in result)) return null;
+      if (result.command === "navigate") {
+        return { bytes: failedArtifactBytes, name: "failed.bin", contentType: "application/octet-stream" };
+      }
+      if (result.command === "observe") {
+        return { bytes: uploadedArtifactBytes, name: "capture.bin", contentType: "application/octet-stream" };
+      }
+      return null;
+    },
+    artifactUploader: async ({ grant, bytes, contentType }) => {
+      assert.equal(grant.uploadUrl, "https://qm.example.com/v1/desktop-browser/artifacts");
+      assert.equal(contentType, "application/octet-stream");
+      assert.deepEqual(Buffer.from(bytes), uploadedArtifactBytes);
+      return {
+        artifactId: "0123456789abcdef0123456789abcdef",
+        name: "capture.bin",
+        contentType,
+        sizeBytes: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
     },
     transport: {
       connect() {
@@ -1127,6 +1187,20 @@ test("Ticket 06 product seam reaches a visible window, sanitized observation, cl
   });
   assert.equal(observed.status, "ok");
   assert.equal(observed.observation.data.text, "Heading: Example\n[REDACTED]");
+  const afterArtifacts = await tasks.get(task.id);
+  assert.equal(afterArtifacts?.operations?.[0]?.hostResult?.payload.outcome, "completed");
+  if (afterArtifacts?.operations?.[0]?.hostResult?.payload.outcome === "completed") {
+    assert.deepEqual(afterArtifacts.operations[0].hostResult.payload.artifactWarning, {
+      code: "artifact_upload_failed",
+      message: "Artifact upload failed",
+    });
+  }
+  assert.equal(afterArtifacts?.operations?.[1]?.hostResult?.payload.outcome, "completed");
+  if (afterArtifacts?.operations?.[1]?.hostResult?.payload.outcome === "completed") {
+    assert.equal(afterArtifacts.operations[1].hostResult.payload.artifact?.artifactId, "0123456789abcdef0123456789abcdef");
+  }
+  assert.equal(artifactIntents.length, 2);
+  assert.doesNotMatch(JSON.stringify(artifactIntents), /phase-f-(?:failed|fake)-artifact/);
   assert.equal(
     (
       await invokeTool({

@@ -1,12 +1,13 @@
-import { sendJson } from "../http.ts";
+import { headerValue, sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
-import { type ApiCtx, type Route } from "./route.ts";
+import { type ApiCtx, type BaseCtx, type Route } from "./route.ts";
 import {
   parseDesktopBrowserRelayConnectionPublishRequest,
   decodeDesktopBrowserMessage,
   type DesktopBrowserRegistrationConfirmationEnvelope,
   type DesktopBrowserRelayConnectionProjection,
   type HostAcceptedMessage,
+  type DesktopBrowserArtifactIntent,
   type HostLocalStopReceiptMessage,
   type HostResultMessage,
 } from "qm-desktop-browser-contracts";
@@ -240,7 +241,67 @@ async function consumeLocalStopCallback(ctx: ApiCtx): Promise<void> {
   ctx.res.end();
 }
 
+async function issueArtifactGrant(ctx: ApiCtx): Promise<void> {
+  if (!ctx.deps.desktopBrowserArtifacts) {
+    return sendJson(ctx.res, 501, { error: "not_configured" });
+  }
+  const body = isObj(ctx.body) ? ctx.body : {};
+  let intent: DesktopBrowserArtifactIntent | null = null;
+  if (isObj(body.intent)) {
+    try {
+      const decoded = decodeDesktopBrowserMessage(
+        JSON.stringify({ protocolVersion: "1.3", kind: "host.artifact-intent", payload: body.intent }),
+        "1.3",
+        "1.0",
+      );
+      if (decoded.kind === "host.artifact-intent") intent = decoded.payload;
+    } catch {
+      intent = null;
+    }
+  }
+  const baseUrl = ctx.deps.publicUrl ?? ctx.deps.apiBaseUrl;
+  if (!intent || !baseUrl) return sendJson(ctx.res, 400, { error: "bad_request", message: "intent required" });
+  const issued = await ctx.deps.desktopBrowserArtifacts.issue(
+    intent,
+    new URL("/v1/desktop-browser/artifacts", baseUrl).toString(),
+  );
+  if (issued.status === "refused") {
+    return sendJson(ctx.res, 409, { error: "not_accepted", message: issued.reason });
+  }
+  return sendJson(ctx.res, 200, { grant: issued.grant });
+}
+
+async function redeemArtifactGrant(ctx: BaseCtx): Promise<void> {
+  if (!ctx.deps.desktopBrowserArtifacts) {
+    ctx.req.resume();
+    return sendJson(ctx.res, 501, { error: "not_configured" });
+  }
+  const authorization = headerValue(ctx.req, "authorization") ?? "";
+  const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+  const deviceId = headerValue(ctx.req, "x-desktop-browser-device-id") ?? "";
+  const contentType = headerValue(ctx.req, "content-type") ?? "";
+  if (!bearerToken || !deviceId || !contentType) {
+    ctx.req.resume();
+    return sendJson(ctx.res, 401, { error: "unauthorized" });
+  }
+  const redeemed = await ctx.deps.desktopBrowserArtifacts.redeem({
+    bearerToken,
+    deviceId,
+    contentType,
+    data: ctx.req,
+  });
+  if (redeemed.status === "refused") {
+    return sendJson(ctx.res, 409, { error: "not_accepted", message: redeemed.reason });
+  }
+  return sendJson(ctx.res, 200, { artifact: redeemed.reference });
+}
+
+export const desktopBrowserRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
+  { method: "POST", path: "/v1/desktop-browser/artifacts", auth: "public", handle: redeemArtifactGrant },
+];
+
 export const desktopBrowserRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  { method: "POST", path: "/v1/desktop-browser/relay/artifact-grants", auth: "source", handle: issueArtifactGrant },
   { method: "GET", path: "/v1/desktop-browser/relay/ready", auth: "source", handle: relayReady },
   {
     method: "POST",

@@ -4,6 +4,13 @@ import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts
 import { createPostgresFileArtifactStore } from "../src/files/postgres-file-artifact-store.ts";
 import { fileArtifactId, type PutFileInput } from "../src/files/file-artifact-store.ts";
 import { scopeId } from "../src/types.ts";
+import { createHash } from "node:crypto";
+import {
+  createDesktopBrowserArtifactGrantService,
+  createPostgresDesktopBrowserArtifactRedemptionCommitter,
+  type DesktopBrowserArtifactGrantRecord,
+} from "../src/desktop-browser/artifact-grant-service.ts";
+import { createPostgresMapFactory } from "../src/persistence/durable-map.ts";
 
 const URL = process.env.DATABASE_URL;
 const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the Postgres file-artifact-store tests";
@@ -17,6 +24,8 @@ beforeEach(async () => {
   const pg = (await import("pg")).default;
   const p = new pg.Pool({ connectionString: URL });
   await p.query("DROP TABLE IF EXISTS file_artifacts CASCADE");
+  await p.query("DROP TABLE IF EXISTS desktop_browser_artifact_grants CASCADE");
+  await p.query("DROP FUNCTION IF EXISTS reject_artifact_grant_redemption() CASCADE");
   await p.end();
 });
 
@@ -56,6 +65,85 @@ test("pg put is an idempotent upsert by deterministic id (no dup, no byte re-sto
   assert.equal(second.artifact.name, "flag.png", "existing row returned unchanged");
   assert.equal(putCount, 1, "no byte re-store on requeue");
   assert.equal((await store.listOwnedByScopes([owner])).files.length, 1);
+});
+
+test("pg artifact redemption rolls back publication and has one concurrent winner", { skip }, async () => {
+  const pg = createPostgresMapFactory(URL!);
+  const bytes = createMemoryDurableByteStore();
+  const files = createPostgresFileArtifactStore(URL!, bytes);
+  const grants = pg.map<DesktopBrowserArtifactGrantRecord>("desktop_browser_artifact_grants");
+  let tokenNumber = 0;
+  const service = createDesktopBrowserArtifactGrantService({
+    grants,
+    files,
+    validateIntent: async () => ({ status: "ok" }),
+    token: () => `${String(++tokenNumber).padStart(43, "a")}abcdefghijklmnopqrstuvwxyz`,
+    commitRedemption: createPostgresDesktopBrowserArtifactRedemptionCommitter({ pg: pg.pool, bytes }),
+  });
+  const data = Buffer.from("postgres-artifact", "utf8");
+  const intent = {
+    artifactIntentId: "postgres-intent-1",
+    taskId: "task-1",
+    attemptId: "attempt-1",
+    operationId: "operation-1",
+    requestHash: "sha256:request-1",
+    deviceId: "device-1",
+    actorId: "actor-1",
+    projectId: "project-1",
+    leaseId: "lease-1",
+    leaseVersion: 3,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    name: "capture.bin",
+    contentType: "application/octet-stream",
+    sizeBytes: data.length,
+    expectedSha256: createHash("sha256").update(data).digest("hex"),
+  };
+  const issued = await service.issue(intent, "https://qm.example.test/v1/desktop-browser/artifacts");
+  assert.equal(issued.status, "ok");
+  if (issued.status !== "ok") return;
+  const pool = await pg.pool.pool();
+  await pool.query(`CREATE FUNCTION reject_artifact_grant_redemption() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.json->>'status' = 'redeemed' THEN RAISE EXCEPTION 'injected redemption failure'; END IF;
+      RETURN NEW;
+    END
+  $$`);
+  await pool.query(`CREATE TRIGGER reject_artifact_grant_redemption
+    BEFORE UPDATE ON desktop_browser_artifact_grants
+    FOR EACH ROW EXECUTE FUNCTION reject_artifact_grant_redemption()`);
+
+  const failed = await service.redeem({
+    bearerToken: issued.grant.bearerToken,
+    deviceId: intent.deviceId,
+    contentType: intent.contentType,
+    data,
+  });
+  assert.deepEqual(failed, { status: "refused", reason: "Artifact redemption could not be committed" });
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM file_artifacts")).rows[0]!.count, 0);
+
+  await pool.query("DROP TRIGGER reject_artifact_grant_redemption ON desktop_browser_artifact_grants");
+  await pool.query("DROP FUNCTION reject_artifact_grant_redemption() CASCADE");
+  const retryIntent = { ...intent, artifactIntentId: "postgres-intent-2" };
+  const retry = await service.issue(retryIntent, "https://qm.example.test/v1/desktop-browser/artifacts");
+  assert.equal(retry.status, "ok");
+  if (retry.status !== "ok") return;
+  const results = await Promise.all([
+    service.redeem({
+      bearerToken: retry.grant.bearerToken,
+      deviceId: retryIntent.deviceId,
+      contentType: retryIntent.contentType,
+      data,
+    }),
+    service.redeem({
+      bearerToken: retry.grant.bearerToken,
+      deviceId: retryIntent.deviceId,
+      contentType: retryIntent.contentType,
+      data,
+    }),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), ["ok", "refused"]);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM file_artifacts")).rows[0]!.count, 1);
+  await pg.pool.close();
 });
 
 test("pg listOwnedByScopes: recency DESC, scope-filtered, keyset-paginated", { skip }, async () => {

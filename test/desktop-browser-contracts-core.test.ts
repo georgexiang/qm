@@ -43,6 +43,89 @@ test("Ticket 11 round-trips sanitized Local Stop Receipt delivery and acknowledg
   assert.doesNotMatch(JSON.stringify(receipt), /actor|goal|url|page|devicePublicKey/iu);
 });
 
+test("Ticket 13 round-trips Task-bound artifact intent, grant, and terminal metadata", () => {
+  const intent = {
+    protocolVersion: "1.3",
+    kind: "host.artifact-intent",
+    payload: {
+      artifactIntentId: "artifact-intent-1",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      operationId: "operation-1",
+      requestHash: "sha256:request-1",
+      deviceId: "device-1",
+      actorId: "actor-1",
+      projectId: "project-1",
+      leaseId: "lease-1",
+      leaseVersion: 3,
+      leaseExpiresAt: "2026-08-29T12:01:00.000Z",
+      name: "capture.bin",
+      contentType: "application/octet-stream",
+      sizeBytes: 8,
+      expectedSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
+  } as const satisfies DesktopBrowserMessage;
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(intent), "1.3", "1.0"), intent);
+
+  const grant = {
+    protocolVersion: "1.3",
+    kind: "relay.artifact-grant",
+    payload: {
+      artifactIntentId: intent.payload.artifactIntentId,
+      operationId: intent.payload.operationId,
+      uploadUrl: "https://qm.example.com/v1/desktop-browser/artifacts",
+      bearerToken: "grant-token-with-at-least-256-bits-of-entropy",
+      expiresAt: "2026-08-29T12:01:00.000Z",
+    },
+  } as const satisfies DesktopBrowserMessage;
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(grant), "1.3", "1.0"), grant);
+  const failedGrant = {
+    protocolVersion: "1.3",
+    kind: "relay.artifact-grant-failed",
+    payload: {
+      artifactIntentId: intent.payload.artifactIntentId,
+      operationId: intent.payload.operationId,
+      error: { code: "grant_refused", message: "Artifact grant unavailable" },
+    },
+  } as const satisfies DesktopBrowserMessage;
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(failedGrant), "1.3", "1.0"), failedGrant);
+
+  const completed = {
+    protocolVersion: "1.3",
+    kind: "host.result",
+    payload: {
+      dispatchId: "dispatch-1",
+      operationId: intent.payload.operationId,
+      outcome: "completed",
+      resultHash: "sha256:result-1",
+      result: { session_id: "session-1", browser_instance_id: "browser-primary", agent_window_id: 42 },
+      artifact: {
+        artifactId: "0123456789abcdef0123456789abcdef",
+        name: intent.payload.name,
+        contentType: intent.payload.contentType,
+        sizeBytes: intent.payload.sizeBytes,
+        sha256: intent.payload.expectedSha256,
+      },
+    },
+  } as const satisfies DesktopBrowserMessage;
+  assert.deepEqual(decodeDesktopBrowserMessage(encodeDesktopBrowserMessage(completed), "1.3", "1.0"), completed);
+  assert.throws(
+    () =>
+      decodeDesktopBrowserMessage(
+        JSON.stringify({
+          ...completed,
+          payload: {
+            ...completed.payload,
+            artifactWarning: { code: "upload_failed", message: "Artifact upload failed" },
+          },
+        }),
+        "1.3",
+        "1.0",
+      ),
+    /cannot include both artifact and artifactWarning/,
+  );
+});
+
 test("Core advertises Ticket 06 before Ticket 05 and the legacy handshake protocol", () => {
   assert.deepEqual([...DESKTOP_BROWSER_PHASE_F_DEFAULT_SUPPORTED_PROTOCOL_VERSIONS], ["1.3", "1.2", "1.0"]);
 });
@@ -175,11 +258,14 @@ test("Core publishes one schema for every Phase F message kind", () => {
     "companion.status",
     "core.authority",
     "host.accepted",
+    "host.artifact-intent",
     "host.challenge-response",
     "host.device-reconciled",
     "host.hello",
     "host.local-stop-receipt",
     "host.result",
+    "relay.artifact-grant",
+    "relay.artifact-grant-failed",
     "relay.challenge",
     "relay.device-reconcile-ack",
     "relay.invoke",

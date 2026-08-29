@@ -51,6 +51,7 @@ import type { UiStateStore } from "../surfaces/ui-state.ts";
 import type { RateLimiter } from "../ratelimit/rate-limiter.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
+import type { DesktopBrowserArtifactGrantService } from "../desktop-browser/artifact-grant-service.ts";
 
 export interface ServerDeps {
   production?: boolean;
@@ -102,6 +103,7 @@ export interface ServerDeps {
   runs?: RunStore;
   workspace?: WorkspaceStore;
   files?: FileArtifactStore;
+  desktopBrowserArtifacts?: DesktopBrowserArtifactGrantService;
   memory?: MemoryService;
   sandboxBackend?: string;
   egressDeclaredEnforcement?: EgressEnforcement;

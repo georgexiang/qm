@@ -186,6 +186,12 @@ import { createMemoryTaskStore } from "./tasks/memory-task-store.ts";
 import { createPostgresTaskStore } from "./tasks/postgres-task-store.ts";
 import type { TaskStore } from "./tasks/task-store.ts";
 import { createDesktopBrowserTaskStore, type DesktopBrowserTaskStore } from "./desktop-browser/browser-task-store.ts";
+import {
+  createDesktopBrowserArtifactGrantService,
+  createPostgresDesktopBrowserArtifactRedemptionCommitter,
+  type DesktopBrowserArtifactGrantRecord,
+  type DesktopBrowserArtifactGrantService,
+} from "./desktop-browser/artifact-grant-service.ts";
 import { reconcileDesktopBrowserFinalizationAudits } from "./desktop-browser/finalization-audit.ts";
 import { createDesktopBrowserOperationCoordinator } from "./desktop-browser/operation-coordinator.ts";
 import { createHttpDesktopBrowserRelayDispatcher } from "./desktop-browser/relay-dispatcher.ts";
@@ -332,6 +338,7 @@ export interface BuiltApp {
   signals: RunSignalStore;
   tasks: TaskStore;
   desktopBrowserTasks: DesktopBrowserTaskStore;
+  desktopBrowserArtifacts: DesktopBrowserArtifactGrantService;
   desktopBrowserDeviceRegistry: DesktopBrowserDeviceRegistry;
   desktopBrowserStopReconciliation?: Sweeper;
   desktopBrowserAttemptReconciliation?: Sweeper;
@@ -975,6 +982,36 @@ export function buildApp(
     isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
   });
+  const desktopBrowserArtifacts = createDesktopBrowserArtifactGrantService({
+    grants: artifactMap<DesktopBrowserArtifactGrantRecord>("desktop_browser_artifact_grants"),
+    files,
+    validateIntent: async (intent) => {
+      const result = await projects.withRosterLock(intent.projectId, async (project) => {
+        await identity.refresh();
+        const task = await desktopBrowserTasks.get(intent.taskId);
+        const actor = identity.classify(intent.actorId);
+        const members = new Set([project.ownerId, ...project.memberIds, ...(project.channelMemberIds ?? [])]);
+        if (
+          !task ||
+          String(project.updatedAt) !== task.projectMembershipVersion ||
+          !members.has(actor.id) ||
+          !identity.isInternal(actor)
+        ) {
+          return { status: "refused" as const, reason: "Desktop Browser Task authorization is no longer current" };
+        }
+        return desktopBrowserTasks.validateArtifactIntent(intent);
+      });
+      return result ?? { status: "refused" as const, reason: "Desktop Browser Project not found" };
+    },
+    ...(pgArtifactMap
+      ? {
+          commitRedemption: createPostgresDesktopBrowserArtifactRedemptionCommitter({
+            pg: pgArtifactMap.pool,
+            bytes: fileBytes,
+          }),
+        }
+      : {}),
+  });
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
@@ -1591,6 +1628,7 @@ export function buildApp(
     signals: runSignals,
     tasks,
     desktopBrowserTasks,
+    desktopBrowserArtifacts,
     desktopBrowserDeviceRegistry,
     ...(desktopBrowserStopReconciliation ? { desktopBrowserStopReconciliation } : {}),
     ...(desktopBrowserAttemptReconciliation ? { desktopBrowserAttemptReconciliation } : {}),
@@ -1717,6 +1755,7 @@ export function serverDeps(
     runs: built.runs,
     workspace: built.workspace,
     files: built.files,
+    desktopBrowserArtifacts: built.desktopBrowserArtifacts,
     memory: built.memory,
     blobTransfer: built.blobTransfer,
     sandboxBackend: built.sandbox.profile.backend,
