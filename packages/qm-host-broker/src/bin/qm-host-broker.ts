@@ -17,7 +17,8 @@ process.once("SIGINT", onSignal);
 process.once("SIGTERM", onSignal);
 
 try {
-  const installRoot = dirname(dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url))))));
+  const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const installRoot = dirname(dirname(packageRoot));
   const runtime = await probeInstalledBrowserRuntime({ installRoot, env: process.env });
   await main(process.argv.slice(2), {
     dataDir: process.env.QM_HOST_BROKER_DATA_DIR ?? ".qm-host-broker",
@@ -28,7 +29,7 @@ try {
     companionPort: HOST_BROKER_COMPANION_PORT,
     deviceId: process.env.QM_HOST_BROKER_DEVICE_ID,
     runtime,
-    browserSkillExecutable: resolveInstalledBrowserSkillExecutable({ env: process.env, installRoot }),
+    browserSkillExecutable: resolveInstalledBrowserSkillExecutable({ env: process.env, installRoot: packageRoot }),
     resolveRelayUrl: (qmUrl) => resolveRelayUrlFromEnv(qmUrl, process.env),
     ...(process.env.QM_HOST_BROKER_PHASE_F_FAKE_ARTIFACT === "1"
       ? { artifactProducer: createPhaseFFakeArtifactProducer() }
