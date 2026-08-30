@@ -128,11 +128,12 @@ jobs:
             --mode baseline-source-build
       - name: Build pinned Phase F bundle
         run: |
+          host_sha="$(node -e "import('./scripts/desktop-browser-phase-f-bundle.ts').then(async m => console.log(await m.computeDesktopBrowserHostArtifactHash('packages/qm-host-broker', 'packages/desktop-browser-contracts', 'node_modules/zod')))")"
           npm run build:desktop-browser-phase-f -- \
             --output "$RUNNER_TEMP/desktop-browser-phase-f.tar.gz" \
             --fixture "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json" \
             --host-source-commit 936dd2b232e3b143e00f269d18b8c061167024c6 \
-            --host-artifact-sha256 fbf898eaf4e64904598abf7d53bb7bb244c46856f222b491871fa4d03ae710b6 \
+            --host-artifact-sha256 "$host_sha" \
             --browser-skill-source-commit "$BROWSERSKILL_COMMIT" \
             --host-source-dir "$GITHUB_WORKSPACE/packages/qm-host-broker" \
             --contracts-source-dir "$GITHUB_WORKSPACE/packages/desktop-browser-contracts" \
