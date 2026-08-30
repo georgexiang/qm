@@ -17,7 +17,7 @@ process.once("SIGINT", onSignal);
 process.once("SIGTERM", onSignal);
 
 try {
-  const installRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const installRoot = dirname(dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url))))));
   const runtime = await probeInstalledBrowserRuntime({ installRoot, env: process.env });
   await main(process.argv.slice(2), {
     dataDir: process.env.QM_HOST_BROKER_DATA_DIR ?? ".qm-host-broker",
