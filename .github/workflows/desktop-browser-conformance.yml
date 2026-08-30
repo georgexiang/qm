@@ -73,8 +73,6 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: package-lock.json
-      - name: Restore pinned Host source
-        run: git checkout 936dd2b232e3b143e00f269d18b8c061167024c6 -- packages/qm-host-broker packages/desktop-browser-contracts
       - name: Verify runner architecture
         run: test "$(uname -m)" = arm64
       - name: Install QM dependencies
@@ -129,10 +127,11 @@ jobs:
       - name: Build pinned Phase F bundle
         run: |
           host_sha="$(node -e "import('./scripts/desktop-browser-phase-f-bundle.ts').then(async m => console.log(await m.computeDesktopBrowserHostArtifactHash('packages/qm-host-broker', 'packages/desktop-browser-contracts', 'node_modules/zod')))")"
+          host_commit="$(git rev-parse HEAD)"
           npm run build:desktop-browser-phase-f -- \
             --output "$RUNNER_TEMP/desktop-browser-phase-f.tar.gz" \
             --fixture "$RUNNER_TEMP/desktop-browser-phase-f.fixture.json" \
-            --host-source-commit 936dd2b232e3b143e00f269d18b8c061167024c6 \
+            --host-source-commit "$host_commit" \
             --host-artifact-sha256 "$host_sha" \
             --browser-skill-source-commit "$BROWSERSKILL_COMMIT" \
             --host-source-dir "$GITHUB_WORKSPACE/packages/qm-host-broker" \
