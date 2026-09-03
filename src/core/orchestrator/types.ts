@@ -183,6 +183,7 @@ export interface OrchestratorDeps {
     | ({
         service: string;
         status: "selected";
+        connectionId: string;
         ownerId: string;
         credentialId: string;
         files: CredentialFile[];

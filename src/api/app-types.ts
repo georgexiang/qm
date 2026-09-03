@@ -106,6 +106,7 @@ import type {
   AzureOpsTargetAllowlist,
 } from "../azure/azure-ops-binding-store.ts";
 import type { AzureAccountConnection, AzureAccountConnectionStore } from "../azure/azure-account-connection-store.ts";
+import type { AzureOpsLegacyMutation } from "../azure/azure-ops-legacy-mutation.ts";
 import type { Keychain } from "../credentials/keychain.ts";
 
 export interface AzureBindingConnectionTenantView {
@@ -628,6 +629,7 @@ export interface AppDeps {
   projects?: ProjectStore;
   azureAccountConnections?: AzureAccountConnectionStore;
   azureOpsBindings?: AzureOpsBindingStore;
+  azureOpsLegacyMutation?: AzureOpsLegacyMutation;
   keychain?: Keychain;
   deploy: DeployService;
   deploymentLayer?: DeploymentLayerRuntime;

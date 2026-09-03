@@ -221,13 +221,26 @@ export async function writeDeviceFlowLoginBundles(input: {
     }
   }
   if (wrote.length) {
-    await input.sandbox
-      .run(
+    try {
+      const secured = await input.sandbox.run(
         input.handle,
         `cd "$HOME" 2>/dev/null || exit 0; for p in ${wrote.map(shq).join(" ")}; do [ -e "$p" ] && chmod 600 "$p"; done`,
         { timeoutMs: 60_000 },
-      )
-      .catch(() => {});
+      );
+      if (secured.code !== 0) {
+        throw new Error(secured.stderr || `exit ${secured.code}`);
+      }
+    } catch (error) {
+      await input.sandbox
+        .run(
+          input.handle,
+          `cd "$HOME" 2>/dev/null || exit 0; for p in ${wrote.map(shq).join(" ")}; do rm -f -- "$p"; done`,
+          { timeoutMs: 60_000 },
+        )
+        .catch(() => undefined);
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`device-flow credential permissions failed: ${reason}`, { cause: error });
+    }
   }
   return [...wroteServices];
 }

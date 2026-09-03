@@ -14,9 +14,11 @@ import {
   deviceFlowCredOwner,
   materializeDeviceFlowLogins,
   removeDeviceFlowLogins,
+  writeDeviceFlowLoginBundles,
   DEVICE_FLOW_ORIGIN,
 } from "../src/credentials/device-flow-persist.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
+import type { Sandbox } from "../src/sandbox/sandbox.ts";
 import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import { installGlobalFakeSprites, type FakeSprites } from "./support/fake-sprites.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -43,6 +45,40 @@ function sprites() {
     fetchImpl: ff.fetchImpl,
   });
 }
+
+test("device-flow restore fails closed when secure file permissions cannot be applied", async () => {
+  const written = new Set<string>();
+  const sandbox = {
+    async writeFileBytes(_handle: unknown, path: string) {
+      written.add(path);
+    },
+    async run(_handle: unknown, command: string) {
+      if (command.includes("chmod 600")) return { code: 1, stdout: "", stderr: "chmod denied" };
+      if (command.includes("rm -f")) written.clear();
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  } as unknown as Sandbox;
+
+  await assert.rejects(
+    writeDeviceFlowLoginBundles({
+      sandbox,
+      handle: { id: "permissions", rootDir: "/workspace", homeDir: "/home/qm" },
+      bundles: [
+        {
+          service: "azure",
+          files: [
+            {
+              path: ".azure/msal_token_cache.json",
+              contentBase64: Buffer.from("secret", "utf8").toString("base64"),
+            },
+          ],
+        },
+      ],
+    }),
+    /permissions.*chmod denied/i,
+  );
+  assert.equal(written.size, 0);
+});
 const rw = (scope: string) => [{ scopeId: scope, mountPath: "", mode: "rw" as const }];
 
 function acmecliBrokeredLayer(binary?: string, approvals?: Array<{ pattern: string; reason?: string }>): string {
@@ -1150,13 +1186,34 @@ test("azure-ops personal binding restore selects the bound credential and replac
   });
   assert.equal(bound.status, "ok");
 
-  const run = await built.app.turn(dm("!run cat ~/.azure/msal_token_cache.json"));
+  const ordinaryRun = await built.app.turn(
+    dm("!run test ! -e ~/.azure/msal_token_cache.json && printf missing || cat ~/.azure/msal_token_cache.json"),
+  );
+  assert.equal(ordinaryRun.status, "ok", ordinaryRun.reason);
+  assert.equal(ordinaryRun.reply, "missing");
+  assert.equal((await built.auditLog.events()).filter((event) => event.action === "azure.binding.use").length, 0);
+
+  const run = await built.app.turn(dm("/azure-ops !run cat ~/.azure/msal_token_cache.json"));
   assert.equal(run.status, "ok", run.reason);
   assert.equal(run.reply, "selected-personal-cache");
+  const bindingUseEvents = (await built.auditLog.events()).filter((event) => event.action === "azure.binding.use");
+  assert.equal(bindingUseEvents.length, 1);
+  assert.equal(bindingUseEvents[0]?.principalId, "U1");
+  assert.equal(bindingUseEvents[0]?.scopeLabel, scopeId("personal", "U1"));
+  assert.equal(bindingUseEvents[0]?.resource, selected.connectionId);
+  assert.deepEqual(JSON.parse(bindingUseEvents[0]?.detail ?? ""), {
+    connectionId: selected.connectionId,
+    selectedTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+    allowedTargets: [
+      { tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] },
+      { tenantId: AZURE_TEST_TENANT_TWO, subscriptionIds: [AZURE_TEST_SUBSCRIPTION_TWO] },
+    ],
+    result: "selected",
+  });
 
   const envRun = await built.app.turn(
     dm(
-      '!run printf "%s|%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID" "$QM_AZURE_OPS_TARGET_ALLOWLIST_JSON"',
+      '/azure-ops !run printf "%s|%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID" "$QM_AZURE_OPS_TARGET_ALLOWLIST_JSON"',
     ),
   );
   assert.equal(envRun.status, "ok", envRun.reason);
@@ -1169,21 +1226,21 @@ test("azure-ops personal binding restore selects the bound credential and replac
   );
 
   const overrideRun = await built.app.turn({
-    ...dm('!run printf "%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID"'),
+    ...dm('/azure-ops !run printf "%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID"'),
     azureOpsTarget: { tenantId: AZURE_TEST_TENANT_TWO, subscriptionId: AZURE_TEST_SUBSCRIPTION_TWO },
   });
   assert.equal(overrideRun.status, "ok", overrideRun.reason);
   assert.equal(overrideRun.reply, `${AZURE_TEST_TENANT_TWO}|${AZURE_TEST_SUBSCRIPTION_TWO}`);
 
   const deniedOverride = await built.app.turn({
-    ...dm("!run printf should-not-run"),
+    ...dm("/azure-ops !run printf should-not-run"),
     azureOpsTarget: { tenantId: AZURE_TEST_TENANT_TWO, subscriptionId: AZURE_TEST_SUBSCRIPTION },
   });
   assert.equal(deniedOverride.status, "refused");
   assert.match(deniedOverride.reason ?? "", /not allowed/);
 
   const refreshRun = await built.app.turn(
-    dm("!run printf 'selected-personal-cache-refreshed' > ~/.azure/msal_token_cache.json"),
+    dm("/azure-ops !run printf 'selected-personal-cache-refreshed' > ~/.azure/msal_token_cache.json"),
   );
   assert.equal(refreshRun.status, "ok", refreshRun.reason);
   const selectedMaterialized = await built.keychain!.materializeOwnById(
@@ -1214,7 +1271,7 @@ test("azure-ops personal binding restore selects the bound credential and replac
   assert.equal((await built.keychain!.listByOwner("U1")).filter((record) => record.service === "azure").length, 2);
 
   const inFlight = built.app.turn(
-    dm("!run sleep 0.3; printf 'selected-after-binding-switch' > ~/.azure/msal_token_cache.json"),
+    dm("/azure-ops !run sleep 0.3; printf 'selected-after-binding-switch' > ~/.azure/msal_token_cache.json"),
   );
   await new Promise((resolve) => setTimeout(resolve, 100));
   const switched = await built.app.setAzureOpsBinding({
@@ -1256,7 +1313,9 @@ test("azure-ops personal binding restore selects the bound credential and replac
   );
 
   assert.equal((await built.app.deleteAzureOpsBinding(scopeId("personal", "U1"), "U1")).status, "ok");
-  const clearedRun = await built.app.turn(dm("!run test ! -e ~/.azure/msal_token_cache.json && printf cleared"));
+  const clearedRun = await built.app.turn(
+    dm("/azure-ops !run test ! -e ~/.azure/msal_token_cache.json && printf cleared"),
+  );
   assert.equal(clearedRun.status, "ok", clearedRun.reason);
   assert.equal(clearedRun.reply, "cleared");
 
@@ -1325,7 +1384,7 @@ test("azure-ops project binding restore requires current membership and cannot m
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run cat ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run cat ~/.azure/msal_token_cache.json",
   });
   assert.equal(projectRun.status, "ok", projectRun.reason);
   assert.equal(projectRun.reply, "selected-project-cache");
@@ -1338,7 +1397,7 @@ test("azure-ops project binding restore requires current membership and cannot m
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run printf 'delegated-project-cache' > ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run printf 'delegated-project-cache' > ~/.azure/msal_token_cache.json",
   });
   assert.equal(delegatedWrite.status, "ok", delegatedWrite.reason);
   const ownerAfterDelegatedWrite = await built.keychain!.materializeOwnById(
@@ -1365,7 +1424,7 @@ test("azure-ops project binding restore requires current membership and cannot m
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
   });
   assert.equal(removedMemberRun.status, "refused");
   assert.match(removedMemberRun.reason ?? "", /not a member/);
@@ -1411,7 +1470,7 @@ test("azure-ops project binding restore requires current membership and cannot m
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
   });
   assert.equal(revokedRun.status, "ok", revokedRun.reason);
   assert.equal(revokedRun.reply, "missing");
@@ -1425,7 +1484,7 @@ test("azure-ops project binding restore requires current membership and cannot m
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run mkdir -p ~/.azure && printf 'revoked-write-cache' > ~/.azure/msal_token_cache.json && echo wrote",
+    text: "/azure-ops !run mkdir -p ~/.azure && printf 'revoked-write-cache' > ~/.azure/msal_token_cache.json && echo wrote",
   });
   assert.equal(writeRevoked.status, "ok", writeRevoked.reason);
   assert.equal(writeRevoked.reply, "wrote");
@@ -1477,7 +1536,7 @@ test("azure-ops Project Owner connection restores through its binding without a 
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run cat ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run cat ~/.azure/msal_token_cache.json",
   });
   assert.equal(run.status, "ok", run.reason);
   assert.equal(run.reply, "owner-project-cache");
@@ -1491,7 +1550,7 @@ test("azure-ops Project Owner connection restores through its binding without a 
       channelRef: projectGroupRef(project.id),
       audience: [],
     },
-    text: "!run printf 'owner-project-mutated-cache' > ~/.azure/msal_token_cache.json",
+    text: "/azure-ops !run printf 'owner-project-mutated-cache' > ~/.azure/msal_token_cache.json",
   });
   assert.equal(write.status, "ok", write.reason);
   const ownerCredential = await built.keychain!.materializeOwnById(

@@ -102,7 +102,8 @@ export function createMockHarness(): Harness {
         const firstLine = turn.input.split("\n")[0]?.trim() ?? "";
         const whyCmd = /<why>\s*(![^<\n]+)/.exec(turn.input)?.[1]?.trim();
         const addressedCmd = /<addressed-messages[^>]*>\s*<message[^>]*>\s*(![^<\n]+)/.exec(turn.input)?.[1]?.trim();
-        const cmd = firstLine.startsWith("<") ? (whyCmd ?? addressedCmd ?? turn.input) : turn.input;
+        const rawCmd = firstLine.startsWith("<") ? (whyCmd ?? addressedCmd ?? turn.input) : turn.input;
+        const cmd = rawCmd.replace(/^\/[a-zA-Z0-9_-]+\s+/, "");
         const command0 = cmd.split("\n")[0]?.trim() ?? "";
         const cacheMiss = command0 === "!cachemiss";
         const systemPromptTokens = countTokens(turn.systemPrompt);

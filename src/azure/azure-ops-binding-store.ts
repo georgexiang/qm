@@ -29,7 +29,7 @@ export interface AzureOpsBinding {
   status: "active";
 }
 
-interface SetAzureOpsBindingInput {
+export interface SetAzureOpsBindingInput {
   scopeId: ScopeId;
   connectionId: string;
   grantId?: string | null;
@@ -111,6 +111,31 @@ function normalizedInput(input: SetAzureOpsBindingInput): SetAzureOpsBindingInpu
   return normalized;
 }
 
+export function prepareAzureOpsBinding(
+  rawInput: SetAzureOpsBindingInput,
+  prior: AzureOpsBinding | null,
+  at: number,
+  bindingId: string,
+): AzureOpsBinding {
+  const input = normalizedInput(rawInput);
+  let grantId: string | undefined;
+  if (input.grantId !== null) grantId = input.grantId ?? prior?.grantId;
+  return {
+    bindingId: prior?.bindingId ?? bindingId,
+    scopeId: input.scopeId,
+    skillName: AZURE_OPS_SKILL_NAME,
+    connectionId: input.connectionId,
+    ...(grantId ? { grantId } : {}),
+    defaultTarget: input.defaultTarget,
+    targetAllowlist: input.targetAllowlist,
+    createdBy: prior?.createdBy ?? input.actorId,
+    updatedBy: input.actorId,
+    createdAt: prior?.createdAt ?? at,
+    updatedAt: at,
+    status: "active",
+  };
+}
+
 export function createAzureOpsBindingStore(
   backing: DurableMap<AzureOpsBinding>,
   opts: { now?: () => number; id?: () => string } = {},
@@ -129,26 +154,10 @@ export function createAzureOpsBindingStore(
         .map(visible);
     },
     async set(rawInput) {
-      const input = normalizedInput(rawInput);
-      const prior = await backing.get(input.scopeId);
+      const prior = await backing.get(rawInput.scopeId);
       const at = now();
-      let grantId: string | undefined;
-      if (input.grantId !== null) grantId = input.grantId ?? prior?.grantId;
-      const binding: AzureOpsBinding = {
-        bindingId: prior?.bindingId ?? nextId(),
-        scopeId: input.scopeId,
-        skillName: AZURE_OPS_SKILL_NAME,
-        connectionId: input.connectionId,
-        ...(grantId ? { grantId } : {}),
-        defaultTarget: input.defaultTarget,
-        targetAllowlist: input.targetAllowlist,
-        createdBy: prior?.createdBy ?? input.actorId,
-        updatedBy: input.actorId,
-        createdAt: prior?.createdAt ?? at,
-        updatedAt: at,
-        status: "active",
-      };
-      await backing.put(input.scopeId, binding);
+      const binding = prepareAzureOpsBinding(rawInput, prior, at, nextId());
+      await backing.put(binding.scopeId, binding);
       return visible(binding);
     },
     async remove(scopeId) {

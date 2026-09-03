@@ -916,9 +916,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const visibleSkillsForTurn = async (): Promise<SkillResolution[]> =>
         filterConnectorSkills((await deps.skills?.visibleFor(skillScopes, grantedSkills)) ?? [], configuredProviders);
       const visibleSkills = await visibleSkillsForTurn();
+      const azureOpsInvoked =
+        input.skillInvocation === AZURE_OPS_SKILL_NAME &&
+        visibleSkills.some((resolution) => resolution.skill?.manifest.name === AZURE_OPS_SKILL_NAME);
       const azureOpsRuntimeSelection =
-        deps.resolveAzureSandboxCredentialForScope &&
-        visibleSkills.some((r) => r.skill?.manifest.name === AZURE_OPS_SKILL_NAME)
+        deps.resolveAzureSandboxCredentialForScope && azureOpsInvoked
           ? await deps
               .resolveAzureSandboxCredentialForScope({
                 scopeId,
@@ -927,21 +929,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               })
               .catch(() => null)
           : null;
-      if (input.azureOpsTarget && azureOpsRuntimeSelection?.status !== "selected") {
+      if (azureOpsInvoked && input.azureOpsTarget && azureOpsRuntimeSelection?.status !== "selected") {
         return { status: "refused", reason: "the selected Azure tenant or subscription is not allowed in this scope" };
-      }
-      if (azureOpsRuntimeSelection?.status === "selected") {
-        deps.auditLog.record({
-          at: Date.now(),
-          principalId: actor.id,
-          action: "azure.binding.use",
-          resource: scopeId,
-          scopeLabel: scopeId,
-          status: azureOpsRuntimeSelection.status,
-          detail:
-            `source=resolver tenant=${azureOpsRuntimeSelection.defaultTarget.tenantId} ` +
-            `subscription=${azureOpsRuntimeSelection.defaultTarget.subscriptionId}`,
-        });
       }
       const transferId = turnFileId(input.runId, input.attempt);
       const turnSessionDir = `${TURN_FILES_DIR}/${hashId([conversation.threadRef], 24)}`;

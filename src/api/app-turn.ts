@@ -24,6 +24,10 @@ import { unscreenedNotice } from "../security/security-posture.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
 
+function leadingSkillInvocation(text: string): string | undefined {
+  return /^\/([a-zA-Z0-9_-]+)(?:\s|$)/.exec(text.trimStart())?.[1]?.toLowerCase();
+}
+
 export function createTurnMethods(
   deps: AppDeps,
   h: AppHelpers,
@@ -245,6 +249,7 @@ export function createTurnMethods(
         conversation,
         origin,
         text: req.text,
+        ...(leadingSkillInvocation(req.text) ? { skillInvocation: leadingSkillInvocation(req.text) } : {}),
         ...(req.gatewayContext ? { gatewayContext: req.gatewayContext } : {}),
         ...(req.proactiveOpener ? { proactiveOpener: true } : {}),
         ...(req.conversationHeader ? { conversationHeader: req.conversationHeader } : {}),

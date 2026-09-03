@@ -17,7 +17,6 @@ import {
 import { shq } from "../../util/shell.ts";
 import { createSkillMaterializer, safeSkillDirName } from "../../skills/materialize.ts";
 import type { SkillResolution } from "../../skills/skill-store.ts";
-import { AZURE_OPS_SKILL_NAME } from "../../azure/azure-ops-binding-store.ts";
 import { TURN_FILES_DIR } from "../attachments.ts";
 import { errMessage, swallow, swallowAs } from "../../util/errors.ts";
 import { sleep } from "../../util/async.ts";
@@ -203,25 +202,26 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     handle.env = { ...handle.env, AGENT_OUTBOX: `${handle.rootDir}/${turnOutboxDir}` };
     if (deps.keychain) {
       const deviceFlowStart = Date.now();
-      const azureOpsVisible = visibleSkills.some((r) => r.skill?.manifest.name === AZURE_OPS_SKILL_NAME);
-      const selectedAzureCredential = azureOpsVisible ? azureOpsRuntimeSelection : null;
+      const selectedAzureCredential = azureOpsRuntimeSelection;
       if (selectedAzureCredential) {
-        deps.auditLog.record({
-          at: Date.now(),
-          principalId: actor.id,
-          action: "azure.binding.use",
-          resource: scopeId,
-          scopeLabel: scopeId,
-          status: selectedAzureCredential.status,
-          ...(selectedAzureCredential.status === "selected"
-            ? {
-                detail:
-                  `source=provision tenant=${selectedAzureCredential.defaultTarget.tenantId} ` +
-                  `subscription=${selectedAzureCredential.defaultTarget.subscriptionId}`,
-              }
-            : { detail: "source=provision blocked=true" }),
-        });
         if (selectedAzureCredential.status === "selected") {
+          const detail = JSON.stringify({
+            connectionId: selectedAzureCredential.connectionId,
+            selectedTarget: selectedAzureCredential.defaultTarget,
+            allowedTargets: selectedAzureCredential.targetAllowlist,
+            result: selectedAzureCredential.status,
+          });
+          for (const action of ["azure.target.select", "azure.binding.use"]) {
+            deps.auditLog.record({
+              at: Date.now(),
+              principalId: actor.id,
+              action,
+              resource: selectedAzureCredential.connectionId,
+              scopeLabel: scopeId,
+              status: selectedAzureCredential.status,
+              detail,
+            });
+          }
           handle.env = {
             ...handle.env,
             QM_AZURE_OPS_TARGET_TENANT_ID: selectedAzureCredential.defaultTarget.tenantId,
@@ -270,6 +270,14 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           principalId: actor.id,
         });
         selectedBindingRestoreServices.add(selectedAzureCredential.service);
+      } else {
+        await writeDeviceFlowLoginBundles({
+          sandbox: deps.sandbox,
+          handle,
+          bundles: [],
+          replaceRoots: [".azure"],
+        });
+        selectedBindingRestoreServices.add("azure");
       }
       const restoreOwnerId =
         input.origin.kind === "automation" && input.origin.useOwnerKeychain && !isolateOwnerKeychain
@@ -299,9 +307,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
         });
       }
       try {
-        const restoreExcludes = [
-          ...new Set([...quarantinedServices, ...(selectedAzureCredential ? [selectedAzureCredential.service] : [])]),
-        ];
+        const restoreExcludes = [...new Set([...quarantinedServices, "azure"])];
         const restoredServices = await materializeDeviceFlowLogins({
           sandbox: deps.sandbox,
           handle,

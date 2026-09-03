@@ -270,8 +270,9 @@ export function createAzureOpsMethods(
         createdPersistentCredentialId = persisted.id;
         targetCredentialId = persisted.id;
       }
+      let connection;
       try {
-        const connection = await deps.azureAccountConnections!.save({
+        connection = await deps.azureAccountConnections!.save({
           ...(existing ? { connectionId: existing.connectionId } : {}),
           ...(existing ? { previousCredentialId: existing.credentialId } : {}),
           credentialId: targetCredentialId,
@@ -282,26 +283,26 @@ export function createAzureOpsMethods(
           tenantAccess: parsedProfile.profile.tenantAccess,
           status: "active",
         });
-        if (existing && existing.credentialId !== targetCredentialId) {
-          await deps.keychain!.remove(input.actorId, existing.credentialId).catch(() => false);
-        }
-        if (shouldPurgeTemporaryCapture && credential.id !== targetCredentialId) {
-          await deps.keychain!.remove(input.actorId, credential.id);
-        }
-        deps.auditLog.record({
-          at: connection.updatedAt,
-          principalId: input.actorId,
-          action: existing ? "azure.connection.verify" : "azure.connection.complete",
-          resource: connection.connectionId,
-          scopeLabel: scopeId("personal", input.actorId),
-        });
-        return { status: "ok", connection, created: !existing };
       } catch {
         if (createdPersistentCredentialId) {
           await deps.keychain!.remove(input.actorId, createdPersistentCredentialId).catch(() => false);
         }
         return { status: "invalid_metadata" };
       }
+      if (existing && existing.credentialId !== targetCredentialId) {
+        await deps.keychain!.remove(input.actorId, existing.credentialId).catch(() => false);
+      }
+      if (shouldPurgeTemporaryCapture && credential.id !== targetCredentialId) {
+        await deps.keychain!.remove(input.actorId, credential.id).catch(() => false);
+      }
+      deps.auditLog.record({
+        at: connection.updatedAt,
+        principalId: input.actorId,
+        action: existing ? "azure.connection.verify" : "azure.connection.complete",
+        resource: connection.connectionId,
+        scopeLabel: scopeId("personal", input.actorId),
+      });
+      return { status: "ok", connection, created: !existing };
     };
 
     return prior
@@ -332,8 +333,22 @@ export function createAzureOpsMethods(
         if (references.length) {
           return { status: "conflict", bindingScopes: references.map((binding) => binding.scopeId) };
         }
-        await deps.azureAccountConnections.remove(connectionId);
-        await deps.keychain.remove(connection.ownerPrincipalId, connection.credentialId);
+        const revoked = await deps.azureAccountConnections.save({
+          connectionId: connection.connectionId,
+          credentialId: connection.credentialId,
+          ownerPrincipalId: connection.ownerPrincipalId,
+          accountLabel: connection.accountLabel,
+          accountEmail: connection.accountEmail,
+          ...(connection.homeTenantId ? { homeTenantId: connection.homeTenantId } : {}),
+          tenantAccess: connection.tenantAccess,
+          status: "revoked",
+        });
+        try {
+          await deps.keychain.remove(connection.ownerPrincipalId, connection.credentialId);
+          await deps.azureAccountConnections.remove(connectionId);
+        } catch {
+          return { status: "invalid_metadata" };
+        }
         deps.auditLog.record({
           at: Date.now(),
           principalId: actorId,
@@ -341,7 +356,7 @@ export function createAzureOpsMethods(
           resource: connectionId,
           scopeLabel: scopeId("personal", actorId),
         });
-        return { status: "ok", connection };
+        return { status: "ok", connection: revoked };
       });
     },
     async getAzureOpsBinding(scopeId, actorId): Promise<AzureOpsBindingResult> {
@@ -403,6 +418,7 @@ export function createAzureOpsMethods(
           if (auth.kind === "project") {
             grantPatch = { grantId: null };
           }
+          let activePriorGrant;
           if (priorTrackedGrantId) {
             if (!priorConnection) return { status: "invalid_credential" };
             const priorGrant = await deps.keychain!.getGrant(priorTrackedGrantId);
@@ -415,16 +431,28 @@ export function createAzureOpsMethods(
             ) {
               return { status: "invalid_credential" };
             }
-            if (priorGrant.status === "active") return { status: "invalid_credential" };
+            if (priorGrant.status === "active") activePriorGrant = priorGrant;
           }
           let stored;
-          try {
-            stored = await deps.azureOpsBindings!.set({
-              ...input,
-              ...(grantPatch ?? {}),
-            });
-          } catch {
-            return { status: "invalid_allowlist" };
+          const next = { ...input, ...(grantPatch ?? {}) };
+          if (activePriorGrant && priorBinding) {
+            if (!deps.azureOpsLegacyMutation) return { status: "invalid_credential" };
+            try {
+              stored = await deps.azureOpsLegacyMutation.replace({
+                grant: activePriorGrant,
+                binding: priorBinding,
+                next,
+              });
+              if (!stored) return { status: "invalid_credential" };
+            } catch {
+              return { status: "invalid_credential" };
+            }
+          } else {
+            try {
+              stored = await deps.azureOpsBindings!.set(next);
+            } catch {
+              return { status: "invalid_allowlist" };
+            }
           }
           const metadataOnly =
             !!priorBinding &&
@@ -454,6 +482,7 @@ export function createAzureOpsMethods(
         const current = await view(scopeId, actorId, auth.kind);
         const internalBinding = await deps.azureOpsBindings?.get(scopeId);
         if (!current || !internalBinding || !deps.azureOpsBindings) return { status: "not_found" };
+        let removedByLegacyMutation = false;
         if (internalBinding.grantId && deps.azureAccountConnections && deps.keychain) {
           const connection = await deps.azureAccountConnections.get(internalBinding.connectionId);
           if (!connection) return { status: "invalid_credential" };
@@ -467,9 +496,18 @@ export function createAzureOpsMethods(
           ) {
             return { status: "invalid_credential" };
           }
-          if (grant.status === "active") return { status: "invalid_credential" };
+          if (grant.status === "active") {
+            if (!deps.azureOpsLegacyMutation) return { status: "invalid_credential" };
+            try {
+              const removed = await deps.azureOpsLegacyMutation.remove({ grant, binding: internalBinding });
+              if (!removed) return { status: "invalid_credential" };
+              removedByLegacyMutation = true;
+            } catch {
+              return { status: "invalid_credential" };
+            }
+          }
         }
-        await deps.azureOpsBindings.remove(scopeId);
+        if (!removedByLegacyMutation) await deps.azureOpsBindings.remove(scopeId);
         deps.auditLog.record({
           at: Date.now(),
           principalId: actorId,

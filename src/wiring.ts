@@ -192,6 +192,7 @@ import {
   type AzureAccountConnection,
   type AzureAccountConnectionStore,
 } from "./azure/azure-account-connection-store.ts";
+import { createAzureOpsLegacyMutation, type AzureOpsLegacyMutation } from "./azure/azure-ops-legacy-mutation.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { refreshChatGPTTokens, refreshClaudeTokens } from "./model/subscription-oauth.ts";
 import { createUserModelCredentialStore, type UserModelCredentialStore } from "./model/user-model-credential-store.ts";
@@ -408,6 +409,7 @@ export interface BuiltApp {
   projects: ProjectStore;
   azureAccountConnections: AzureAccountConnectionStore;
   azureOpsBindings: AzureOpsBindingStore;
+  azureOpsLegacyMutation: AzureOpsLegacyMutation;
   environments: EnvironmentStore;
   processes?: ProcessRegistry;
   monitors: MonitorStore;
@@ -520,7 +522,14 @@ export function buildApp(
     resets: artifactMap<DeviceFlowCutoverReset>("device_flow_cutover_resets"),
   });
   const connectorStatusCache = createConnectorStatusCache(artifactMap<ConnectorStatusRecord>("connector_status"));
-  const azureOpsBindings = createAzureOpsBindingStore(artifactMap<AzureOpsBinding>("azure_ops_default_bindings"));
+  const azureOpsBindingsBacking = artifactMap<AzureOpsBinding>("azure_ops_default_bindings");
+  const keychainGrantsBacking = artifactMap<KeychainGrant>("keychain_grants");
+  const azureOpsBindings = createAzureOpsBindingStore(azureOpsBindingsBacking);
+  const azureOpsLegacyMutation = createAzureOpsLegacyMutation({
+    grants: keychainGrantsBacking,
+    bindings: azureOpsBindingsBacking,
+    ...(pgArtifactMap ? { pg: pgArtifactMap.pool } : {}),
+  });
   const azureAccountConnections = createAzureAccountConnectionStore(
     artifactMap<AzureAccountConnection>("azure_account_connections"),
   );
@@ -768,7 +777,7 @@ export function buildApp(
   };
   const credentialStore: Keychain = createKeychain({
     creds: artifactMap<KeychainCredential>("keychain_credentials"),
-    grants: artifactMap<KeychainGrant>("keychain_grants"),
+    grants: keychainGrantsBacking,
     asks: artifactMap<KeychainAsk>("keychain_asks"),
     key: credentialKey,
     refreshConnector: (() => {
@@ -1199,6 +1208,7 @@ export function buildApp(
             return {
               service: materialized.service,
               status: "selected" as const,
+              connectionId: connection.connectionId,
               ownerId: materialized.ownerId,
               credentialId: materialized.credentialId,
               files: materialized.files,
@@ -1224,6 +1234,7 @@ export function buildApp(
               return {
                 service: materialized.service,
                 status: "selected" as const,
+                connectionId: connection.connectionId,
                 ownerId: materialized.ownerId,
                 credentialId: materialized.credentialId,
                 files: materialized.files,
@@ -1240,6 +1251,7 @@ export function buildApp(
             return {
               service: materialized.service,
               status: "selected" as const,
+              connectionId: connection.connectionId,
               ownerId: materialized.ownerId,
               credentialId: materialized.credentialId,
               files: materialized.files,
@@ -1468,6 +1480,7 @@ export function buildApp(
     projects,
     azureAccountConnections,
     azureOpsBindings,
+    azureOpsLegacyMutation,
     keychain: credentialStore,
     environments,
     deploy: deployService,
@@ -1841,6 +1854,7 @@ export function buildApp(
     projects,
     azureAccountConnections,
     azureOpsBindings,
+    azureOpsLegacyMutation,
     environments,
     ...(processes ? { processes } : {}),
     monitors,

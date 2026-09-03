@@ -404,6 +404,7 @@ export interface TurnRequest {
     publishMembers?: ActorAssertion[];
   };
   text: string;
+  skillInvocation?: string;
   origin?: TurnOrigin;
   triggerTs?: string;
   entryTs?: string;
