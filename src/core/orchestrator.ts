@@ -10,7 +10,7 @@ import type {
   PendingApproval,
   PendingApprovalRecord,
 } from "../types.ts";
-import { scopeId as toScopeId, personalScope } from "../types.ts";
+import { parseScopeId, scopeId as toScopeId, personalScope } from "../types.ts";
 import { turnOriginRequestFields } from "./turn-origin.ts";
 import { resolveTurnFastMode } from "./turn-options.ts";
 import { orgId } from "../config.ts";
@@ -3082,6 +3082,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             if (writable && writtenHandle) {
               if (deps.keychain) {
                 try {
+                  const captureSelectedAzureCredential =
+                    azureOpsRuntimeSelection?.status === "selected" &&
+                    parseScopeId(scopeId).kind === "personal" &&
+                    samePerson(azureOpsRuntimeSelection.ownerId, actor.id);
                   const restoreExcludes = selectedRestoreServices().filter(
                     (service) =>
                       !(
@@ -3093,6 +3097,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       ...brokerCutoverServices,
                       ...restoreExcludes,
                       ...(azureOpsRuntimeSelection?.status === "blocked" ? [azureOpsRuntimeSelection.service] : []),
+                      ...(azureOpsRuntimeSelection?.status === "selected" && !captureSelectedAzureCredential
+                        ? [azureOpsRuntimeSelection.service]
+                        : []),
                     ]),
                   ];
                   await captureDeviceFlowLogins({
@@ -3100,7 +3107,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                     handle: writtenHandle,
                     keychain: deps.keychain,
                     ownerId: deviceFlowCredOwner(memoryScopeId, actor.id),
-                    ...(azureOpsRuntimeSelection?.status === "selected"
+                    ...(captureSelectedAzureCredential
                       ? {
                           selectedCredentialByService: {
                             [azureOpsRuntimeSelection.service]: {

@@ -1268,14 +1268,18 @@ test("azure-ops personal binding restore selects the bound credential and replac
   );
 });
 
-test("azure-ops project binding restore materializes via standing grant and revocation prevents restore", async () => {
+test("azure-ops project binding restore requires current membership and cannot mutate the owner credential", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dfp-azure-binding-project-")) }));
   await publishAzureOpsSkill(built);
 
-  await built.app.upsertDirectory([{ principalId: "U1", displayName: "Owner", type: "internal" }]);
+  await built.app.upsertDirectory([
+    { principalId: "U1", displayName: "Owner", type: "internal" },
+    { principalId: "U2", displayName: "Member", type: "internal" },
+  ]);
   const project = await built.app.createProject("U1", "Azure Ops");
   assert.ok(project);
   if (!project) throw new Error("project setup failed");
+  assert.equal((await built.app.addProjectMember(project.id, "U1", "U2")).status, "ok");
   const projectScope = projectScopeId(project.id);
   await built.keychain!.save({
     ownerId: projectScope,
@@ -1325,6 +1329,46 @@ test("azure-ops project binding restore materializes via standing grant and revo
   });
   assert.equal(projectRun.status, "ok", projectRun.reason);
   assert.equal(projectRun.reply, "selected-project-cache");
+  const delegatedWrite = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U2" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U2:azure-ops-binding-write",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run printf 'delegated-project-cache' > ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(delegatedWrite.status, "ok", delegatedWrite.reason);
+  const ownerAfterDelegatedWrite = await built.keychain!.materializeOwnById(
+    "credential-owner",
+    selected.credentialId,
+    scopeId("personal", "credential-owner"),
+  );
+  assert.equal(ownerAfterDelegatedWrite.kind, "file");
+  if (ownerAfterDelegatedWrite.kind !== "file") return;
+  assert.equal(
+    Buffer.from(
+      ownerAfterDelegatedWrite.files.find((file) => file.path === ".azure/msal_token_cache.json")!.contentBase64,
+      "base64",
+    ).toString("utf8"),
+    "selected-project-cache",
+  );
+  assert.equal((await built.app.removeProjectMember(project.id, "U1", "U2")).status, "ok");
+  const removedMemberRun = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U2" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U2:azure-ops-binding-removed",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(removedMemberRun.status, "refused");
+  assert.match(removedMemberRun.reason ?? "", /not a member/);
   assert.equal(
     (await built.keychain!.materializeOwnFiles("U1")).some(
       (record) =>
@@ -1437,4 +1481,31 @@ test("azure-ops Project Owner connection restores through its binding without a 
   });
   assert.equal(run.status, "ok", run.reason);
   assert.equal(run.reply, "owner-project-cache");
+
+  const write = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U1:owner-azure-ops-binding-write",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run printf 'owner-project-mutated-cache' > ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(write.status, "ok", write.reason);
+  const ownerCredential = await built.keychain!.materializeOwnById(
+    "U1",
+    selected.credentialId,
+    scopeId("personal", "U1"),
+  );
+  assert.equal(ownerCredential.kind, "file");
+  if (ownerCredential.kind !== "file") return;
+  assert.equal(
+    Buffer.from(
+      ownerCredential.files.find((file) => file.path === ".azure/msal_token_cache.json")!.contentBase64,
+      "base64",
+    ).toString("utf8"),
+    "owner-project-cache",
+  );
 });

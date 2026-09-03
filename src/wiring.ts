@@ -1210,12 +1210,33 @@ export function buildApp(
           if (!projectId) return { service: "azure", status: "blocked" as const, ...metadata };
           const project = await projects.get(projectId);
           if (!project) return { service: "azure", status: "blocked" as const, ...metadata };
-          if (
-            samePerson(project.ownerId, connection.ownerPrincipalId) &&
-            samePerson(project.ownerId, credential.ownerId)
-          ) {
-            const materialized = await keychain.materializeOwnedById(project.ownerId, credential.id);
-            if (materialized.kind !== "file") return { service: "azure", status: "blocked" as const, ...metadata };
+          const rosterVersion = await projects.version(parsed.ref);
+          if (rosterVersion === undefined || (await projects.membership(parsed.ref, actorId)) !== true) {
+            return { service: "azure", status: "blocked" as const, ...metadata };
+          }
+          const selected = await projects.withVersion(parsed.ref, rosterVersion, async () => {
+            if (
+              samePerson(project.ownerId, connection.ownerPrincipalId) &&
+              samePerson(project.ownerId, credential.ownerId)
+            ) {
+              const materialized = await keychain.materializeOwnedById(project.ownerId, credential.id);
+              if (materialized.kind !== "file") return null;
+              return {
+                service: materialized.service,
+                status: "selected" as const,
+                ownerId: materialized.ownerId,
+                credentialId: materialized.credentialId,
+                files: materialized.files,
+                ...metadata,
+              };
+            }
+            const grantRecord = (await keychain.grantsForScope(activeScopeId)).find(
+              ({ grant }) =>
+                grant.credentialId === credential.id && grant.mode === "standing" && grant.status === "active",
+            );
+            if (!grantRecord) return null;
+            const materialized = await keychain.materialize(grantRecord.grant.id, activeScopeId, actorId);
+            if (materialized.kind !== "file") return null;
             return {
               service: materialized.service,
               status: "selected" as const,
@@ -1224,22 +1245,8 @@ export function buildApp(
               files: materialized.files,
               ...metadata,
             };
-          }
-          const grantRecord = (await keychain.grantsForScope(activeScopeId)).find(
-            ({ grant }) =>
-              grant.credentialId === credential.id && grant.mode === "standing" && grant.status === "active",
-          );
-          if (!grantRecord) return { service: "azure", status: "blocked" as const, ...metadata };
-          const materialized = await keychain.materialize(grantRecord.grant.id, activeScopeId, actorId);
-          if (materialized.kind !== "file") return { service: "azure", status: "blocked" as const, ...metadata };
-          return {
-            service: materialized.service,
-            status: "selected" as const,
-            ownerId: materialized.ownerId,
-            credentialId: materialized.credentialId,
-            files: materialized.files,
-            ...metadata,
-          };
+          });
+          return selected ?? { service: "azure", status: "blocked" as const, ...metadata };
         }
       : undefined;
   const orchestratorDeps: OrchestratorDeps = {
