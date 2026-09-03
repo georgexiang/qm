@@ -377,10 +377,13 @@ test("Azure registration archives captured default credentials into account-spec
       },
     );
     assert.equal(refreshAlice.status, 200);
+    const refreshedConnection = (await refreshAlice.json()) as { credentialId: string };
+    assert.notEqual(refreshedConnection.credentialId, firstConnection.credentialId);
+    assert.equal(await built.keychain!.getCredential(firstConnection.credentialId), null);
 
     const refreshedFirst = await built.keychain!.materializeOwnById(
       "alice",
-      firstConnection.credentialId,
+      refreshedConnection.credentialId,
       "personal:alice",
     );
     const retainedSecond = await built.keychain!.materializeOwnById(

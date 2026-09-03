@@ -36,6 +36,7 @@ export interface AzureAccountConnection {
 
 export interface SaveAzureAccountConnectionInput {
   connectionId?: string;
+  previousCredentialId?: string;
   credentialId: string;
   ownerPrincipalId: string;
   accountLabel: string;
@@ -128,7 +129,9 @@ export function createAzureAccountConnectionStore(
       const prior = input.connectionId ? await backing.get(input.connectionId) : null;
       if (input.connectionId && !prior) throw new Error("connection not found");
       if (prior && prior.ownerPrincipalId !== input.ownerPrincipalId) throw new Error("connection owner cannot change");
-      if (prior && prior.credentialId !== input.credentialId) throw new Error("connection credential cannot change");
+      if (prior && prior.credentialId !== input.credentialId && input.previousCredentialId !== prior.credentialId) {
+        throw new Error("connection credential rotation requires the current credential ID");
+      }
       const at = now();
       const homeTenantId = input.homeTenantId ? uuid(input.homeTenantId, "homeTenantId") : undefined;
       const tenantAccess = normalizeTenantAccess(input.tenantAccess);

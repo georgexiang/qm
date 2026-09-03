@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { buildApp } from "../src/wiring.ts";
 import { createAzureOpsMethods } from "../src/api/app-azure.ts";
 import type { AppDeps } from "../src/api/app-types.ts";
@@ -103,8 +104,8 @@ test("Core enforces personal ownership and atomically updates the Azure Ops defa
                 id: SUBSCRIPTION_TWO,
                 name: "alice-two subscription",
                 state: "Enabled",
-                tenantId: TENANT_TWO,
-                homeTenantId: TENANT_TWO,
+                tenantId: TENANT_ONE,
+                homeTenantId: TENANT_ONE,
                 user: { name: "alice@example.com", type: "user" },
               },
             ],
@@ -127,18 +128,198 @@ test("Core enforces personal ownership and atomically updates the Azure Ops defa
   const replaced = await built.app.setAzureOpsBinding({
     scopeId: "personal:alice",
     connectionId: first.connection.connectionId,
-    ...targets(TENANT_TWO, SUBSCRIPTION_TWO),
+    ...targets(TENANT_ONE, SUBSCRIPTION_TWO),
     actorId: "alice",
   });
   assert.equal(replaced.status, "ok");
   if (created.status !== "ok" || replaced.status !== "ok") return;
   assert.equal(replaced.binding.binding.bindingId, created.binding.binding.bindingId);
   assert.equal(replaced.binding.binding.connectionId, first.connection.connectionId);
-  assert.equal(replaced.binding.binding.defaultTarget.tenantId, TENANT_TWO);
+  assert.equal(replaced.binding.binding.defaultTarget.tenantId, TENANT_ONE);
   assert.ok(!JSON.stringify(replaced).includes("secret-alice"));
   assert.equal((await built.app.deleteAzureOpsBinding("personal:alice", "bob")).status, "forbidden");
   assert.equal((await built.app.deleteAzureOpsBinding("personal:alice", "alice")).status, "ok");
   assert.equal((await built.app.getAzureOpsBinding("personal:alice", "alice")).status, "not_found");
+});
+
+test("Azure connection refresh cannot replace the established account identity", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-connection-identity-")) }));
+  const first = await azureConnection(built, "alice", "alice-one", TENANT_ONE, SUBSCRIPTION_ONE);
+  const secondCredential = await built.keychain!.save({
+    ownerId: "alice",
+    service: "azure",
+    files: [
+      {
+        path: ".azure/azureProfile.json",
+        contentBase64: Buffer.from(
+          JSON.stringify({
+            subscriptions: [
+              {
+                id: SUBSCRIPTION_TWO,
+                name: "second subscription",
+                state: "Enabled",
+                tenantId: TENANT_TWO,
+                homeTenantId: TENANT_TWO,
+                user: { name: "other@example.com", type: "user" },
+              },
+            ],
+          }),
+          "utf8",
+        ).toString("base64"),
+      },
+      { path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("secret-other").toString("base64") },
+    ],
+    accountLabel: "other",
+    origin: "device-flow-auto-capture",
+  });
+
+  const refreshed = await built.app.saveAzureAccountConnection({
+    connectionId: first.connection.connectionId,
+    credentialId: secondCredential.id,
+    actorId: "alice",
+  });
+
+  assert.equal(refreshed.status, "invalid_metadata");
+  const unchanged = await built.azureAccountConnections.get(first.connection.connectionId);
+  assert.equal(unchanged?.accountEmail, "alice@example.com");
+  assert.equal(unchanged?.homeTenantId, TENANT_ONE);
+});
+
+test("Failed Azure refresh metadata persistence preserves the prior credential", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-connection-refresh-rollback-")) }));
+  const first = await azureConnection(built, "alice", "first", TENANT_ONE, SUBSCRIPTION_ONE);
+  const refreshedCapture = await built.keychain!.save({
+    ownerId: "alice",
+    service: "azure",
+    files: [
+      {
+        path: ".azure/azureProfile.json",
+        contentBase64: Buffer.from(
+          JSON.stringify({
+            subscriptions: [
+              {
+                id: SUBSCRIPTION_ONE,
+                name: "refreshed subscription",
+                state: "Enabled",
+                tenantId: TENANT_ONE,
+                homeTenantId: TENANT_ONE,
+                user: { name: "alice@example.com", type: "user" },
+              },
+            ],
+          }),
+          "utf8",
+        ).toString("base64"),
+      },
+      { path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("secret-refreshed").toString("base64") },
+    ],
+    accountLabel: "refreshed",
+    origin: "device-flow-auto-capture",
+  });
+  const originalSave = built.azureAccountConnections.save.bind(built.azureAccountConnections);
+  built.azureAccountConnections.save = async () => {
+    throw new Error("metadata unavailable");
+  };
+
+  const refreshed = await built.app.saveAzureAccountConnection({
+    connectionId: first.connection.connectionId,
+    credentialId: refreshedCapture.id,
+    actorId: "alice",
+  });
+  built.azureAccountConnections.save = originalSave;
+
+  assert.equal(refreshed.status, "invalid_metadata");
+  const materialized = await built.keychain!.materializeOwnById(
+    "alice",
+    first.connection.credentialId,
+    "personal:alice",
+  );
+  assert.equal(materialized.kind, "file");
+  if (materialized.kind !== "file") return;
+  const tokenCache = materialized.files.find((file) => file.path === ".azure/msal_token_cache.json");
+  assert.equal(Buffer.from(tokenCache?.contentBase64 ?? "", "base64").toString("utf8"), "secret-first");
+});
+
+test("Concurrent Azure registration creates one connection for an account", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-connection-concurrent-")) }));
+  const captured = await built.keychain!.save({
+    ownerId: "alice",
+    service: "azure",
+    files: [
+      {
+        path: ".azure/azureProfile.json",
+        contentBase64: Buffer.from(
+          JSON.stringify({
+            subscriptions: [
+              {
+                id: SUBSCRIPTION_ONE,
+                name: "concurrent subscription",
+                state: "Enabled",
+                tenantId: TENANT_ONE,
+                homeTenantId: TENANT_ONE,
+                user: { name: "alice@example.com", type: "user" },
+              },
+            ],
+          }),
+          "utf8",
+        ).toString("base64"),
+      },
+      { path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("secret-concurrent").toString("base64") },
+    ],
+    accountLabel: "concurrent",
+    origin: "device-flow-auto-capture",
+  });
+  const input = { credentialId: captured.id, actorId: "alice", accountLabel: "concurrent" };
+
+  const results = await Promise.all([
+    built.app.saveAzureAccountConnection(input),
+    built.app.saveAzureAccountConnection(input),
+  ]);
+
+  assert.deepEqual(
+    results.map((result) => result.status),
+    ["ok", "ok"],
+  );
+  const connections = await built.azureAccountConnections.listByOwner("alice");
+  assert.equal(connections.length, 1);
+  assert.equal(new Set(connections.map((connection) => connection.credentialId)).size, 1);
+});
+
+test("Azure connection deletion serializes against binding creation", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-connection-delete-race-")) }));
+  const saved = await azureConnection(built, "alice", "alice", TENANT_ONE, SUBSCRIPTION_ONE);
+  const listed = Promise.withResolvers<void>();
+  const releaseDelete = Promise.withResolvers<void>();
+  const bindingSetStarted = Promise.withResolvers<void>();
+  const originalListByConnection = built.azureOpsBindings.listByConnection.bind(built.azureOpsBindings);
+  const originalSet = built.azureOpsBindings.set.bind(built.azureOpsBindings);
+  built.azureOpsBindings.listByConnection = async (connectionId) => {
+    listed.resolve();
+    await releaseDelete.promise;
+    return originalListByConnection(connectionId);
+  };
+  built.azureOpsBindings.set = async (input) => {
+    bindingSetStarted.resolve();
+    return originalSet(input);
+  };
+
+  const deleting = built.app.deleteAzureAccountConnection(saved.connection.connectionId, "alice");
+  await listed.promise;
+  const binding = built.app.setAzureOpsBinding({
+    scopeId: "personal:alice",
+    connectionId: saved.connection.connectionId,
+    ...targets(TENANT_ONE, SUBSCRIPTION_ONE),
+    actorId: "alice",
+  });
+  const startedBeforeDeleteReleased = await Promise.race([
+    bindingSetStarted.promise.then(() => true),
+    delay(25).then(() => false),
+  ]);
+  releaseDelete.resolve();
+
+  assert.equal(startedBeforeDeleteReleased, false);
+  assert.equal((await deleting).status, "ok");
+  assert.equal((await binding).status, "invalid_credential");
+  assert.equal((await built.azureOpsBindings.get("personal:alice")) ?? null, null);
 });
 
 test("Project owner mutates while current members read and standing grant revocation makes the binding unavailable", async () => {
@@ -643,7 +824,7 @@ test("Legacy tracked Project grant replacement leaves the prior binding untouche
   );
 });
 
-test("Legacy tracked Project grant is revoked before a successful replacement", async () => {
+test("Active legacy tracked Project grant blocks replacement until separately revoked", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-binding-legacy-replace-ok-")) }));
   const project = await built.projects.create({ name: "Azure legacy success", ownerId: "project-owner" });
   const projectScope = projectScopeId(project.id);
@@ -672,9 +853,49 @@ test("Legacy tracked Project grant is revoked before a successful replacement", 
     actorId: "project-owner",
   });
 
-  assert.equal(replaced.status, "ok");
-  assert.equal((await built.keychain!.getGrant(legacyGrant.id))?.status, "revoked");
+  assert.equal(replaced.status, "invalid_credential");
+  assert.equal((await built.keychain!.getGrant(legacyGrant.id))?.status, "active");
+  assert.equal((await built.azureOpsBindings.get(projectScope))?.connectionId, first.connection.connectionId);
+
+  assert.equal(await built.keychain!.revokeGrant("project-owner", legacyGrant.id), true);
+  const retried = await built.app.setAzureOpsBinding({
+    scopeId: projectScope,
+    connectionId: second.connection.connectionId,
+    ...targets(TENANT_TWO, SUBSCRIPTION_TWO),
+    confirmProjectSharing: true,
+    actorId: "project-owner",
+  });
+  assert.equal(retried.status, "ok");
   assert.equal((await built.azureOpsBindings.get(projectScope))?.connectionId, second.connection.connectionId);
+});
+
+test("Active legacy tracked Project grant blocks disconnect until separately revoked", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "azure-binding-legacy-delete-active-")) }));
+  const project = await built.projects.create({ name: "Azure legacy delete", ownerId: "project-owner" });
+  const projectScope = projectScopeId(project.id);
+  const connection = await azureConnection(built, "project-owner", "legacy", TENANT_ONE, SUBSCRIPTION_ONE);
+  const legacyGrant = await built.keychain!.createGrant({
+    credentialId: connection.credential.id,
+    ownerId: "project-owner",
+    audienceScopeId: projectScope,
+    mode: "standing",
+    purpose: "Legacy Azure Project binding",
+  });
+  await built.azureOpsBindings.set({
+    scopeId: projectScope,
+    connectionId: connection.connection.connectionId,
+    ...targets(TENANT_ONE, SUBSCRIPTION_ONE),
+    grantId: legacyGrant.id,
+    actorId: "project-owner",
+  });
+
+  assert.equal((await built.app.deleteAzureOpsBinding(projectScope, "project-owner")).status, "invalid_credential");
+  assert.ok(await built.azureOpsBindings.get(projectScope));
+  assert.equal((await built.keychain!.getGrant(legacyGrant.id))?.status, "active");
+
+  assert.equal(await built.keychain!.revokeGrant("project-owner", legacyGrant.id), true);
+  assert.equal((await built.app.deleteAzureOpsBinding(projectScope, "project-owner")).status, "ok");
+  assert.equal(await built.azureOpsBindings.get(projectScope), null);
 });
 
 test("Legacy Project binding cannot revoke a mismatched same-owner grant", async () => {
