@@ -1073,7 +1073,7 @@ const AZURE_TEST_SUBSCRIPTION = "483ab1e0-a746-4f34-8276-53e640d6ab09";
 const AZURE_TEST_TENANT_TWO = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const AZURE_TEST_SUBSCRIPTION_TWO = "a8af42d5-b229-4360-9620-682eec610bc5";
 
-async function publishAzureOpsSkill(built: ReturnType<typeof buildApp>): Promise<void> {
+async function publishAzureOpsSkill(built: ReturnType<typeof buildApp>, guarded = true): Promise<void> {
   const skill = await built.skills.create({
     scopeId: scopeId("org", "default-org"),
     createdBy: "system:test",
@@ -1082,11 +1082,38 @@ async function publishAzureOpsSkill(built: ReturnType<typeof buildApp>): Promise
       description: "azure ops sandbox binding runtime test",
       requiredCapabilities: [],
       body: "runtime test skill",
+      ...(guarded ? { files: [{ path: "scripts/az_guard.py", content: "guard" }] } : {}),
     },
   });
   await built.skills.review(skill.id, "system:test-review", []);
   await built.skills.publish(skill.id);
 }
+
+test("azure-ops invocation requires the installed read-only guard asset", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dfp-azure-unguarded-skill-")) }));
+  await publishAzureOpsSkill(built, false);
+  const selected = await registerAzureConnection(built, "U1", "unguarded", "must-not-restore");
+  assert.equal(
+    (
+      await built.app.setAzureOpsBinding({
+        scopeId: scopeId("personal", "U1"),
+        connectionId: selected.connectionId,
+        defaultTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+        targetAllowlist: [{ tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] }],
+        actorId: "U1",
+      })
+    ).status,
+    "ok",
+  );
+
+  const run = await built.app.turn(
+    dm(
+      "/azure-ops !run test ! -e ~/.azure/msal_token_cache.json && printf blocked || cat ~/.azure/msal_token_cache.json",
+    ),
+  );
+  assert.equal(run.status, "refused");
+  assert.match(run.reason ?? "", /missing.*guard/i);
+});
 
 async function registerAzureConnection(
   built: ReturnType<typeof buildApp>,

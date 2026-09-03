@@ -916,9 +916,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const visibleSkillsForTurn = async (): Promise<SkillResolution[]> =>
         filterConnectorSkills((await deps.skills?.visibleFor(skillScopes, grantedSkills)) ?? [], configuredProviders);
       const visibleSkills = await visibleSkillsForTurn();
+      const azureOpsRequested = input.skillInvocation === AZURE_OPS_SKILL_NAME;
+      const azureOpsSkill = visibleSkills.find(
+        (resolution) => resolution.skill?.manifest.name === AZURE_OPS_SKILL_NAME,
+      );
       const azureOpsInvoked =
-        input.skillInvocation === AZURE_OPS_SKILL_NAME &&
-        visibleSkills.some((resolution) => resolution.skill?.manifest.name === AZURE_OPS_SKILL_NAME);
+        azureOpsRequested &&
+        azureOpsSkill?.skill?.manifest.files?.some((file) => file.path === "scripts/az_guard.py") === true;
+      if (azureOpsRequested && azureOpsSkill && !azureOpsInvoked) {
+        return { status: "refused", reason: "the Azure Ops skill is missing its required read-only guard" };
+      }
       const azureOpsRuntimeSelection =
         deps.resolveAzureSandboxCredentialForScope && azureOpsInvoked
           ? await deps
