@@ -66,6 +66,7 @@ export interface DeviceFlowPersistInput {
   keychain: Keychain;
   ownerId: string;
   selectedCredentialByService?: Record<string, { ownerId: string; credentialId: string }>;
+  credentialSlotByService?: Record<string, string>;
   onAnomaly?: (service: string, detail: string) => void;
   credentialPaths?: CredentialPathSpec[];
   services?: readonly string[];
@@ -131,6 +132,18 @@ export async function captureDeviceFlowLogins(input: DeviceFlowPersistInput): Pr
       continue;
     }
     files.sort((a, b) => a.path.localeCompare(b.path));
+    const credentialSlot = input.credentialSlotByService?.[service];
+    if (credentialSlot) {
+      await input.keychain.save({
+        ownerId: input.ownerId,
+        service,
+        files,
+        credentialSlot,
+        origin: DEVICE_FLOW_ORIGIN,
+      });
+      saved.push(service);
+      continue;
+    }
     const selected = input.selectedCredentialByService?.[service];
     if (selected) {
       const current = await input.keychain.getCredential(selected.credentialId);

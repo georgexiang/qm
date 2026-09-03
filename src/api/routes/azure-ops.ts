@@ -42,6 +42,21 @@ function connectionResponse(
   return sendJson(ctx.res, result.status === "invalid_credential" ? 409 : 404, { error: result.status });
 }
 
+function deviceCodeResponse(
+  ctx: ApiCtx,
+  result: Awaited<ReturnType<ApiCtx["app"]["startAzureDeviceCodeFlow"]>>,
+  created = false,
+): void {
+  if (result.status === "ok") return sendJson(ctx.res, created ? 201 : 200, result);
+  if (result.status === "forbidden") return sendJson(ctx.res, 403, { error: result.status });
+  if (result.status === "expired") return sendJson(ctx.res, 410, { error: result.status });
+  if (result.status === "conflict" || result.status === "not_ready") {
+    return sendJson(ctx.res, 409, { error: result.status });
+  }
+  if (result.status === "unavailable") return sendJson(ctx.res, 503, { error: result.status });
+  return sendJson(ctx.res, result.status === "not_found" ? 404 : 502, { error: result.status });
+}
+
 async function listCredentials(ctx: ApiCtx): Promise<void> {
   const actorId = ctx.actor?.p;
   if (!actorId) return sendJson(ctx.res, 401, { error: "unauthorized" });
@@ -52,6 +67,34 @@ async function listConnections(ctx: ApiCtx): Promise<void> {
   const actorId = ctx.actor?.p;
   if (!actorId) return sendJson(ctx.res, 401, { error: "unauthorized" });
   return sendJson(ctx.res, 200, { connections: await ctx.app.listAzureAccountConnections(actorId) });
+}
+
+async function startDeviceCode(ctx: ApiCtx): Promise<void> {
+  const actorId = ctx.actor?.p;
+  if (!actorId) return sendJson(ctx.res, 401, { error: "unauthorized" });
+  const body = isObj(ctx.body) ? ctx.body : {};
+  const connectionId = typeof body.connectionId === "string" ? body.connectionId.trim() : undefined;
+  return deviceCodeResponse(
+    ctx,
+    await ctx.app.startAzureDeviceCodeFlow({ actorId, ...(connectionId ? { connectionId } : {}) }),
+    true,
+  );
+}
+
+async function pollDeviceCode(ctx: ApiCtx): Promise<void> {
+  const actorId = ctx.actor?.p;
+  if (!actorId) return sendJson(ctx.res, 401, { error: "unauthorized" });
+  const flowId = ctx.params.flowId;
+  if (!flowId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  return deviceCodeResponse(ctx, await ctx.app.pollAzureDeviceCodeFlow(flowId, actorId));
+}
+
+async function completeDeviceCode(ctx: ApiCtx): Promise<void> {
+  const actorId = ctx.actor?.p;
+  if (!actorId) return sendJson(ctx.res, 401, { error: "unauthorized" });
+  const flowId = ctx.params.flowId;
+  if (!flowId) return sendJson(ctx.res, 400, { error: "bad_request" });
+  return deviceCodeResponse(ctx, await ctx.app.completeAzureDeviceCodeFlow(flowId, actorId));
 }
 
 async function createConnection(ctx: ApiCtx): Promise<void> {
@@ -133,6 +176,14 @@ async function deleteBinding(ctx: ApiCtx): Promise<void> {
 
 export const azureOpsRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/azure/credentials", auth: "source", handle: listCredentials },
+  { method: "POST", path: "/v1/azure/connections/device-code/start", auth: "source", handle: startDeviceCode },
+  { method: "GET", path: "/v1/azure/connections/device-code/:flowId", auth: "source", handle: pollDeviceCode },
+  {
+    method: "POST",
+    path: "/v1/azure/connections/device-code/:flowId/complete",
+    auth: "source",
+    handle: completeDeviceCode,
+  },
   { method: "GET", path: "/v1/azure/connections", auth: "source", handle: listConnections },
   { method: "POST", path: "/v1/azure/connections", auth: "source", handle: createConnection },
   { method: "PUT", path: "/v1/azure/connections/:connectionId", auth: "source", handle: updateConnection },

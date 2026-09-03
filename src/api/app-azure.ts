@@ -106,6 +106,9 @@ export function createAzureOpsMethods(
   App,
   | "listAzureCapturedCredentials"
   | "listAzureAccountConnections"
+  | "startAzureDeviceCodeFlow"
+  | "pollAzureDeviceCodeFlow"
+  | "completeAzureDeviceCodeFlow"
   | "saveAzureAccountConnection"
   | "deleteAzureAccountConnection"
   | "getAzureOpsBinding"
@@ -115,6 +118,7 @@ export function createAzureOpsMethods(
   const bindingQueue = createKeyedQueue<ScopeId>();
   const accountIdentityQueue = createKeyedQueue<string>();
   const connectionQueue = createKeyedQueue<string>();
+  const deviceCodeQueue = createKeyedQueue<string>();
   const withBindingLock = <T>(targetScopeId: ScopeId, fn: () => Promise<T>): Promise<T> =>
     bindingQueue(targetScopeId, () => deps.advisoryLock?.withLock(`azure-binding:${targetScopeId}`, fn) ?? fn());
   const withAccountIdentityLock = <T>(ownerId: string, identity: string, fn: () => Promise<T>): Promise<T> => {
@@ -123,6 +127,30 @@ export function createAzureOpsMethods(
   };
   const withConnectionLock = <T>(connectionId: string, fn: () => Promise<T>): Promise<T> =>
     connectionQueue(connectionId, () => deps.advisoryLock?.withLock(`azure-connection:${connectionId}`, fn) ?? fn());
+  const withDeviceCodeLock = <T>(flowId: string, fn: () => Promise<T>): Promise<T> =>
+    deviceCodeQueue(flowId, () => deps.advisoryLock?.withLock(`azure-device-code:${flowId}`, fn) ?? fn());
+
+  const flowView = (flow: NonNullable<Awaited<ReturnType<NonNullable<AppDeps["azureDeviceCodeFlows"]>["get"]>>>) => ({
+    flowId: flow.flowId,
+    scopeId: flow.intendedScopeId,
+    status: flow.status,
+    createdAt: flow.createdAt,
+    expiresAt: flow.expiresAt,
+    ...(flow.connectionId ? { connectionId: flow.connectionId } : {}),
+  });
+
+  async function actorFlow(flowId: string, actorId: string) {
+    const flow = await deps.azureDeviceCodeFlows?.get(flowId);
+    if (!flow) return { status: "not_found" as const };
+    if (!samePerson(flow.principalId, actorId) || flow.intendedScopeId !== scopeId("personal", actorId)) {
+      return { status: "forbidden" as const };
+    }
+    if (flow.expiresAt <= Date.now() && flow.status !== "completed") {
+      const expired = (await deps.azureDeviceCodeFlows?.merge(flowId, { status: "expired" })) ?? flow;
+      return { status: "expired" as const, flow: expired };
+    }
+    return { status: "ok" as const, flow };
+  }
 
   async function authorization(
     targetScopeId: ScopeId,
@@ -191,7 +219,9 @@ export function createAzureOpsMethods(
   }
 
   async function saveConnection(
-    input: Parameters<App["saveAzureAccountConnection"]>[0],
+    input: Parameters<App["saveAzureAccountConnection"]>[0] & {
+      auditAction?: "azure.connection.complete" | "azure.connection.reconnect";
+    },
   ): Promise<AzureAccountConnectionResult> {
     if (!deps.azureAccountConnections || !deps.keychain) return { status: "not_found" };
     const prior = input.connectionId ? await deps.azureAccountConnections.get(input.connectionId) : null;
@@ -298,9 +328,10 @@ export function createAzureOpsMethods(
       deps.auditLog.record({
         at: connection.updatedAt,
         principalId: input.actorId,
-        action: existing ? "azure.connection.verify" : "azure.connection.complete",
+        action: input.auditAction ?? (existing ? "azure.connection.verify" : "azure.connection.complete"),
         resource: connection.connectionId,
         scopeLabel: scopeId("personal", input.actorId),
+        status: "ok",
       });
       return { status: "ok", connection, created: !existing };
     };
@@ -322,6 +353,165 @@ export function createAzureOpsMethods(
     },
     async listAzureAccountConnections(actorId) {
       return (await deps.azureAccountConnections?.listByOwner(actorId)) ?? [];
+    },
+    async startAzureDeviceCodeFlow(input) {
+      if (!deps.azureDeviceCodeFlows || !deps.azureDeviceCodeDriver) return { status: "unavailable" };
+      if (input.connectionId) {
+        const connection = await deps.azureAccountConnections?.get(input.connectionId);
+        if (!connection || !samePerson(connection.ownerPrincipalId, input.actorId)) return { status: "not_found" };
+      }
+      const flowId = randomUUID();
+      const createdAt = Date.now();
+      const expiresAt = createdAt + 15 * 60_000;
+      const intendedScopeId = scopeId("personal", input.actorId);
+      const flow = {
+        flowId,
+        principalId: input.actorId,
+        intendedScopeId,
+        status: "starting" as const,
+        createdAt,
+        expiresAt,
+        ...(input.connectionId ? { connectionId: input.connectionId } : {}),
+      };
+      await deps.azureDeviceCodeFlows.put(flowId, flow);
+      let started;
+      try {
+        started = await deps.azureDeviceCodeDriver.start({
+          flowId,
+          principalId: input.actorId,
+          scopeId: intendedScopeId,
+          expiresAt,
+        });
+      } catch {
+        await deps.azureDeviceCodeFlows.merge(flowId, { status: "failed" });
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: input.actorId,
+          action: "azure.connection.start",
+          resource: input.connectionId ?? flowId,
+          scopeLabel: intendedScopeId,
+          status: "failed",
+        });
+        return { status: "failed" };
+      }
+      const pendingFlow = {
+        ...flow,
+        status: "pending" as const,
+        processRef: started.processRef,
+        sessionRef: started.sessionRef,
+      };
+      await deps.azureDeviceCodeFlows.put(flowId, pendingFlow);
+      deps.auditLog.record({
+        at: createdAt,
+        principalId: input.actorId,
+        action: "azure.connection.start",
+        resource: input.connectionId ?? flowId,
+        scopeLabel: intendedScopeId,
+        status: "started",
+      });
+      return {
+        status: "ok",
+        flow: flowView(pendingFlow),
+        verificationUri: started.verificationUri,
+        userCode: started.userCode,
+      };
+    },
+    async pollAzureDeviceCodeFlow(flowId, actorId) {
+      const owned = await actorFlow(flowId, actorId);
+      if (owned.status !== "ok") return { status: owned.status };
+      if (owned.flow.status === "completed" || owned.flow.status === "failed") {
+        return { status: "ok", flow: flowView(owned.flow) };
+      }
+      if (!deps.azureDeviceCodeDriver || !deps.azureDeviceCodeFlows) return { status: "unavailable" };
+      let driverStatus: "pending" | "ready" | "failed";
+      try {
+        driverStatus = await deps.azureDeviceCodeDriver.poll(owned.flow);
+      } catch {
+        driverStatus = "failed";
+      }
+      const updated = (await deps.azureDeviceCodeFlows.merge(flowId, { status: driverStatus })) ?? owned.flow;
+      return { status: "ok", flow: flowView(updated) };
+    },
+    async completeAzureDeviceCodeFlow(flowId, actorId) {
+      return withDeviceCodeLock(flowId, async () => {
+        const owned = await actorFlow(flowId, actorId);
+        if (owned.status !== "ok") return { status: owned.status };
+        if (owned.flow.status === "completed") return { status: "conflict" };
+        if (owned.flow.status === "failed") return { status: "failed" };
+        if (!deps.azureDeviceCodeDriver || !deps.azureDeviceCodeFlows) return { status: "unavailable" };
+        let driverStatus: "pending" | "ready" | "failed";
+        try {
+          driverStatus = await deps.azureDeviceCodeDriver.poll(owned.flow);
+        } catch {
+          driverStatus = "failed";
+        }
+        if (driverStatus === "pending") return { status: "not_ready" };
+        if (driverStatus === "failed") {
+          await deps.azureDeviceCodeFlows.merge(flowId, { status: "failed" });
+          deps.auditLog.record({
+            at: Date.now(),
+            principalId: actorId,
+            action: owned.flow.connectionId ? "azure.connection.reconnect" : "azure.connection.complete",
+            resource: owned.flow.connectionId ?? flowId,
+            scopeLabel: owned.flow.intendedScopeId,
+            status: "failed",
+          });
+          return { status: "failed" };
+        }
+        let credentialId = owned.flow.capturedCredentialId;
+        if (!credentialId) {
+          try {
+            credentialId = await deps.azureDeviceCodeDriver.capture(owned.flow);
+            const captured = await deps.azureDeviceCodeFlows.merge(flowId, {
+              status: "ready",
+              capturedCredentialId: credentialId,
+            });
+            if (!captured) {
+              await deps.keychain?.remove(actorId, credentialId);
+              return { status: "failed" };
+            }
+          } catch {
+            await deps.azureDeviceCodeFlows.merge(flowId, { status: "failed" });
+            deps.auditLog.record({
+              at: Date.now(),
+              principalId: actorId,
+              action: owned.flow.connectionId ? "azure.connection.reconnect" : "azure.connection.complete",
+              resource: owned.flow.connectionId ?? flowId,
+              scopeLabel: owned.flow.intendedScopeId,
+              status: "failed",
+            });
+            return { status: "failed" };
+          }
+        }
+        const registered = await saveConnection({
+          actorId,
+          credentialId,
+          ...(owned.flow.connectionId ? { connectionId: owned.flow.connectionId } : {}),
+          auditAction: owned.flow.connectionId ? "azure.connection.reconnect" : "azure.connection.complete",
+        });
+        if (registered.status !== "ok") {
+          await deps.keychain?.remove(actorId, credentialId);
+          await deps.azureDeviceCodeFlows.merge(flowId, { status: "failed" });
+          deps.auditLog.record({
+            at: Date.now(),
+            principalId: actorId,
+            action: owned.flow.connectionId ? "azure.connection.reconnect" : "azure.connection.complete",
+            resource: owned.flow.connectionId ?? flowId,
+            scopeLabel: owned.flow.intendedScopeId,
+            status: "failed",
+          });
+          return { status: "failed" };
+        }
+        if (credentialId !== registered.connection.credentialId) {
+          await deps.keychain?.remove(actorId, credentialId).catch(() => false);
+        }
+        const completed =
+          (await deps.azureDeviceCodeFlows.merge(flowId, {
+            status: "completed",
+            connectionId: registered.connection.connectionId,
+          })) ?? owned.flow;
+        return { status: "ok", flow: flowView(completed) };
+      });
     },
     saveAzureAccountConnection: saveConnection,
     async deleteAzureAccountConnection(connectionId, actorId): Promise<AzureAccountConnectionResult> {

@@ -193,6 +193,11 @@ import {
   type AzureAccountConnectionStore,
 } from "./azure/azure-account-connection-store.ts";
 import { createAzureOpsLegacyMutation, type AzureOpsLegacyMutation } from "./azure/azure-ops-legacy-mutation.ts";
+import {
+  createSandboxAzureDeviceCodeDriver,
+  type AzureDeviceCodeDriver,
+  type AzureDeviceCodeFlow,
+} from "./azure/azure-device-code-flow.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { refreshChatGPTTokens, refreshClaudeTokens } from "./model/subscription-oauth.ts";
 import { createUserModelCredentialStore, type UserModelCredentialStore } from "./model/user-model-credential-store.ts";
@@ -410,6 +415,7 @@ export interface BuiltApp {
   azureAccountConnections: AzureAccountConnectionStore;
   azureOpsBindings: AzureOpsBindingStore;
   azureOpsLegacyMutation: AzureOpsLegacyMutation;
+  azureDeviceCodeFlows: DurableMap<AzureDeviceCodeFlow>;
   environments: EnvironmentStore;
   processes?: ProcessRegistry;
   monitors: MonitorStore;
@@ -431,6 +437,7 @@ export function buildApp(
     securityScreener?: SecurityScreener;
     credentialBrokers?: Record<string, AwsRoleBroker>;
     modelCredentialFetch?: typeof fetch;
+    azureDeviceCodeDriver?: AzureDeviceCodeDriver;
   } = {},
 ): BuiltApp {
   if (config.databaseUrl && !config.connectorSecretKey) {
@@ -533,6 +540,7 @@ export function buildApp(
   const azureAccountConnections = createAzureAccountConnectionStore(
     artifactMap<AzureAccountConnection>("azure_account_connections"),
   );
+  const azureDeviceCodeFlows = artifactMap<AzureDeviceCodeFlow>("azure_device_code_flows");
   const slackInstallation = createSlackInstallationStore(
     config.orgId,
     artifactMap("slack_installation"),
@@ -999,6 +1007,9 @@ export function buildApp(
   if (supportsProcessSessions(sandbox)) {
     processes = config.databaseUrl ? createPostgresProcessRegistry(config.databaseUrl) : createMemoryProcessRegistry();
   }
+  const azureDeviceCodeDriver =
+    overrides.azureDeviceCodeDriver ??
+    (processes ? createSandboxAzureDeviceCodeDriver({ sandbox, processes, keychain: credentialStore }) : undefined);
 
   const replayDedupe = config.databaseUrl ? createPostgresReplayDedupe(config.databaseUrl) : createMemoryReplayDedupe();
   const metrics = config.databaseUrl ? createPostgresMetricsSink(config.databaseUrl) : createMetricsSink();
@@ -1481,6 +1492,8 @@ export function buildApp(
     azureAccountConnections,
     azureOpsBindings,
     azureOpsLegacyMutation,
+    azureDeviceCodeFlows,
+    ...(azureDeviceCodeDriver ? { azureDeviceCodeDriver } : {}),
     keychain: credentialStore,
     environments,
     deploy: deployService,
@@ -1855,6 +1868,7 @@ export function buildApp(
     azureAccountConnections,
     azureOpsBindings,
     azureOpsLegacyMutation,
+    azureDeviceCodeFlows,
     environments,
     ...(processes ? { processes } : {}),
     monitors,

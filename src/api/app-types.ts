@@ -107,6 +107,11 @@ import type {
 } from "../azure/azure-ops-binding-store.ts";
 import type { AzureAccountConnection, AzureAccountConnectionStore } from "../azure/azure-account-connection-store.ts";
 import type { AzureOpsLegacyMutation } from "../azure/azure-ops-legacy-mutation.ts";
+import type {
+  AzureDeviceCodeDriver,
+  AzureDeviceCodeFlow,
+  AzureDeviceCodeFlowStatus,
+} from "../azure/azure-device-code-flow.ts";
 import type { Keychain } from "../credentials/keychain.ts";
 
 export interface AzureBindingConnectionTenantView {
@@ -157,6 +162,19 @@ export type AzureAccountConnectionResult =
   | { status: "ok"; connection: AzureAccountConnection; created?: boolean }
   | { status: "not_found" | "invalid_credential" | "invalid_metadata" | "invalid_profile" | "verification_required" }
   | { status: "conflict"; bindingScopes: ScopeId[] };
+
+export interface AzureDeviceCodeFlowView {
+  flowId: string;
+  scopeId: ScopeId;
+  status: AzureDeviceCodeFlowStatus;
+  createdAt: number;
+  expiresAt: number;
+  connectionId?: string;
+}
+
+export type AzureDeviceCodeFlowResult =
+  | { status: "ok"; flow: AzureDeviceCodeFlowView; verificationUri?: string; userCode?: string }
+  | { status: "not_found" | "forbidden" | "expired" | "not_ready" | "conflict" | "failed" | "unavailable" };
 
 interface DeploymentVersionView {
   version: number;
@@ -364,6 +382,9 @@ export interface App {
   listProjects(principalId: string): Promise<ProjectView[]>;
   listAzureCapturedCredentials(actorId: string): Promise<AzureCapturedCredentialView[]>;
   listAzureAccountConnections(actorId: string): Promise<AzureAccountConnection[]>;
+  startAzureDeviceCodeFlow(input: { actorId: string; connectionId?: string }): Promise<AzureDeviceCodeFlowResult>;
+  pollAzureDeviceCodeFlow(flowId: string, actorId: string): Promise<AzureDeviceCodeFlowResult>;
+  completeAzureDeviceCodeFlow(flowId: string, actorId: string): Promise<AzureDeviceCodeFlowResult>;
   saveAzureAccountConnection(input: {
     connectionId?: string;
     credentialId?: string;
@@ -630,6 +651,8 @@ export interface AppDeps {
   azureAccountConnections?: AzureAccountConnectionStore;
   azureOpsBindings?: AzureOpsBindingStore;
   azureOpsLegacyMutation?: AzureOpsLegacyMutation;
+  azureDeviceCodeFlows?: DurableMap<AzureDeviceCodeFlow>;
+  azureDeviceCodeDriver?: AzureDeviceCodeDriver;
   keychain?: Keychain;
   deploy: DeployService;
   deploymentLayer?: DeploymentLayerRuntime;

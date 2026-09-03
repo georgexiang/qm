@@ -319,6 +319,35 @@ test("capture saves changed login bundles per service and fingerprint-skips unch
   assert.deepEqual(await captureDeviceFlowLogins(input), ["gh"]);
 });
 
+test("capture writes Azure Device Code credentials to an isolated slot", async () => {
+  const sb = sprites();
+  const k = kc();
+  const h = await sb.provision(rw(scopeId("personal", "U1")));
+  const prior = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("prior").toString("base64") }],
+    credentialSlot: "prior",
+    origin: DEVICE_FLOW_ORIGIN,
+  });
+  await sb.run(h, "mkdir -p ~/.azure && printf current > ~/.azure/msal_token_cache.json");
+
+  assert.deepEqual(
+    await captureDeviceFlowLogins({
+      sandbox: sb,
+      handle: h,
+      keychain: k,
+      ownerId: "U1",
+      services: ["azure"],
+      credentialSlotByService: { azure: "device-code:flow-1" },
+    }),
+    ["azure"],
+  );
+  const azureRecords = (await k.listByOwner("U1")).filter((record) => record.service === "azure");
+  assert.equal(azureRecords.length, 2);
+  assert.ok(azureRecords.some((record) => record.id === prior.id));
+});
+
 test("capture grabs the AWS SSO token under .aws/sso/cache; gcloud's cache/logs bulk dirs are pruned", async () => {
   const sb = sprites();
   const k = kc();
