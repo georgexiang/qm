@@ -922,9 +922,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       );
       const azureOpsInvoked =
         azureOpsRequested &&
+        parseScopeId(azureOpsSkill?.skill?.scopeId ?? "").kind === "org" &&
+        azureOpsSkill?.skill?.pack?.upstreamName === AZURE_OPS_SKILL_NAME &&
         azureOpsSkill?.skill?.manifest.files?.some((file) => file.path === "scripts/az_guard.py") === true;
       if (azureOpsRequested && azureOpsSkill && !azureOpsInvoked) {
-        return { status: "refused", reason: "the Azure Ops skill is missing its required read-only guard" };
+        return { status: "refused", reason: "the Azure Ops skill is not an organization-installed guarded pack" };
       }
       const azureOpsRuntimeSelection =
         deps.resolveAzureSandboxCredentialForScope && azureOpsInvoked
