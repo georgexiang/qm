@@ -881,62 +881,55 @@ function projectAzureSection(context: CoreContext): TemplateResult | typeof noth
                       >
                         <label class="project-name-field"
                           ><span>Connection</span>
-                          <select
-                            class="skill-desc-input"
-                            .value=${contextsState.azureSelectedConnectionId}
-                            ?disabled=${contextsState.azureBusy}
-                            @change=${(event: Event) => {
-                              setProjectAzureConnection((event.currentTarget as HTMLSelectElement).value);
-                            }}
-                          >
-                            ${contextsState.azureConnections.map(
+                          ${fieldSelect({
+                            className: "skill-desc-input",
+                            value: contextsState.azureSelectedConnectionId,
+                            disabled: contextsState.azureBusy,
+                            onChange: setProjectAzureConnection,
+                            options: contextsState.azureConnections.map(
                               (candidate) =>
                                 html`<option value=${candidate.connectionId}>
                                   ${candidate.accountLabel}${candidate.accountEmail ? ` · ${candidate.accountEmail}` : ""}
                                 </option>`,
-                            )}
-                          </select>
+                            ),
+                          })}
                         </label>
                         ${
                           connection
                             ? html`
                                 <label class="project-name-field"
                                   ><span>Default tenant</span>
-                                  <select
-                                    class="skill-desc-input"
-                                    .value=${contextsState.azureDefaultTenantId}
-                                    ?disabled=${contextsState.azureBusy}
-                                    @change=${(event: Event) => setProjectAzureDefaultTenant((event.currentTarget as HTMLSelectElement).value)}
-                                  >
-                                    ${tenants.map(
+                                  ${fieldSelect({
+                                    className: "skill-desc-input",
+                                    value: contextsState.azureDefaultTenantId,
+                                    disabled: contextsState.azureBusy,
+                                    onChange: setProjectAzureDefaultTenant,
+                                    options: tenants.map(
                                       (tenant) =>
                                         html`<option value=${tenant.tenantId}>
                                           ${tenant.displayName} · ${azureStatus(tenant.status)}
                                         </option>`,
-                                    )}
-                                  </select>
+                                    ),
+                                  })}
                                 </label>
                                 <label class="project-name-field"
                                   ><span>Default subscription</span>
-                                  <select
-                                    class="skill-desc-input"
-                                    .value=${contextsState.azureDefaultSubscriptionId}
-                                    ?disabled=${contextsState.azureBusy}
-                                    @change=${(event: Event) => {
-                                      contextsState.azureDefaultSubscriptionId = (
-                                        event.currentTarget as HTMLSelectElement
-                                      ).value;
+                                  ${fieldSelect({
+                                    className: "skill-desc-input",
+                                    value: contextsState.azureDefaultSubscriptionId,
+                                    disabled: contextsState.azureBusy,
+                                    onChange: (defaultSubscriptionId) => {
+                                      contextsState.azureDefaultSubscriptionId = defaultSubscriptionId;
                                       drawContexts();
-                                    }}
-                                  >
-                                    ${(
+                                    },
+                                    options: (
                                       tenants.find((tenant) => tenant.tenantId === contextsState.azureDefaultTenantId)
                                         ?.visibleSubscriptions ?? []
                                     ).map(
                                       (subscription) =>
                                         html`<option value=${subscription.id}>${subscription.name}</option>`,
-                                    )}
-                                  </select>
+                                    ),
+                                  })}
                                 </label>
                                 <div class="project-member-list">
                                   ${tenants.map(

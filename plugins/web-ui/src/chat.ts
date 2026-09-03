@@ -83,7 +83,7 @@ import {
   harnessSupportsEffort,
   harnessSupportsFastMode,
 } from "./model-options";
-import { browserRenderableImage, formatBytes, icon, relTime } from "./ui";
+import { browserRenderableImage, fieldSelect, formatBytes, icon, relTime } from "./ui";
 import { appState, renderSidebarTop, switchView, syncUrlFromState } from "./shell";
 import { contextsState, scopeTitle } from "./contexts";
 import { openProjectPage, scopeToolCount, sessionTopbarTpl, setScopedSession } from "./session-scope";
@@ -512,34 +512,33 @@ export function createChatSurface(
       <span class="azure-chat-target-icon">${icon(Cloud, 16)}</span>
       <label>
         <span>Tenant</span>
-        <select
-          .value=${target.tenantId}
-          @change=${(event: Event) => {
-            const tenantId = (event.currentTarget as HTMLSelectElement).value;
+        ${fieldSelect({
+          value: target.tenantId,
+          onChange: (tenantId) => {
             const tenant = tenants.find((candidate) => candidate.tenantId === tenantId);
             const subscriptionId = tenant?.visibleSubscriptions[0]?.id;
             if (!subscriptionId) return;
             chatState.azureTarget = { tenantId, subscriptionId };
             drawActiveChat();
-          }}
-        >
-          ${tenants.map((tenant) => html`<option value=${tenant.tenantId}>${tenant.displayName}</option>`)}
-        </select>
+          },
+          options: tenants.map((tenant) => html`<option value=${tenant.tenantId}>${tenant.displayName}</option>`),
+        })}
       </label>
       <label>
         <span>Subscription</span>
-        <select
-          .value=${target.subscriptionId}
-          @change=${(event: Event) => {
+        ${fieldSelect({
+          value: target.subscriptionId,
+          onChange: (subscriptionId) => {
             chatState.azureTarget = {
               tenantId: target.tenantId,
-              subscriptionId: (event.currentTarget as HTMLSelectElement).value,
+              subscriptionId,
             };
             drawActiveChat();
-          }}
-        >
-          ${subscriptions.map((subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`)}
-        </select>
+          },
+          options: subscriptions.map(
+            (subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`,
+          ),
+        })}
       </label>
     </div>`;
   }

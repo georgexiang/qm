@@ -2,7 +2,7 @@ import { html, render, type TemplateResult } from "lit";
 import { Activity, KeyRound, Link, LockKeyhole, Plug, Plus, RefreshCw, ShieldCheck } from "lucide";
 import { ApiError, api } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
-import { icon } from "./ui";
+import { fieldSelect, icon } from "./ui";
 import { appState, openPersonalChatDraft, replacePanePreservingFocus } from "./shell";
 import { scopedSession, scopedViewTopbar } from "./session-scope";
 import { focusDialogCancel, restoreDialogFocus, trapDialogFocus } from "./dialog-focus";
@@ -534,50 +534,47 @@ function personalDefaultEditorCard(): TemplateResult {
     <div class="kc-form-grid">
       <label class="skill-field"
         ><span>Connection</span>
-        <select
-          class="skill-desc-input"
-          .value=${editor.connectionId}
-          ?disabled=${editor.busy}
-          @change=${(event: Event) => setPersonalDefaultConnection((event.currentTarget as HTMLSelectElement).value)}
-        >
-          ${azureConnections.map(
+        ${fieldSelect({
+          className: "skill-desc-input",
+          value: editor.connectionId,
+          disabled: editor.busy,
+          onChange: setPersonalDefaultConnection,
+          options: azureConnections.map(
             (candidate) =>
               html`<option value=${candidate.connectionId}>
                 ${candidate.accountLabel}${candidate.accountEmail ? ` · ${candidate.accountEmail}` : ""}
               </option>`,
-          )}
-        </select>
+          ),
+        })}
       </label>
       <label class="skill-field"
-        ><span>Default tenant</span>
-        <select
-          class="skill-desc-input"
-          .value=${editor.defaultTenantId}
-          ?disabled=${editor.busy}
-          @change=${(event: Event) => setPersonalDefaultTenant((event.currentTarget as HTMLSelectElement).value)}
-        >
-          ${tenants.map(
+        ><span>Default tenant</span> ${fieldSelect({
+          className: "skill-desc-input",
+          value: editor.defaultTenantId,
+          disabled: editor.busy,
+          onChange: setPersonalDefaultTenant,
+          options: tenants.map(
             (tenant) =>
               html`<option value=${tenant.tenantId}>
                 ${tenant.displayName} · ${azureStatusLabel(tenant.status)}
               </option>`,
-          )}
-        </select></label
+          ),
+        })}</label
       >
       <label class="skill-field"
-        ><span>Default subscription</span>
-        <select
-          class="skill-desc-input"
-          .value=${editor.defaultSubscriptionId}
-          ?disabled=${editor.busy}
-          @change=${(event: Event) => {
+        ><span>Default subscription</span> ${fieldSelect({
+          className: "skill-desc-input",
+          value: editor.defaultSubscriptionId,
+          disabled: editor.busy,
+          onChange: (defaultSubscriptionId) => {
             if (!azurePersonalEditor) return;
-            azurePersonalEditor.defaultSubscriptionId = (event.currentTarget as HTMLSelectElement).value;
+            azurePersonalEditor.defaultSubscriptionId = defaultSubscriptionId;
             drawConnectors();
-          }}
-        >
-          ${subscriptionOptions.map((subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`)}
-        </select></label
+          },
+          options: subscriptionOptions.map(
+            (subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`,
+          ),
+        })}</label
       >
     </div>
     <div class="kc-access-block">
