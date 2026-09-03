@@ -265,6 +265,16 @@ interface SaveCredentialInput {
   files?: CredentialFile[];
   host?: string;
   accountLabel?: string;
+  credentialSlot?: string;
+  origin?: string;
+  expiresAt?: number;
+}
+
+interface SaveFileCredentialByIdInput {
+  ownerId: string;
+  credentialId: string;
+  files: CredentialFile[];
+  accountLabel?: string;
   origin?: string;
   expiresAt?: number;
 }
@@ -341,6 +351,7 @@ interface GrantListFilter {
 
 export interface Keychain extends ServiceCredentialStore, ConnectorTokenStore {
   save(input: SaveCredentialInput): Promise<KeychainCredentialMeta>;
+  saveFileById(input: SaveFileCredentialByIdInput): Promise<KeychainCredentialMeta | null>;
   listAllMetadata(): Promise<KeychainCredentialMeta[]>;
   listByOwner(ownerId: string): Promise<KeychainCredentialMeta[]>;
   listByOwners(ownerIds: string[]): Promise<Map<string, KeychainCredentialMeta[]>>;
@@ -374,6 +385,7 @@ export interface Keychain extends ServiceCredentialStore, ConnectorTokenStore {
 
   materialize(grantId: string, scopeId: ScopeId, usedBy: string): Promise<MaterializedCred>;
   materializeOwnById(ownerId: string, credentialId: string, scopeId: ScopeId): Promise<MaterializedCred>;
+  materializeOwnedById(ownerId: string, credentialId: string): Promise<MaterializedCred>;
   materializeOwn(ownerId: string): Promise<MaterializedEnvCred[]>;
   materializeOwnFiles(ownerId: string): Promise<MaterializedFileCred[]>;
 
@@ -402,6 +414,16 @@ function credId(ownerId: string, service: string, slot: string): string {
 
 function defaultEnvKey(service: string): string {
   return `${service.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_TOKEN`;
+}
+
+const CREDENTIAL_SLOT_RE = /^[A-Za-z0-9._:-]{1,120}$/;
+
+function azureCredentialSlot(slot: string | undefined): string | undefined {
+  if (slot === undefined) return undefined;
+  const normalized = slot.trim();
+  if (!normalized) throw new KeychainError(400, "credentialSlot must not be empty");
+  if (!CREDENTIAL_SLOT_RE.test(normalized)) throw new KeychainError(400, "credentialSlot contains invalid characters");
+  return normalized;
 }
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -786,8 +808,10 @@ export function createKeychain(deps: {
     const targets = files?.map((f) => f.path);
     const t = now();
     let slot = `env:${envKey}`;
-    if (kind === "file") slot = "file";
-    else if (fields)
+    if (kind === "file") {
+      const explicitAzureSlot = service === "azure" ? azureCredentialSlot(input.credentialSlot) : undefined;
+      slot = explicitAzureSlot ? `file:${explicitAzureSlot}` : "file";
+    } else if (fields)
       slot = `env:${fields
         .map((f) => f.envKey)
         .sort()
@@ -813,6 +837,26 @@ export function createKeychain(deps: {
       updatedAt: t,
     };
     await deps.creds.put(id, rec);
+    return toMeta(rec);
+  }
+
+  async function saveFileById(input: SaveFileCredentialByIdInput): Promise<KeychainCredentialMeta | null> {
+    const owned = await getOwned(input.ownerId, input.credentialId);
+    if (!owned || owned.kind !== "file" || owned.managed) return null;
+    const files = input.files.map((f) => ({ ...f, path: keychainFilePath(f.path) }));
+    const secret = JSON.stringify(files);
+    const t = now();
+    const rec: KeychainCredential = {
+      ...owned,
+      targets: files.map((f) => f.path),
+      ...(input.accountLabel ? { accountLabel: input.accountLabel } : {}),
+      ...(input.origin ? { origin: input.origin } : {}),
+      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      secretEnc: encryptSecret(secret, deps.key),
+      fingerprint: fingerprintOf(secret),
+      updatedAt: t,
+    };
+    await deps.creds.put(rec.id, rec);
     return toMeta(rec);
   }
 
@@ -910,6 +954,7 @@ export function createKeychain(deps: {
 
   return {
     save: saveCredential,
+    saveFileById,
 
     async listAllMetadata() {
       return (await deps.creds.all()).filter((c) => !c.managed && c.kind !== "broker").map(toMeta);
@@ -1259,13 +1304,7 @@ export function createKeychain(deps: {
       return materialized;
     },
 
-    async materializeOwnById(ownerId, credentialId, scopeId) {
-      if (scopeId !== toScopeId("personal", ownerId)) {
-        throw new KeychainError(
-          403,
-          "a credential id loads only in its owner's own personal conversation — anywhere else needs a grant from the owner",
-        );
-      }
+    async materializeOwnedById(ownerId, credentialId) {
       const cred = await deps.creds.get(credentialId);
       if (!cred || !samePerson(cred.ownerId, ownerId)) throw new KeychainError(404, "unknown credential");
       if (cred.kind === "broker") {
@@ -1274,6 +1313,16 @@ export function createKeychain(deps: {
       if (cred.managed === "connector") return materializeConnectorEnv(cred);
       if (credExpired(cred, now())) throw new KeychainError(410, "credential is expired");
       return materializeDecrypted(cred);
+    },
+
+    async materializeOwnById(ownerId, credentialId, scopeId) {
+      if (scopeId !== toScopeId("personal", ownerId)) {
+        throw new KeychainError(
+          403,
+          "a credential id loads only in its owner's own personal conversation — anywhere else needs a grant from the owner",
+        );
+      }
+      return this.materializeOwnedById(ownerId, credentialId);
     },
 
     async materializeOwn(ownerId) {

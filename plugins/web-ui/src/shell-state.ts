@@ -2,6 +2,7 @@ export type AuthMode = "portal" | "dev";
 
 export interface Me {
   user: string;
+  displayName?: string;
   org: string;
   mode?: AuthMode;
   slackWorkspaceUrl?: string | null;

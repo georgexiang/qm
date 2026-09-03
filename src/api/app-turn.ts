@@ -257,6 +257,7 @@ export function createTurnMethods(
         ...(!individualAuth && req.harness ? { harness: req.harness } : {}),
         ...(!individualAuth && req.model ? { model: req.model } : {}),
         ...turnModelOptions(req),
+        ...(req.azureOpsTarget ? { azureOpsTarget: req.azureOpsTarget } : {}),
         ...(req.readOnly ? { readOnly: true } : {}),
         ...(req.skipMemory ? { skipMemory: true } : {}),
         ...(req.unattendedGrants?.length ? { unattendedGrants: req.unattendedGrants } : {}),

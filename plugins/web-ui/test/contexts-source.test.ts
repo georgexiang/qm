@@ -75,3 +75,27 @@ test("every project member can invite while only the owner can remove people", (
   assert.doesNotMatch(detail, /c\.project && isProjectOwner\(c\)/);
   assert.match(members, /isProjectOwner\(context\) && principalId !== project\.ownerId/);
 });
+
+test("project settings includes Azure access section with owner edit and member read-only states", () => {
+  assert.match(source, /projectAzureSection\(c\)/);
+  const azureSection = source.match(/function projectAzureSection\([^]*?\n\}/)?.[0] ?? "";
+  assert.match(azureSection, /Azure access/);
+  assert.match(azureSection, /Only the Project Owner can change Azure access settings\./);
+  assert.match(azureSection, /This Project will use Azure as the selected account\./);
+  assert.match(azureSection, /Every active Project\s+member who can run \/azure-ops/);
+  assert.match(azureSection, /may indirectly use that account(?:'|\\')s Azure\s+permissions\./);
+  assert.match(azureSection, /I understand this Project-sharing impact and want to continue\./);
+  assert.match(azureSection, /saveProjectAzureBinding\(context\)/);
+  assert.match(azureSection, /disconnectProjectAzureBinding\(context\)/);
+  assert.match(azureSection, /azureAllowlist/);
+});
+
+test("project Azure access loads and saves via dedicated API routes", () => {
+  assert.match(source, /\/api\/azure\/default\?scopeId=/);
+  assert.match(source, /api<\{ connections\?: AzureConnection\[\] \}>\("\/api\/azure\/connections"\)/);
+  assert.match(source, /api\("\/api\/azure\/default", \{/);
+  assert.match(
+    source,
+    /confirmProjectSharing: needsSharingConfirmation \? contextsState\.azureProjectSharingConfirmed : false/,
+  );
+});

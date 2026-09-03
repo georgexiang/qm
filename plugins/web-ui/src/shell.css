@@ -2374,6 +2374,42 @@ a.chat-row-open {
     0 1px 2px color-mix(in srgb, var(--foreground) 8%, transparent),
     0 12px 28px color-mix(in srgb, var(--foreground) 7%, transparent);
 }
+
+.azure-chat-target {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  max-width: 760px;
+  margin: 0 auto 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--secondary);
+}
+
+.azure-chat-target-icon {
+  align-self: center;
+  color: var(--muted-foreground);
+}
+
+.azure-chat-target label {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 3px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.azure-chat-target select {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+}
 .composer-input {
   width: 100%;
   min-height: 48px;

@@ -65,10 +65,16 @@ export interface DeviceFlowPersistInput {
   handle: SandboxHandle;
   keychain: Keychain;
   ownerId: string;
+  selectedCredentialByService?: Record<string, { ownerId: string; credentialId: string }>;
   onAnomaly?: (service: string, detail: string) => void;
   credentialPaths?: CredentialPathSpec[];
   services?: readonly string[];
   excludeServices?: readonly string[];
+}
+
+export interface DeviceFlowFileBundle {
+  service: string;
+  files: CredentialFile[];
 }
 
 function rootedAt(handle: SandboxHandle, dir: string): SandboxHandle {
@@ -125,6 +131,23 @@ export async function captureDeviceFlowLogins(input: DeviceFlowPersistInput): Pr
       continue;
     }
     files.sort((a, b) => a.path.localeCompare(b.path));
+    const selected = input.selectedCredentialByService?.[service];
+    if (selected) {
+      const current = await input.keychain.getCredential(selected.credentialId);
+      if (current?.fingerprint === fileCredentialFingerprint(files)) continue;
+      const savedSelected = await input.keychain.saveFileById({
+        ownerId: selected.ownerId,
+        credentialId: selected.credentialId,
+        files,
+        origin: DEVICE_FLOW_ORIGIN,
+      });
+      if (!savedSelected) {
+        input.onAnomaly?.(service, `selected credential ${selected.credentialId} is unavailable for refresh`);
+        continue;
+      }
+      saved.push(service);
+      continue;
+    }
     const prior = existing.get(service);
     if (prior?.fingerprint === fileCredentialFingerprint(files)) continue;
     await input.keychain.save({
@@ -145,24 +168,50 @@ export async function materializeDeviceFlowLogins(input: DeviceFlowPersistInput)
       (!input.services || input.services.includes(b.service)) &&
       !input.excludeServices?.includes(b.service),
   );
-  if (!bundles.length) return [];
+  return writeDeviceFlowLoginBundles({
+    sandbox: input.sandbox,
+    handle: input.handle,
+    bundles: bundles.map((bundle) => ({ service: bundle.service, files: bundle.files })),
+    skipExisting: true,
+  });
+}
 
-  const candidates = [...new Set(bundles.flatMap((b) => b.files.map((f) => f.path)))];
-
-  const home = homeOf(input.handle);
-  const probe = await input.sandbox.run(
-    input.handle,
-    `cd "$HOME" 2>/dev/null || exit 0; for p in ${candidates.map(shq).join(" ")}; do [ -e "$p" ] && printf '%s\\0' "$p"; done; :`,
-    { timeoutMs: 60_000 },
-  );
-  if (probe.code !== 0)
-    throw new Error(`device-flow credential restore failed: ${probe.stderr || `exit ${probe.code}`}`);
-  const present = new Set(probe.stdout.split("\0").filter(Boolean));
-
-  const homeHandle = rootedAt(input.handle, home);
+export async function writeDeviceFlowLoginBundles(input: {
+  sandbox: Sandbox;
+  handle: SandboxHandle;
+  bundles: readonly DeviceFlowFileBundle[];
+  replaceRoots?: readonly string[];
+  skipExisting?: boolean;
+}): Promise<string[]> {
+  const roots = [...new Set((input.replaceRoots ?? []).map((root) => root.trim()).filter(Boolean))];
+  if (roots.length) {
+    const replaced = await input.sandbox.run(
+      input.handle,
+      `cd "$HOME" 2>/dev/null || exit 0; for p in ${roots.map(shq).join(" ")}; do if [ -L "$p" ]; then target="$(readlink -- "$p" 2>/dev/null || true)"; case "$target" in ${shq(`${EPHEMERAL_CRED_DIR}/`)}*) rm -rf -- "$target" ;; esac; fi; rm -rf -- "$p"; done`,
+      { timeoutMs: 60_000 },
+    );
+    if (replaced.code !== 0)
+      throw new Error(`device-flow credential replace failed: ${replaced.stderr || `exit ${replaced.code}`}`);
+  }
+  if (!input.bundles.length) return [];
+  const candidates = [...new Set(input.bundles.flatMap((b) => b.files.map((f) => f.path)))];
+  const present = new Set<string>();
+  if (input.skipExisting && candidates.length) {
+    const probe = await input.sandbox.run(
+      input.handle,
+      `cd "$HOME" 2>/dev/null || exit 0; for p in ${candidates.map(shq).join(" ")}; do [ -e "$p" ] && printf '%s\\0' "$p"; done; :`,
+      { timeoutMs: 60_000 },
+    );
+    if (probe.code !== 0)
+      throw new Error(`device-flow credential restore failed: ${probe.stderr || `exit ${probe.code}`}`);
+    for (const path of probe.stdout.split("\0")) {
+      if (path) present.add(path);
+    }
+  }
+  const homeHandle = rootedAt(input.handle, homeOf(input.handle));
   const wrote: string[] = [];
   const wroteServices = new Set<string>();
-  for (const bundle of bundles) {
+  for (const bundle of input.bundles) {
     for (const f of bundle.files) {
       if (present.has(f.path)) continue;
       await input.sandbox.writeFileBytes(homeHandle, f.path, Buffer.from(f.contentBase64, "base64"));

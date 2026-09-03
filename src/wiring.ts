@@ -57,7 +57,7 @@ import type {
   SurfaceContextRequest,
   Webhook,
 } from "./types.ts";
-import { scopeId } from "./types.ts";
+import { parseScopeId, scopeId } from "./types.ts";
 import { createAuditLog, type AuditLog } from "./audit/audit-log.ts";
 import { createPostgresAuditLog } from "./admin/postgres-audit-log.ts";
 import { createRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
@@ -159,6 +159,7 @@ import {
   type DeviceFlowCutoverReset,
   type DeviceFlowCutoverStore,
 } from "./credentials/device-flow-cutover.ts";
+import { DEVICE_FLOW_ORIGIN } from "./credentials/device-flow-persist.ts";
 import { makeRefresh, type OAuthClientResolver } from "./connectors/oauth.ts";
 import {
   createConnectorClientResolver,
@@ -177,6 +178,16 @@ import { createEgressAuditSink, type EgressAuditSink } from "./admin/egress-audi
 import { createPostgresEgressAuditSink } from "./admin/postgres-egress-audit-sink.ts";
 import { createConsentLinkStore, type ConsentLinkStore, type ConsentLinkRecord } from "./connectors/consent-link.ts";
 import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts";
+import {
+  createAzureOpsBindingStore,
+  type AzureOpsBinding,
+  type AzureOpsBindingStore,
+} from "./azure/azure-ops-binding-store.ts";
+import {
+  createAzureAccountConnectionStore,
+  type AzureAccountConnection,
+  type AzureAccountConnectionStore,
+} from "./azure/azure-account-connection-store.ts";
 import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
 import { refreshChatGPTTokens, refreshClaudeTokens } from "./model/subscription-oauth.ts";
 import { createUserModelCredentialStore, type UserModelCredentialStore } from "./model/user-model-credential-store.ts";
@@ -271,7 +282,13 @@ import {
 import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
-import { createProjectStore, type Project, type ProjectStore } from "./projects/project-store.ts";
+import {
+  createProjectStore,
+  projectIdFromGroupRef,
+  type Project,
+  type ProjectStore,
+} from "./projects/project-store.ts";
+import { samePerson } from "./directory/person.ts";
 import { createErrorLog, type ErrorLog } from "./admin/error-log.ts";
 import { createMemoryReplayDedupe, createPostgresReplayDedupe, type ReplayDedupe } from "./auth/replay-dedupe.ts";
 import { createAwsRoleBroker, type AwsRoleBroker } from "./auth/aws-role-broker.ts";
@@ -384,6 +401,8 @@ export interface BuiltApp {
   replayDedupe?: ReplayDedupe;
   directory: DirectoryStore;
   projects: ProjectStore;
+  azureAccountConnections: AzureAccountConnectionStore;
+  azureOpsBindings: AzureOpsBindingStore;
   environments: EnvironmentStore;
   processes?: ProcessRegistry;
   monitors: MonitorStore;
@@ -495,6 +514,10 @@ export function buildApp(
     resets: artifactMap<DeviceFlowCutoverReset>("device_flow_cutover_resets"),
   });
   const connectorStatusCache = createConnectorStatusCache(artifactMap<ConnectorStatusRecord>("connector_status"));
+  const azureOpsBindings = createAzureOpsBindingStore(artifactMap<AzureOpsBinding>("azure_ops_default_bindings"));
+  const azureAccountConnections = createAzureAccountConnectionStore(
+    artifactMap<AzureAccountConnection>("azure_account_connections"),
+  );
   const slackInstallation = createSlackInstallationStore(
     config.orgId,
     artifactMap("slack_installation"),
@@ -1097,6 +1120,103 @@ export function buildApp(
       shadow: config.securityScreenProxy!.shadow,
     });
   }
+  const resolveAzureSandboxCredentialForScope: OrchestratorDeps["resolveAzureSandboxCredentialForScope"] =
+    keychain && projects
+      ? async ({ scopeId: activeScopeId, actorId, target }) => {
+          const binding = await azureOpsBindings.get(activeScopeId);
+          if (!binding) return { service: "azure", status: "blocked" as const };
+          const requestedTarget = target
+            ? {
+                tenantId: target.tenantId.trim().toLowerCase(),
+                subscriptionId: target.subscriptionId.trim().toLowerCase(),
+              }
+            : binding.defaultTarget;
+          const targetAllowed = binding.targetAllowlist.some(
+            (allowed) =>
+              allowed.tenantId === requestedTarget.tenantId &&
+              allowed.subscriptionIds.includes(requestedTarget.subscriptionId),
+          );
+          if (!targetAllowed) return { service: "azure", status: "blocked" as const };
+          const metadata = {
+            defaultTarget: Object.freeze({
+              tenantId: requestedTarget.tenantId,
+              subscriptionId: requestedTarget.subscriptionId,
+            }),
+            targetAllowlist: Object.freeze(
+              binding.targetAllowlist.map((target) =>
+                Object.freeze({
+                  tenantId: target.tenantId,
+                  subscriptionIds: Object.freeze([...target.subscriptionIds]),
+                }),
+              ),
+            ),
+          };
+          const connection = await azureAccountConnections.get(binding.connectionId);
+          if (!connection || connection.status !== "active") {
+            return { service: "azure", status: "blocked" as const, ...metadata };
+          }
+          const credential = await keychain.getCredential(connection.credentialId);
+          if (
+            !credential ||
+            credential.kind !== "file" ||
+            credential.service !== "azure" ||
+            credential.origin !== DEVICE_FLOW_ORIGIN
+          ) {
+            return { service: "azure", status: "blocked" as const, ...metadata };
+          }
+          const parsed = parseScopeId(activeScopeId);
+          if (parsed.kind === "personal") {
+            if (!samePerson(parsed.ref, connection.ownerPrincipalId) || !samePerson(parsed.ref, credential.ownerId)) {
+              return { service: "azure", status: "blocked" as const, ...metadata };
+            }
+            const materialized = await keychain.materializeOwnById(parsed.ref, credential.id, activeScopeId);
+            if (materialized.kind !== "file") return { service: "azure", status: "blocked" as const, ...metadata };
+            return {
+              service: materialized.service,
+              status: "selected" as const,
+              ownerId: materialized.ownerId,
+              credentialId: materialized.credentialId,
+              files: materialized.files,
+              ...metadata,
+            };
+          }
+          if (parsed.kind !== "group") return { service: "azure", status: "blocked" as const, ...metadata };
+          const projectId = projectIdFromGroupRef(parsed.ref);
+          if (!projectId) return { service: "azure", status: "blocked" as const, ...metadata };
+          const project = await projects.get(projectId);
+          if (!project) return { service: "azure", status: "blocked" as const, ...metadata };
+          if (
+            samePerson(project.ownerId, connection.ownerPrincipalId) &&
+            samePerson(project.ownerId, credential.ownerId)
+          ) {
+            const materialized = await keychain.materializeOwnedById(project.ownerId, credential.id);
+            if (materialized.kind !== "file") return { service: "azure", status: "blocked" as const, ...metadata };
+            return {
+              service: materialized.service,
+              status: "selected" as const,
+              ownerId: materialized.ownerId,
+              credentialId: materialized.credentialId,
+              files: materialized.files,
+              ...metadata,
+            };
+          }
+          const grantRecord = (await keychain.grantsForScope(activeScopeId)).find(
+            ({ grant }) =>
+              grant.credentialId === credential.id && grant.mode === "standing" && grant.status === "active",
+          );
+          if (!grantRecord) return { service: "azure", status: "blocked" as const, ...metadata };
+          const materialized = await keychain.materialize(grantRecord.grant.id, activeScopeId, actorId);
+          if (materialized.kind !== "file") return { service: "azure", status: "blocked" as const, ...metadata };
+          return {
+            service: materialized.service,
+            status: "selected" as const,
+            ownerId: materialized.ownerId,
+            credentialId: materialized.credentialId,
+            files: materialized.files,
+            ...metadata,
+          };
+        }
+      : undefined;
   const orchestratorDeps: OrchestratorDeps = {
     identity,
     resolution,
@@ -1151,6 +1271,7 @@ export function buildApp(
     livenessCache,
     deviceFlowCutover,
     credentialUsage,
+    ...(resolveAzureSandboxCredentialForScope ? { resolveAzureSandboxCredentialForScope } : {}),
     connectorStatusCache,
     resolveConnectorClient: resolveClient,
     ...(keychain ? { keychain } : {}),
@@ -1299,6 +1420,9 @@ export function buildApp(
         }
       : {}),
     projects,
+    azureAccountConnections,
+    azureOpsBindings,
+    keychain: credentialStore,
     environments,
     deploy: deployService,
     deploymentLayer,
@@ -1667,6 +1791,8 @@ export function buildApp(
     ...(replayDedupe ? { replayDedupe } : {}),
     directory,
     projects,
+    azureAccountConnections,
+    azureOpsBindings,
     environments,
     ...(processes ? { processes } : {}),
     monitors,

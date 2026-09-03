@@ -1,9 +1,9 @@
 import { html, render, type TemplateResult } from "lit";
 import { Activity, KeyRound, Link, LockKeyhole, Plug, Plus, RefreshCw, ShieldCheck } from "lucide";
-import { api } from "./core-bridge";
+import { ApiError, api } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
 import { icon } from "./ui";
-import { appState, replacePanePreservingFocus } from "./shell";
+import { appState, openPersonalChatDraft, replacePanePreservingFocus } from "./shell";
 import { scopedSession, scopedViewTopbar } from "./session-scope";
 import { focusDialogCancel, restoreDialogFocus, trapDialogFocus } from "./dialog-focus";
 import { isActiveGrant, isExpiredCredential, KeychainOperations, keychainSummary } from "./keychain-state";
@@ -127,6 +127,81 @@ interface KeychainUsage {
   status: string;
 }
 
+type AzureConnectionStatus = "active" | "verification_required" | "revoked";
+type AzureTenantStatus = "active" | "verification_required" | "unavailable";
+
+interface AzureCapturedCredential {
+  credentialId: string;
+  accountLabel?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface AzureVisibleSubscription {
+  id: string;
+  name: string;
+  state: string;
+}
+
+interface AzureTenantAccess {
+  tenantId: string;
+  displayName: string;
+  objectId: string | null;
+  status: AzureTenantStatus;
+  visibleSubscriptions: AzureVisibleSubscription[];
+}
+
+interface AzureAccountConnection {
+  connectionId: string;
+  credentialId: string;
+  ownerPrincipalId: string;
+  authenticationType: "azure-cli-device-code";
+  accountLabel: string;
+  accountEmail?: string;
+  homeTenantId?: string;
+  tenantAccess: AzureTenantAccess[];
+  createdAt: number;
+  updatedAt: number;
+  lastVerifiedAt: number;
+  status: AzureConnectionStatus;
+}
+
+interface AzureBinding {
+  bindingId: string;
+  scopeId: string;
+  connectionId: string;
+  defaultTarget: { tenantId: string; subscriptionId: string };
+  targetAllowlist: Array<{ tenantId: string; subscriptionIds: string[] }>;
+  status: "active";
+}
+
+interface AzureBindingView {
+  binding: AzureBinding;
+  available: boolean;
+  connection?: {
+    accountLabel: string;
+    status: AzureConnectionStatus;
+  };
+}
+
+interface AzurePersonalDefaultEditor {
+  connectionId: string;
+  defaultTenantId: string;
+  defaultSubscriptionId: string;
+  allowlist: Record<string, string[]>;
+  busy: boolean;
+  error: string;
+}
+
+interface AzureConnectionEditor {
+  mode: "create" | "edit";
+  connectionId?: string;
+  credentialId: string;
+  accountLabel: string;
+  busy: boolean;
+  error: string;
+}
+
 let connectorProviders: Record<string, ConnectorProvider> = {};
 let keychainCredentials: KeychainCredential[] = [];
 let keychainConnectorCredentials: KeychainConnectorCredential[] = [];
@@ -134,6 +209,11 @@ let keychainGrants: KeychainGrant[] = [];
 let keychainAsks: KeychainAsk[] = [];
 let keychainUsage: KeychainUsage[] = [];
 let keychainScopeNames: Record<string, string> = {};
+let azureCapturedCredentials: AzureCapturedCredential[] = [];
+let azureConnections: AzureAccountConnection[] = [];
+let azurePersonalBinding: AzureBindingView | null = null;
+let azurePersonalEditor: AzurePersonalDefaultEditor | null = null;
+let azureEditor: AzureConnectionEditor | null = null;
 let connectorNotice = "";
 let addingCredential: { service: string; envKey: string; purpose: string } | null = null;
 let secureDropUrl: string | null = null;
@@ -150,6 +230,11 @@ export function resetKeychainState(): void {
   keychainAsks = [];
   keychainUsage = [];
   keychainScopeNames = {};
+  azureCapturedCredentials = [];
+  azureConnections = [];
+  azurePersonalBinding = null;
+  azurePersonalEditor = null;
+  azureEditor = null;
   connectorNotice = "";
   addingCredential = null;
   secureDropUrl = null;
@@ -164,6 +249,521 @@ function fmtDate(ms?: number): string {
   } catch {
     return "";
   }
+}
+
+function fmtDateTime(ms?: number): string {
+  if (!ms) return "";
+  try {
+    return new Date(ms).toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+function azureStatusLabel(status: AzureConnectionStatus | AzureTenantStatus): string {
+  if (status === "active") return "Active";
+  if (status === "verification_required") return "Verification required";
+  if (status === "revoked") return "Revoked";
+  return "Unavailable";
+}
+
+function azureSubscriptionsCount(connection: AzureAccountConnection): number {
+  return connection.tenantAccess.reduce((count, tenant) => count + tenant.visibleSubscriptions.length, 0);
+}
+
+function personalAzureScopeId(): string | null {
+  const principal = appState.me?.user?.trim();
+  return principal ? `personal:${principal}` : null;
+}
+
+function personalDefaultConnectionId(): string {
+  return azurePersonalBinding?.binding.connectionId ?? "";
+}
+
+function seedPersonalDefaultDraft(connectionId: string): AzurePersonalDefaultEditor | null {
+  const connection = azureConnections.find((candidate) => candidate.connectionId === connectionId) ?? null;
+  if (!connection) return null;
+  const allowlist: Record<string, string[]> = {};
+  for (const target of azurePersonalBinding?.binding.targetAllowlist ?? [])
+    allowlist[target.tenantId] = [...target.subscriptionIds];
+  if (!Object.keys(allowlist).length) {
+    for (const tenant of connection.tenantAccess)
+      allowlist[tenant.tenantId] = tenant.visibleSubscriptions.map((subscription) => subscription.id);
+  }
+  const defaultTenantId =
+    azurePersonalBinding?.binding.defaultTarget.tenantId ??
+    connection.tenantAccess.find((tenant) => (allowlist[tenant.tenantId] ?? []).length > 0)?.tenantId ??
+    connection.tenantAccess[0]?.tenantId ??
+    "";
+  const defaultSubscriptionId =
+    azurePersonalBinding?.binding.defaultTarget.subscriptionId ??
+    allowlist[defaultTenantId]?.[0] ??
+    connection.tenantAccess.find((tenant) => tenant.tenantId === defaultTenantId)?.visibleSubscriptions[0]?.id ??
+    "";
+  return {
+    connectionId,
+    defaultTenantId,
+    defaultSubscriptionId,
+    allowlist,
+    busy: false,
+    error: "",
+  };
+}
+
+function openPersonalDefaultEditor(connectionId?: string): void {
+  const targetId = connectionId ?? personalDefaultConnectionId() ?? azureConnections[0]?.connectionId ?? "";
+  azurePersonalEditor = targetId ? seedPersonalDefaultDraft(targetId) : null;
+  drawConnectors();
+}
+
+function closePersonalDefaultEditor(): void {
+  azurePersonalEditor = null;
+  drawConnectors();
+}
+
+function setPersonalDefaultConnection(connectionId: string): void {
+  azurePersonalEditor = seedPersonalDefaultDraft(connectionId);
+  drawConnectors();
+}
+
+function setPersonalDefaultTenant(tenantId: string): void {
+  if (!azurePersonalEditor) return;
+  azurePersonalEditor.defaultTenantId = tenantId;
+  const options = azurePersonalEditor.allowlist[tenantId] ?? [];
+  azurePersonalEditor.defaultSubscriptionId = options[0] ?? "";
+  drawConnectors();
+}
+
+function togglePersonalAllowlist(tenantId: string, subscriptionId: string, checked: boolean): void {
+  if (!azurePersonalEditor) return;
+  const current = new Set(azurePersonalEditor.allowlist[tenantId] ?? []);
+  if (checked) current.add(subscriptionId);
+  else current.delete(subscriptionId);
+  azurePersonalEditor.allowlist = { ...azurePersonalEditor.allowlist, [tenantId]: [...current] };
+  if (
+    azurePersonalEditor.defaultTenantId === tenantId &&
+    azurePersonalEditor.defaultSubscriptionId &&
+    !(azurePersonalEditor.allowlist[tenantId] ?? []).includes(azurePersonalEditor.defaultSubscriptionId)
+  ) {
+    azurePersonalEditor.defaultSubscriptionId = azurePersonalEditor.allowlist[tenantId]?.[0] ?? "";
+  }
+  drawConnectors();
+}
+
+function openAzureCreateEditor(credentialId = ""): void {
+  azureEditor = {
+    mode: "create",
+    credentialId,
+    accountLabel: "",
+    busy: false,
+    error: "",
+  };
+  drawConnectors();
+}
+
+function openAzureEditEditor(connection: AzureAccountConnection): void {
+  azureEditor = {
+    mode: "edit",
+    connectionId: connection.connectionId,
+    credentialId: connection.credentialId,
+    accountLabel: connection.accountLabel,
+    busy: false,
+    error: "",
+  };
+  drawConnectors();
+}
+
+function closeAzureEditor(): void {
+  azureEditor = null;
+  drawConnectors();
+}
+
+function azureConnectionCard(connection: AzureAccountConnection): TemplateResult {
+  const isPersonalDefault = personalDefaultConnectionId() === connection.connectionId;
+  const personalScopeId = personalAzureScopeId();
+  let personalDefaultAction: TemplateResult | string = "";
+  if (personalScopeId) {
+    personalDefaultAction = isPersonalDefault
+      ? html`<button
+            class="btn"
+            type="button"
+            ?disabled=${Boolean(azureEditor?.busy || azurePersonalEditor?.busy)}
+            @click=${() => openPersonalDefaultEditor(connection.connectionId)}
+          >
+            Edit default
+          </button>
+          <button
+            class="btn"
+            type="button"
+            ?disabled=${Boolean(azureEditor?.busy || azurePersonalEditor?.busy)}
+            @click=${() => void disconnectPersonalDefault()}
+          >
+            Disconnect
+          </button>`
+      : html`<button
+          class="btn"
+          type="button"
+          ?disabled=${Boolean(azureEditor?.busy || azurePersonalEditor?.busy)}
+          @click=${() => openPersonalDefaultEditor(connection.connectionId)}
+        >
+          Set personal default
+        </button>`;
+  }
+  return html`
+    <article class="kc-resource kc-account">
+      <div class="kc-resource-main">
+        <div class="kc-resource-icon">${icon(ShieldCheck, 18)}</div>
+        <div class="kc-resource-copy">
+          <div class="kc-resource-title-row">
+            <h3>${connection.accountLabel}</h3>
+            <span class=${connection.status === "active" ? "kc-state" : "kc-state warning"}
+              >${azureStatusLabel(connection.status)}</span
+            >
+            ${isPersonalDefault ? html`<span class="badge">Active default</span>` : ""}
+          </div>
+          <div class="kc-credential-facts">
+            <div class="kc-audit-line">
+              Tenants ${connection.tenantAccess.length} · Subscriptions ${azureSubscriptionsCount(connection)}
+            </div>
+            <div class="kc-resource-foot">Last verified ${fmtDateTime(connection.lastVerifiedAt)}</div>
+          </div>
+        </div>
+      </div>
+      ${
+        connection.tenantAccess.length
+          ? html`<div class="kc-access-block">
+              <div class="kc-access-label">Tenant access</div>
+              ${connection.tenantAccess.map(
+                (tenant) =>
+                  html`<div class="kc-access-row">
+                    <div>
+                      <strong>${tenant.displayName}</strong> · ${tenant.tenantId}
+                      <div>
+                        ${azureStatusLabel(tenant.status)} · ${tenant.visibleSubscriptions.length} subscriptions
+                      </div>
+                      ${
+                        tenant.visibleSubscriptions.length
+                          ? html`<div>
+                              ${tenant.visibleSubscriptions.map((subscription) => `${subscription.name} (${subscription.id})`).join(", ")}
+                            </div>`
+                          : ""
+                      }
+                    </div>
+                  </div>`,
+              )}
+            </div>`
+          : ""
+      }
+      <div class="kc-resource-actions">
+        ${personalDefaultAction}
+        <button
+          class="btn"
+          type="button"
+          ?disabled=${Boolean(azureEditor?.busy || azurePersonalEditor?.busy)}
+          @click=${() => openAzureEditEditor(connection)}
+        >
+          Edit
+        </button>
+        <button
+          class="kc-text-action danger"
+          type="button"
+          ?disabled=${Boolean(azureEditor?.busy || azurePersonalEditor?.busy)}
+          @click=${() => void removeAzureConnection(connection)}
+        >
+          Remove
+        </button>
+      </div>
+    </article>
+  `;
+}
+
+function azureEditorCard(): TemplateResult {
+  const editor = azureEditor!;
+  const action = editor.mode === "create" ? "Register" : "Refresh";
+  return html`<section class="kc-add-card" aria-labelledby="azure-editor-title">
+    <div class="kc-panel-head">
+      <div>
+        <span class="kc-eyebrow">Azure connection</span>
+        <h2 id="azure-editor-title">${action} Azure account</h2>
+      </div>
+      <div class="kc-panel-icon">${icon(ShieldCheck, 20)}</div>
+    </div>
+    <p>Run Device Code in Personal chat first, then ${action}.</p>
+    <div class="kc-form-grid">
+      <label class="skill-field"
+        ><span>Captured credential</span><input class="skill-desc-input" .value=${editor.credentialId} disabled />
+      </label>
+      <label class="skill-field"
+        ><span>Account label</span
+        ><input
+          class="skill-desc-input"
+          .value=${editor.accountLabel}
+          ?disabled=${editor.busy}
+          @input=${(event: Event) => {
+            editor.accountLabel = (event.currentTarget as HTMLInputElement).value;
+            editor.error = "";
+          }}
+      /></label>
+    </div>
+    ${editor.error ? html`<div class="status">${editor.error}</div>` : ""}
+    <div class="kc-form-actions">
+      <button class="btn" type="button" ?disabled=${editor.busy} @click=${closeAzureEditor}>Cancel</button>
+      <button class="btn primary" type="button" ?disabled=${editor.busy} @click=${() => void saveAzureConnection()}>
+        ${editor.busy ? "Saving…" : action}
+      </button>
+    </div>
+  </section>`;
+}
+
+function personalDefaultEditorCard(): TemplateResult {
+  const editor = azurePersonalEditor;
+  if (!editor) return html``;
+  const connection = azureConnections.find((candidate) => candidate.connectionId === editor.connectionId) ?? null;
+  const tenants = connection?.tenantAccess ?? [];
+  const subscriptionOptions =
+    tenants.find((tenant) => tenant.tenantId === editor.defaultTenantId)?.visibleSubscriptions ?? [];
+  const saveLabel = azurePersonalBinding ? "Save default" : "Set personal default";
+  return html`<section class="kc-add-card" aria-labelledby="azure-default-title">
+    <div class="kc-panel-head">
+      <div>
+        <span class="kc-eyebrow">Azure default</span>
+        <h2 id="azure-default-title">${azurePersonalBinding ? "Edit personal default" : "Set personal default"}</h2>
+      </div>
+      <div class="kc-panel-icon">${icon(ShieldCheck, 20)}</div>
+    </div>
+    <div class="kc-form-grid">
+      <label class="skill-field"
+        ><span>Connection</span>
+        <select
+          class="skill-desc-input"
+          .value=${editor.connectionId}
+          ?disabled=${editor.busy}
+          @change=${(event: Event) => setPersonalDefaultConnection((event.currentTarget as HTMLSelectElement).value)}
+        >
+          ${azureConnections.map(
+            (candidate) =>
+              html`<option value=${candidate.connectionId}>
+                ${candidate.accountLabel}${candidate.accountEmail ? ` · ${candidate.accountEmail}` : ""}
+              </option>`,
+          )}
+        </select>
+      </label>
+      <label class="skill-field"
+        ><span>Default tenant</span>
+        <select
+          class="skill-desc-input"
+          .value=${editor.defaultTenantId}
+          ?disabled=${editor.busy}
+          @change=${(event: Event) => setPersonalDefaultTenant((event.currentTarget as HTMLSelectElement).value)}
+        >
+          ${tenants.map(
+            (tenant) =>
+              html`<option value=${tenant.tenantId}>
+                ${tenant.displayName} · ${azureStatusLabel(tenant.status)}
+              </option>`,
+          )}
+        </select></label
+      >
+      <label class="skill-field"
+        ><span>Default subscription</span>
+        <select
+          class="skill-desc-input"
+          .value=${editor.defaultSubscriptionId}
+          ?disabled=${editor.busy}
+          @change=${(event: Event) => {
+            if (!azurePersonalEditor) return;
+            azurePersonalEditor.defaultSubscriptionId = (event.currentTarget as HTMLSelectElement).value;
+            drawConnectors();
+          }}
+        >
+          ${subscriptionOptions.map((subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`)}
+        </select></label
+      >
+    </div>
+    <div class="kc-access-block">
+      <div class="kc-access-label">Allowed subscriptions</div>
+      ${tenants.map(
+        (tenant) =>
+          html`<div class="kc-access-row">
+              <div><strong>${tenant.displayName}</strong></div>
+            </div>
+            ${tenant.visibleSubscriptions.map(
+              (subscription) =>
+                html`<label class="kc-access-row">
+                  <input
+                    type="checkbox"
+                    .checked=${(editor.allowlist[tenant.tenantId] ?? []).includes(subscription.id)}
+                    ?disabled=${editor.busy}
+                    @change=${(event: Event) =>
+                      togglePersonalAllowlist(
+                        tenant.tenantId,
+                        subscription.id,
+                        (event.currentTarget as HTMLInputElement).checked,
+                      )}
+                  />
+                  <span>${subscription.name}</span>
+                </label>`,
+            )}`,
+      )}
+    </div>
+    ${editor.error ? html`<div class="status">${editor.error}</div>` : ""}
+    <div class="kc-form-actions">
+      <button class="btn" type="button" ?disabled=${editor.busy} @click=${closePersonalDefaultEditor}>Cancel</button>
+      <button class="btn primary" type="button" ?disabled=${editor.busy} @click=${() => void savePersonalDefault()}>
+        ${editor.busy ? "Saving…" : saveLabel}
+      </button>
+      ${
+        azurePersonalBinding
+          ? html`<button
+              class="btn"
+              type="button"
+              ?disabled=${editor.busy}
+              @click=${() => void disconnectPersonalDefault()}
+            >
+              Disconnect
+            </button>`
+          : ""
+      }
+    </div>
+  </section>`;
+}
+
+async function savePersonalDefault(): Promise<void> {
+  if (!azurePersonalEditor || azurePersonalEditor.busy) return;
+  const editor = azurePersonalEditor;
+  const scopeId = personalAzureScopeId();
+  if (!scopeId) return;
+  const connection = azureConnections.find((candidate) => candidate.connectionId === editor.connectionId) ?? null;
+  if (!connection) {
+    editor.error = "Select an Azure connection first.";
+    drawConnectors();
+    return;
+  }
+  const targetAllowlist = Object.entries(editor.allowlist)
+    .map(([tenantId, subscriptionIds]) => ({ tenantId, subscriptionIds: [...new Set(subscriptionIds)] }))
+    .filter((target) => target.subscriptionIds.length > 0);
+  if (!editor.defaultTenantId || !editor.defaultSubscriptionId) {
+    editor.error = "Select a default tenant and subscription.";
+    drawConnectors();
+    return;
+  }
+  if (
+    !targetAllowlist.some(
+      (target) =>
+        target.tenantId === editor.defaultTenantId && target.subscriptionIds.includes(editor.defaultSubscriptionId),
+    )
+  ) {
+    editor.error = "Default tenant and subscription must be part of the allowlist.";
+    drawConnectors();
+    return;
+  }
+  editor.error = "";
+  editor.busy = true;
+  drawConnectors();
+  try {
+    await api("/api/azure/default", {
+      method: "PUT",
+      body: JSON.stringify({
+        scopeId,
+        connectionId: connection.connectionId,
+        defaultTarget: {
+          tenantId: editor.defaultTenantId,
+          subscriptionId: editor.defaultSubscriptionId,
+        },
+        targetAllowlist,
+      }),
+    });
+    connectorNotice = "Personal Azure default saved.";
+    azurePersonalEditor = null;
+  } catch (error) {
+    if (!azurePersonalEditor) return;
+    azurePersonalEditor.busy = false;
+    azurePersonalEditor.error = errMessage(error, "Could not save personal Azure default.");
+    drawConnectors();
+    return;
+  }
+  await renderConnectors();
+}
+
+async function disconnectPersonalDefault(): Promise<void> {
+  const scopeId = personalAzureScopeId();
+  if (!scopeId) return;
+  if (azurePersonalEditor?.busy || azureEditor?.busy) return;
+  if (!azurePersonalBinding) return;
+  if (!window.confirm("Disconnect your personal Azure default?")) return;
+  try {
+    await api(`/api/azure/default?scopeId=${encodeURIComponent(scopeId)}`, { method: "DELETE" });
+    connectorNotice = "Personal Azure default disconnected.";
+  } catch (error) {
+    connectorNotice = errMessage(error, "Could not disconnect personal Azure default.");
+  }
+  azurePersonalEditor = null;
+  await renderConnectors();
+}
+
+function azureActionCard(): TemplateResult {
+  const availableCredentials = azureCapturedCredentials.filter(
+    (credential) => !azureConnections.some((connection) => connection.credentialId === credential.credentialId),
+  );
+  return html`<section class="kc-section" aria-labelledby="kc-azure-connect-title">
+    <div class="kc-section-head">
+      <div class="kc-section-title">
+        <h2 id="kc-azure-connect-title">Add Azure account</h2>
+      </div>
+      <p>Run Device Code in Personal chat first, then Refresh or Register here.</p>
+    </div>
+    <div class="kc-resource-list">
+      <article class="kc-resource kc-account">
+        <div class="kc-resource-main">
+          <div class="kc-resource-icon">${icon(LockKeyhole, 18)}</div>
+          <div class="kc-resource-copy">
+            <div class="kc-resource-title-row">
+              <h3>Use Personal chat for Device Code</h3>
+            </div>
+            <div class="kc-resource-meta">
+              Run /azure-ops in Personal chat and finish the verification URL and code flow there first.
+            </div>
+          </div>
+        </div>
+        <div class="kc-resource-actions">
+          <button
+            class="btn"
+            type="button"
+            @click=${() => openPersonalChatDraft("/azure-ops connect my Azure account using Device Code")}
+          >
+            Open Personal chat
+          </button>
+        </div>
+      </article>
+      <article class="kc-resource kc-account">
+        <div class="kc-resource-main">
+          <div class="kc-resource-icon">${icon(KeyRound, 18)}</div>
+          <div class="kc-resource-copy">
+            <div class="kc-resource-title-row"><h3>Captured Azure credentials</h3></div>
+            <div class="kc-resource-meta">${availableCredentials.length} ready to register</div>
+          </div>
+        </div>
+        <div class="kc-access-block">
+          ${
+            availableCredentials.length
+              ? availableCredentials.map(
+                  (credential) =>
+                    html`<div class="kc-access-row">
+                      <div>
+                        <strong>${credential.accountLabel?.trim() || credential.credentialId}</strong>
+                        <div>Captured ${fmtDateTime(credential.updatedAt)}</div>
+                      </div>
+                      <button class="btn" type="button" @click=${() => openAzureCreateEditor(credential.credentialId)}>
+                        Register
+                      </button>
+                    </div>`,
+                )
+              : html`<div class="kc-access-row"><div>No unregistered captured Azure credentials yet.</div></div>`
+          }
+        </div>
+      </article>
+    </div>
+  </section>`;
 }
 
 function credentialCard(c: KeychainCredential): TemplateResult {
@@ -549,7 +1149,37 @@ function drawConnectors(loading = false): void {
           </div>
         </div>
         ${connectorNotice || loading ? html`<div class="kc-notice" role="status">${loading ? "Loading your keychain…" : connectorNotice}</div>` : ""}
-        ${addingCredential ? addCredentialCard() : ""}
+        ${addingCredential ? addCredentialCard() : ""} ${azureEditor ? azureEditorCard() : ""}
+        ${azurePersonalEditor ? personalDefaultEditorCard() : ""} ${azureActionCard()}
+        <section class="kc-section" aria-labelledby="kc-azure-title">
+          <div class="kc-section-head">
+            <div class="kc-section-title">
+              <h2 id="kc-azure-title">Azure accounts</h2>
+              <span>${azureConnections.length}</span>
+            </div>
+            <p>Multi-tenant Azure account metadata bound to captured keychain credentials.</p>
+            ${
+              azurePersonalBinding
+                ? html`<div class="kc-resource-meta">
+                    Personal default: ${azurePersonalBinding.connection?.accountLabel ?? "Unknown account"}
+                  </div>`
+                : ""
+            }
+          </div>
+          <div class="kc-resource-list">
+            ${
+              azureConnections.length
+                ? azureConnections.map(azureConnectionCard)
+                : html`<div class="kc-empty">
+                    ${icon(ShieldCheck, 20)}
+                    <div>
+                      <strong>No Azure accounts registered</strong
+                      ><span>Complete Device Code in Personal chat, then register the captured credential.</span>
+                    </div>
+                  </div>`
+            }
+          </div>
+        </section>
         <section class="kc-section" aria-labelledby="kc-accounts-title">
           <div class="kc-section-head">
             <div class="kc-section-title">
@@ -618,7 +1248,8 @@ export async function renderConnectors(): Promise<void> {
   const seq = appState.viewRenderSeq;
   const load = keychainOperations.beginLoad();
   drawConnectors(true);
-  const [conn, keys] = await Promise.allSettled([
+  const personalScopeId = personalAzureScopeId();
+  const [conn, keys, azureCredentialsResult, azureConnectionsResult, azureDefaultResult] = await Promise.allSettled([
     api<{ providers?: Record<string, ConnectorProvider> }>("/api/connectors"),
     api<{
       credentials?: KeychainCredential[];
@@ -628,6 +1259,11 @@ export async function renderConnectors(): Promise<void> {
       usage?: KeychainUsage[];
       scopeNames?: Record<string, string>;
     }>("/api/keychain/overview"),
+    api<{ credentials?: AzureCapturedCredential[] }>("/api/azure/credentials"),
+    api<{ connections?: AzureAccountConnection[] }>("/api/azure/connections"),
+    personalScopeId
+      ? api<AzureBindingView>(`/api/azure/default?scopeId=${encodeURIComponent(personalScopeId)}`)
+      : Promise.resolve(null),
   ]);
   if (seq !== appState.viewRenderSeq || !keychainOperations.isCurrentLoad(load) || appState.currentView !== "keychain")
     return;
@@ -656,8 +1292,76 @@ export async function renderConnectors(): Promise<void> {
     keychainScopeNames = {};
     notices.push(errMessage(keys.reason, "Failed to load stored keys."));
   }
+  if (azureCredentialsResult.status === "fulfilled") {
+    azureCapturedCredentials = (azureCredentialsResult.value.credentials ?? []).slice();
+  } else {
+    azureCapturedCredentials = [];
+    notices.push(errMessage(azureCredentialsResult.reason, "Failed to load Azure captured credentials."));
+  }
+  if (azureConnectionsResult.status === "fulfilled") {
+    azureConnections = (azureConnectionsResult.value.connections ?? []).slice();
+  } else {
+    azureConnections = [];
+    notices.push(errMessage(azureConnectionsResult.reason, "Failed to load Azure account connections."));
+  }
+  if (azureDefaultResult.status === "fulfilled") {
+    azurePersonalBinding = azureDefaultResult.value;
+  } else if (azureDefaultResult.reason instanceof ApiError && azureDefaultResult.reason.status === 404) {
+    azurePersonalBinding = null;
+  } else {
+    azurePersonalBinding = null;
+    notices.push(errMessage(azureDefaultResult.reason, "Failed to load personal Azure default."));
+  }
   if (notices.length) connectorNotice = notices.join(" ");
   drawConnectors(false);
+}
+
+async function saveAzureConnection(): Promise<void> {
+  const editor = azureEditor;
+  if (!editor || editor.busy) return;
+  editor.error = "";
+  editor.busy = true;
+  drawConnectors();
+  try {
+    const body = {
+      ...(editor.mode === "create" ? { credentialId: editor.credentialId } : {}),
+      accountLabel: editor.accountLabel,
+    };
+    if (editor.mode === "create") {
+      await api("/api/azure/connections", { method: "POST", body: JSON.stringify(body) });
+    } else {
+      await api(`/api/azure/connections/${encodeURIComponent(editor.connectionId!)}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+    }
+    azureEditor = null;
+    connectorNotice = editor.mode === "create" ? "Azure account registered." : "Azure account updated.";
+    await renderConnectors();
+  } catch (error) {
+    if (!azureEditor) return;
+    azureEditor.busy = false;
+    azureEditor.error = errMessage(error, "Could not save Azure account.");
+    drawConnectors();
+  }
+}
+
+async function removeAzureConnection(connection: AzureAccountConnection): Promise<void> {
+  if (azureEditor?.busy) return;
+  azureEditor = null;
+  drawConnectors();
+  if (!window.confirm(`Remove Azure account ${connection.accountLabel}?`)) return;
+  try {
+    await api(`/api/azure/connections/${encodeURIComponent(connection.connectionId)}`, { method: "DELETE" });
+    connectorNotice = "Azure account removed.";
+  } catch (error) {
+    connectorNotice = errMessage(error, "Could not remove Azure account.");
+    const body = (error as { body?: { bindingScopes?: unknown } }).body;
+    if (Array.isArray(body?.bindingScopes) && body.bindingScopes.every((value) => typeof value === "string")) {
+      connectorNotice = `Remove Project or Personal bindings first: ${body.bindingScopes.join(", ")}`;
+    }
+  }
+  await renderConnectors();
 }
 
 async function deleteCredential(credential: KeychainCredential): Promise<void> {

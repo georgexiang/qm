@@ -427,6 +427,7 @@ export interface TurnRequest {
   harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;
+  azureOpsTarget?: { tenantId: string; subscriptionId: string };
   readOnly?: boolean;
   skipMemory?: boolean;
   surfaceTools?: boolean;

@@ -7,6 +7,7 @@ import { createMessagingMethods } from "./app-messaging.ts";
 import { createDeploymentMethods } from "./app-deployments.ts";
 import { createSkillMethods } from "./app-skills.ts";
 import { createSearchMethods } from "./app-search.ts";
+import { createAzureOpsMethods } from "./app-azure.ts";
 
 export type { App, AppDeps, ContextSummary, ProjectView, VisibleCron } from "./app-types.ts";
 export { deploymentView, STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -22,6 +23,7 @@ export function createApp(deps: AppDeps): App {
     ...createMessagingMethods(deps, helpers, ambient),
     ...createDeploymentMethods(deps, helpers),
     ...createSkillMethods(deps, helpers),
+    ...createAzureOpsMethods(deps),
   };
   Object.assign(app, methods);
   return Object.assign(app, createSearchMethods(deps, app));

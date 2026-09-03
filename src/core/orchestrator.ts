@@ -134,6 +134,7 @@ import { LRUCache } from "lru-cache";
 import type { SkillResolution, GrantedSkillRef } from "../skills/skill-store.ts";
 import type { Orchestrator, OrchestratorDeps, OrchestratorInput } from "./orchestrator/types.ts";
 import { resolveModel, CODEX_SUBSCRIPTION_PROVIDER } from "../model/pi-models.ts";
+import { AZURE_OPS_SKILL_NAME } from "../azure/azure-ops-binding-store.ts";
 import type { ProviderKeys } from "../harness/pi-harness.ts";
 import type { CodexTurnAuth } from "../harness/harness.ts";
 import { resolveIndividualAuthRouting } from "./individual-auth-routing.ts";
@@ -915,6 +916,33 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const visibleSkillsForTurn = async (): Promise<SkillResolution[]> =>
         filterConnectorSkills((await deps.skills?.visibleFor(skillScopes, grantedSkills)) ?? [], configuredProviders);
       const visibleSkills = await visibleSkillsForTurn();
+      const azureOpsRuntimeSelection =
+        deps.resolveAzureSandboxCredentialForScope &&
+        visibleSkills.some((r) => r.skill?.manifest.name === AZURE_OPS_SKILL_NAME)
+          ? await deps
+              .resolveAzureSandboxCredentialForScope({
+                scopeId,
+                actorId: actor.id,
+                ...(input.azureOpsTarget ? { target: input.azureOpsTarget } : {}),
+              })
+              .catch(() => null)
+          : null;
+      if (input.azureOpsTarget && azureOpsRuntimeSelection?.status !== "selected") {
+        return { status: "refused", reason: "the selected Azure tenant or subscription is not allowed in this scope" };
+      }
+      if (azureOpsRuntimeSelection?.status === "selected") {
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actor.id,
+          action: "azure.binding.use",
+          resource: scopeId,
+          scopeLabel: scopeId,
+          status: azureOpsRuntimeSelection.status,
+          detail:
+            `source=resolver tenant=${azureOpsRuntimeSelection.defaultTarget.tenantId} ` +
+            `subscription=${azureOpsRuntimeSelection.defaultTarget.subscriptionId}`,
+        });
+      }
       const transferId = turnFileId(input.runId, input.attempt);
       const turnSessionDir = `${TURN_FILES_DIR}/${hashId([conversation.threadRef], 24)}`;
       const turnFilesDir = `${turnSessionDir}/${transferId}`;
@@ -937,6 +965,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         systemPrompt += `\n\n## Deployment tool hints\n${deps.deploymentLayer.hints.map((hint) => `- ${hint}`).join("\n")}`;
       }
       if (visibleSkills.length) systemPrompt += `\n\n${skillsIndex(visibleSkills)}`;
+      if (azureOpsRuntimeSelection?.status === "selected") {
+        systemPrompt +=
+          `\n\n## Azure Ops target defaults\n` +
+          `QM_AZURE_OPS_TARGET_TENANT_ID=${azureOpsRuntimeSelection.defaultTarget.tenantId}\n` +
+          `QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID=${azureOpsRuntimeSelection.defaultTarget.subscriptionId}\n` +
+          `QM_AZURE_OPS_TARGET_ALLOWLIST_JSON=${JSON.stringify(azureOpsRuntimeSelection.targetAllowlist)}\n` +
+          `Never run az account set. Pass --subscription ${azureOpsRuntimeSelection.defaultTarget.subscriptionId} on Azure commands and scope every Resource Graph request body to the same subscription and allowed tenants.`;
+      }
       const gatewayBlock = renderGatewayContext(input.surface, input.gatewayContext);
       if (gatewayBlock) systemPrompt += `\n\n${gatewayBlock}`;
       const homeChannel =
@@ -1370,6 +1406,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         provisionForReach,
         reclaimBox,
         provisionPending,
+        selectedRestoreServices,
       } = createTurnSandboxes({
         deps,
         input,
@@ -1393,6 +1430,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         brokerCutoverServices,
         cutoverModeOf,
         visibleSkills,
+        azureOpsRuntimeSelection,
         visibleSkillsForTurn,
         skillMaterializer,
         residentAuthConnectors,
@@ -3044,12 +3082,35 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             if (writable && writtenHandle) {
               if (deps.keychain) {
                 try {
+                  const restoreExcludes = selectedRestoreServices().filter(
+                    (service) =>
+                      !(
+                        azureOpsRuntimeSelection?.status === "selected" && service === azureOpsRuntimeSelection.service
+                      ),
+                  );
+                  const captureExcludes = [
+                    ...new Set([
+                      ...brokerCutoverServices,
+                      ...restoreExcludes,
+                      ...(azureOpsRuntimeSelection?.status === "blocked" ? [azureOpsRuntimeSelection.service] : []),
+                    ]),
+                  ];
                   await captureDeviceFlowLogins({
                     sandbox: deps.sandbox,
                     handle: writtenHandle,
                     keychain: deps.keychain,
                     ownerId: deviceFlowCredOwner(memoryScopeId, actor.id),
-                    ...(brokerCutoverServices.length ? { excludeServices: brokerCutoverServices } : {}),
+                    ...(azureOpsRuntimeSelection?.status === "selected"
+                      ? {
+                          selectedCredentialByService: {
+                            [azureOpsRuntimeSelection.service]: {
+                              ownerId: azureOpsRuntimeSelection.ownerId,
+                              credentialId: azureOpsRuntimeSelection.credentialId,
+                            },
+                          },
+                        }
+                      : {}),
+                    ...(captureExcludes.length ? { excludeServices: captureExcludes } : {}),
                     ...(deps.deploymentLayer?.credentialPaths.length
                       ? { credentialPaths: deps.deploymentLayer.credentialPaths }
                       : {}),

@@ -78,6 +78,7 @@ import { contextsState, ensureContexts, renderContexts, resetContextsState, reso
 import { appState, can, isView, type AuthMode, type Me, type View } from "./shell-state";
 import { trapDialogFocus } from "./dialog-focus";
 import { activeSessionForDocumentTitle, updateDocumentTitle } from "./document-title";
+import { openPersonalChatDraftWithSeams } from "./personal-chat-draft";
 export { appState, can, type Me, type View } from "./shell-state";
 
 let authMode: AuthMode = "portal";
@@ -454,8 +455,8 @@ export function mountShell(): void {
           <div class="list" id="sidebar-body"></div>
           <div class="sidebar-footer">
             <div class="user-pill" title=${appState.me?.user ?? ""}>
-              <span class="avatar">${initials(appState.me?.user ?? "?")}</span>
-              <span class="user-name">${appState.me?.user ?? ""}</span>
+              <span class="avatar">${initials(appState.me?.displayName || appState.me?.user || "?")}</span>
+              <span class="user-name">${appState.me?.displayName || appState.me?.user || ""}</span>
             </div>
             ${
               appState.me?.individualModelAuth
@@ -682,6 +683,10 @@ export function switchView(v: View): void {
       void renderSkills();
       break;
   }
+}
+
+export function openPersonalChatDraft(text: string): void {
+  openPersonalChatDraftWithSeams(text, appState.me?.user, () => mainConversation().newChat());
 }
 
 function refreshActiveView(v: View): void {

@@ -11,6 +11,7 @@ import {
   Ban,
   Brain,
   Check,
+  Cloud,
   ChevronRight,
   Clock3,
   Copy,
@@ -125,6 +126,21 @@ const connectedConnectors = new Set<string>();
 const redrawHooks = new Set<() => void>();
 let proactiveOpenerStarted = false;
 
+interface AzureChatBindingView {
+  binding: {
+    defaultTarget: { tenantId: string; subscriptionId: string };
+    targetAllowlist: Array<{ tenantId: string; subscriptionIds: string[] }>;
+  };
+  available: boolean;
+  connection?: {
+    tenantAccess: Array<{
+      tenantId: string;
+      displayName: string;
+      visibleSubscriptions: Array<{ id: string; name: string }>;
+    }>;
+  };
+}
+
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export function markConnectorConnected(provider: string): void {
@@ -164,6 +180,8 @@ export function createChatSurface(
     inheritedMessages: [] as ReturnType<typeof entriesToMessages>,
     inheritedExpanded: false,
     inheritedLoaded: false,
+    azureBinding: null as AzureChatBindingView | null,
+    azureTarget: null as { tenantId: string; subscriptionId: string } | null,
   };
   const forkOriginController = createForkOriginController({
     state: chatState,
@@ -312,6 +330,8 @@ export function createChatSurface(
     chatState.inheritedMessages = inheritedMessages;
     chatState.inheritedExpanded = false;
     chatState.inheritedLoaded = !session?.forkedFrom;
+    chatState.azureBinding = null;
+    chatState.azureTarget = null;
     chatState.rememberedThreadRef = threadRef;
     chatState.rememberedSessionId = sessionId;
     chatState.rememberedScopeId = scopeId;
@@ -346,6 +366,7 @@ export function createChatSurface(
     chatState.normalStreamFn = normalStreamFn;
     chatState.onWork = onWork;
     void ctx.composer.refreshRuntimeSelection(scopeId, agent);
+    void loadAzureChatBinding(threadRef, scopeId);
 
     let listedWorking = false;
     let titlePollStarted = false;
@@ -446,9 +467,81 @@ export function createChatSurface(
         ? { fastMode: ctx.composer.state.fastMode }
         : {}),
       harness,
+      ...(chatState.azureTarget ? { azureOpsTarget: chatState.azureTarget } : {}),
       scopeId: chatState.scopeId,
       channelName: chatState.contextName,
     };
+  }
+
+  async function loadAzureChatBinding(threadRef: string, currentScopeId: string | null): Promise<void> {
+    const principal = appState.me?.user;
+    const targetScopeId = currentScopeId ?? (principal ? `personal:${principal}` : null);
+    if (!targetScopeId) return;
+    try {
+      const binding = await api<AzureChatBindingView>(
+        `/api/azure/default?scopeId=${encodeURIComponent(targetScopeId)}`,
+      );
+      if (chatState.threadRef !== threadRef) return;
+      chatState.azureBinding = binding.available ? binding : null;
+      chatState.azureTarget = binding.available ? { ...binding.binding.defaultTarget } : null;
+    } catch {
+      if (chatState.threadRef !== threadRef) return;
+      chatState.azureBinding = null;
+      chatState.azureTarget = null;
+    }
+    drawActiveChat();
+  }
+
+  function azureTargetSelector(): TemplateResult | typeof nothing {
+    const view = chatState.azureBinding;
+    const target = chatState.azureTarget;
+    if (!view || !target) return nothing;
+    const allowed = new Map(
+      view.binding.targetAllowlist.map((entry) => [entry.tenantId, new Set(entry.subscriptionIds)]),
+    );
+    const tenants = (view.connection?.tenantAccess ?? [])
+      .map((tenant) => ({
+        ...tenant,
+        visibleSubscriptions: tenant.visibleSubscriptions.filter((subscription) =>
+          allowed.get(tenant.tenantId)?.has(subscription.id),
+        ),
+      }))
+      .filter((tenant) => tenant.visibleSubscriptions.length > 0);
+    const subscriptions = tenants.find((tenant) => tenant.tenantId === target.tenantId)?.visibleSubscriptions ?? [];
+    return html`<div class="azure-chat-target" aria-label="Azure target for this chat">
+      <span class="azure-chat-target-icon">${icon(Cloud, 16)}</span>
+      <label>
+        <span>Tenant</span>
+        <select
+          .value=${target.tenantId}
+          @change=${(event: Event) => {
+            const tenantId = (event.currentTarget as HTMLSelectElement).value;
+            const tenant = tenants.find((candidate) => candidate.tenantId === tenantId);
+            const subscriptionId = tenant?.visibleSubscriptions[0]?.id;
+            if (!subscriptionId) return;
+            chatState.azureTarget = { tenantId, subscriptionId };
+            drawActiveChat();
+          }}
+        >
+          ${tenants.map((tenant) => html`<option value=${tenant.tenantId}>${tenant.displayName}</option>`)}
+        </select>
+      </label>
+      <label>
+        <span>Subscription</span>
+        <select
+          .value=${target.subscriptionId}
+          @change=${(event: Event) => {
+            chatState.azureTarget = {
+              tenantId: target.tenantId,
+              subscriptionId: (event.currentTarget as HTMLSelectElement).value,
+            };
+            drawActiveChat();
+          }}
+        >
+          ${subscriptions.map((subscription) => html`<option value=${subscription.id}>${subscription.name}</option>`)}
+        </select>
+      </label>
+    </div>`;
   }
 
   function inheritedHeader(): TemplateResult | typeof nothing {
@@ -1091,7 +1184,8 @@ export function createChatSurface(
             </div>
           </section>
           <div class="chat-bottom-dock">
-            ${backgroundActivityStrip()} ${liveWorkDock(agent)} ${ctx.composer.composerForm(agent)}
+            ${backgroundActivityStrip()} ${liveWorkDock(agent)} ${azureTargetSelector()}
+            ${ctx.composer.composerForm(agent)}
           </div>
         </div>
       `,

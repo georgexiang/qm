@@ -19,6 +19,7 @@ import {
   type IconNode,
 } from "lucide";
 import {
+  ApiError,
   api,
   isContinuable,
   sharedContextLabel,
@@ -78,6 +79,47 @@ interface DirectoryMatch {
   type: string;
 }
 
+interface AzureVisibleSubscription {
+  id: string;
+  name: string;
+  state: string;
+}
+
+interface AzureTenantAccess {
+  tenantId: string;
+  displayName: string;
+  objectId: string | null;
+  status: "active" | "verification_required" | "unavailable";
+  visibleSubscriptions: AzureVisibleSubscription[];
+}
+
+interface AzureConnection {
+  connectionId: string;
+  credentialId?: string;
+  ownerPrincipalId?: string;
+  accountLabel: string;
+  accountEmail?: string;
+  homeTenantId?: string;
+  tenantAccess?: AzureTenantAccess[];
+  lastVerifiedAt?: number;
+  status: "active" | "verification_required" | "revoked";
+}
+
+interface AzureBinding {
+  bindingId: string;
+  scopeId: string;
+  connectionId: string;
+  defaultTarget: { tenantId: string; subscriptionId: string };
+  targetAllowlist: Array<{ tenantId: string; subscriptionIds: string[] }>;
+  status: "active";
+}
+
+interface AzureBindingView {
+  binding: AzureBinding;
+  available: boolean;
+  connection?: AzureConnection;
+}
+
 export const contextsState = {
   list: [] as CoreContext[],
   loaded: false,
@@ -102,6 +144,16 @@ export const contextsState = {
   slackValue: "",
   slackBusy: false,
   slackError: "",
+  azureBinding: null as AzureBindingView | null,
+  azureConnections: [] as AzureConnection[],
+  azureSelectedConnectionId: "",
+  azureDefaultTenantId: "",
+  azureDefaultSubscriptionId: "",
+  azureAllowlist: {} as Record<string, string[]>,
+  azureProjectSharingConfirmed: false,
+  azureLoading: false,
+  azureBusy: false,
+  azureNotice: "",
 };
 
 let contextsLoading = false;
@@ -160,6 +212,16 @@ export function resetContextsState(): void {
   contextsState.slackValue = "";
   contextsState.slackBusy = false;
   contextsState.slackError = "";
+  contextsState.azureBinding = null;
+  contextsState.azureConnections = [];
+  contextsState.azureSelectedConnectionId = "";
+  contextsState.azureDefaultTenantId = "";
+  contextsState.azureDefaultSubscriptionId = "";
+  contextsState.azureAllowlist = {};
+  contextsState.azureProjectSharingConfirmed = false;
+  contextsState.azureLoading = false;
+  contextsState.azureBusy = false;
+  contextsState.azureNotice = "";
   cancelMemberSearchTimer();
   contextsNotice = "";
   memberSearchSeq++;
@@ -194,6 +256,9 @@ export async function renderContexts(): Promise<void> {
     void loadAmbientPolicy(contextsState.selected, drawContexts);
     void loadContextModel(contextsState.selected, drawContexts);
     void loadChannelHeader(contextsState.selected, drawContexts);
+    const selected = contextsState.list.find((context) => context.scopeId === contextsState.selected);
+    if (selected?.project) void loadProjectAzureAccess(selected);
+    else clearProjectAzureAccessState();
   }
   drawContexts();
 }
@@ -510,7 +575,8 @@ function detailTpl(c: CoreContext): TemplateResult {
         </div>
         <aside class="context-settings" aria-label=${c.project ? "Project settings" : "Context settings"}>
           ${c.project ? projectMembersSection(c) : nothing} ${c.project ? projectSlackSection(c) : nothing}
-          ${contextModelSection(c.scopeId)} ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}
+          ${c.project ? projectAzureSection(c) : nothing} ${contextModelSection(c.scopeId)}
+          ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}
         </aside>
       </div>
     </div>
@@ -717,6 +783,424 @@ function projectSlackSection(context: CoreContext): TemplateResult {
       ${contextsState.slackError ? html`<div class="project-member-status error" aria-live="polite">${contextsState.slackError}</div>` : nothing}
     </section>
   `;
+}
+
+function azureStatus(status: "active" | "verification_required" | "revoked" | "unavailable"): string {
+  if (status === "active") return "Active";
+  if (status === "verification_required") return "Verification required";
+  if (status === "revoked") return "Revoked";
+  return "Unavailable";
+}
+
+function azureConnectionById(connectionId: string): AzureConnection | null {
+  return contextsState.azureConnections.find((connection) => connection.connectionId === connectionId) ?? null;
+}
+
+function selectedAzureConnection(): AzureConnection | null {
+  if (contextsState.azureSelectedConnectionId)
+    return (
+      azureConnectionById(contextsState.azureSelectedConnectionId) ?? contextsState.azureBinding?.connection ?? null
+    );
+  return contextsState.azureBinding?.connection ?? contextsState.azureConnections[0] ?? null;
+}
+
+function azureTenantOptions(connection: AzureConnection | null): AzureTenantAccess[] {
+  return connection?.tenantAccess ?? [];
+}
+
+function projectBindingNeedsSharingConfirmation(context: CoreContext, connection: AzureConnection | null): boolean {
+  if (!context.project || !connection?.ownerPrincipalId) return false;
+  return connection.ownerPrincipalId === context.project.ownerId;
+}
+
+function toggleAzureAllowlist(tenantId: string, subscriptionId: string, checked: boolean): void {
+  const current = new Set(contextsState.azureAllowlist[tenantId] ?? []);
+  if (checked) current.add(subscriptionId);
+  else current.delete(subscriptionId);
+  contextsState.azureAllowlist = {
+    ...contextsState.azureAllowlist,
+    [tenantId]: [...current],
+  };
+  const selectedTenant = contextsState.azureDefaultTenantId;
+  const selectedSubscription = contextsState.azureDefaultSubscriptionId;
+  if (
+    selectedTenant === tenantId &&
+    selectedSubscription &&
+    !(contextsState.azureAllowlist[selectedTenant] ?? []).includes(selectedSubscription)
+  ) {
+    contextsState.azureDefaultSubscriptionId = contextsState.azureAllowlist[selectedTenant]?.[0] ?? "";
+  }
+  drawContexts();
+}
+
+function projectAzureSection(context: CoreContext): TemplateResult | typeof nothing {
+  if (!context.project) return nothing;
+  const owner = isProjectOwner(context);
+  const connection = selectedAzureConnection();
+  const tenants = azureTenantOptions(connection);
+  const accessConfigured = Boolean(contextsState.azureBinding);
+  const saveLabel = accessConfigured ? "Save changes" : "Save Azure access";
+  const needsSharingConfirmation = projectBindingNeedsSharingConfirmation(context, connection);
+  return html`
+    <section class="context-panel project-azure" aria-labelledby="project-azure-title">
+      <div class="context-panel-heading">
+        <h2 class="context-panel-title" id="project-azure-title">Azure access</h2>
+      </div>
+      ${
+        contextsState.azureLoading
+          ? html`<div class="context-inline-empty">Loading Azure access…</div>`
+          : html`
+              <p class="context-hint">
+                Configure this Project's default Azure account, default tenant and subscription, and per-tenant
+                allowlist.
+              </p>
+              ${
+                contextsState.azureBinding
+                  ? html`<div class="project-member-row">
+                      <span class="project-member-avatar" aria-hidden="true">AZ</span>
+                      <span class="project-member-name"
+                        >${contextsState.azureBinding.connection?.accountLabel ?? "Unknown account"}</span
+                      >
+                      <span class="badge">${contextsState.azureBinding.available ? "Available" : "Unavailable"}</span>
+                    </div>`
+                  : html`<div class="context-inline-empty">Azure access is not configured for this Project.</div>`
+              }
+              ${
+                !owner
+                  ? html`<p class="context-hint">
+                      Only the Project Owner can change Azure access settings. Contact the Project Owner to update
+                      bindings.
+                    </p>`
+                  : html`
+                      <form
+                        class="project-slack-form"
+                        @submit=${(event: SubmitEvent) => {
+                          event.preventDefault();
+                          void saveProjectAzureBinding(context);
+                        }}
+                      >
+                        <label class="project-name-field"
+                          ><span>Connection</span>
+                          <select
+                            class="skill-desc-input"
+                            .value=${contextsState.azureSelectedConnectionId}
+                            ?disabled=${contextsState.azureBusy}
+                            @change=${(event: Event) => {
+                              setProjectAzureConnection((event.currentTarget as HTMLSelectElement).value);
+                            }}
+                          >
+                            ${contextsState.azureConnections.map(
+                              (candidate) =>
+                                html`<option value=${candidate.connectionId}>
+                                  ${candidate.accountLabel}${candidate.accountEmail ? ` · ${candidate.accountEmail}` : ""}
+                                </option>`,
+                            )}
+                          </select>
+                        </label>
+                        ${
+                          connection
+                            ? html`
+                                <label class="project-name-field"
+                                  ><span>Default tenant</span>
+                                  <select
+                                    class="skill-desc-input"
+                                    .value=${contextsState.azureDefaultTenantId}
+                                    ?disabled=${contextsState.azureBusy}
+                                    @change=${(event: Event) => setProjectAzureDefaultTenant((event.currentTarget as HTMLSelectElement).value)}
+                                  >
+                                    ${tenants.map(
+                                      (tenant) =>
+                                        html`<option value=${tenant.tenantId}>
+                                          ${tenant.displayName} · ${azureStatus(tenant.status)}
+                                        </option>`,
+                                    )}
+                                  </select>
+                                </label>
+                                <label class="project-name-field"
+                                  ><span>Default subscription</span>
+                                  <select
+                                    class="skill-desc-input"
+                                    .value=${contextsState.azureDefaultSubscriptionId}
+                                    ?disabled=${contextsState.azureBusy}
+                                    @change=${(event: Event) => {
+                                      contextsState.azureDefaultSubscriptionId = (
+                                        event.currentTarget as HTMLSelectElement
+                                      ).value;
+                                      drawContexts();
+                                    }}
+                                  >
+                                    ${(
+                                      tenants.find((tenant) => tenant.tenantId === contextsState.azureDefaultTenantId)
+                                        ?.visibleSubscriptions ?? []
+                                    ).map(
+                                      (subscription) =>
+                                        html`<option value=${subscription.id}>${subscription.name}</option>`,
+                                    )}
+                                  </select>
+                                </label>
+                                <div class="project-member-list">
+                                  ${tenants.map(
+                                    (tenant) =>
+                                      html`<div class="project-member-row">
+                                          <span class="project-member-avatar" aria-hidden="true">TN</span>
+                                          <span class="project-member-name">${tenant.displayName}</span>
+                                          <span class="badge">${tenant.visibleSubscriptions.length}</span>
+                                        </div>
+                                        ${tenant.visibleSubscriptions.map(
+                                          (subscription) =>
+                                            html`<label class="project-member-row">
+                                              <input
+                                                type="checkbox"
+                                                .checked=${(contextsState.azureAllowlist[tenant.tenantId] ?? []).includes(subscription.id)}
+                                                ?disabled=${contextsState.azureBusy}
+                                                @change=${(event: Event) =>
+                                                  toggleAzureAllowlist(
+                                                    tenant.tenantId,
+                                                    subscription.id,
+                                                    (event.currentTarget as HTMLInputElement).checked,
+                                                  )}
+                                              />
+                                              <span class="project-member-name">${subscription.name}</span>
+                                            </label>`,
+                                        )}`,
+                                  )}
+                                </div>
+                                ${
+                                  needsSharingConfirmation
+                                    ? html`<div class="context-hint">
+                                          This Project will use Azure as the selected account. Every active Project
+                                          member who can run /azure-ops may indirectly use that account's Azure
+                                          permissions. Azure activity logs identify the Azure account, while QM audit
+                                          logs identify the Project member who initiated the operation.
+                                        </div>
+                                        <label class="project-member-row">
+                                          <input
+                                            type="checkbox"
+                                            .checked=${contextsState.azureProjectSharingConfirmed}
+                                            ?disabled=${contextsState.azureBusy}
+                                            @change=${(event: Event) => {
+                                              contextsState.azureProjectSharingConfirmed = (
+                                                event.currentTarget as HTMLInputElement
+                                              ).checked;
+                                              drawContexts();
+                                            }}
+                                          />
+                                          <span class="project-member-name"
+                                            >I understand this Project-sharing impact and want to continue.</span
+                                          >
+                                        </label>`
+                                    : nothing
+                                }
+                              `
+                            : html`<p class="context-hint">
+                                No eligible Azure account connections are available in your Keychain.
+                              </p>`
+                        }
+                        <div class="project-slack-actions">
+                          <button class="btn primary" type="submit" ?disabled=${contextsState.azureBusy || !connection}>
+                            ${contextsState.azureBusy ? "Saving…" : saveLabel}
+                          </button>
+                          <button
+                            class="btn"
+                            type="button"
+                            ?disabled=${contextsState.azureBusy || !accessConfigured}
+                            @click=${() => void disconnectProjectAzureBinding(context)}
+                          >
+                            Disconnect
+                          </button>
+                        </div>
+                      </form>
+                    `
+              }
+              <p class="context-hint">
+                Start or refresh Device Code from Personal chat using /azure-ops. Do not paste tokens or .azure files in
+                this form.
+              </p>
+            `
+      }
+      ${contextsState.azureNotice ? html`<div class="project-member-status" aria-live="polite">${contextsState.azureNotice}</div>` : nothing}
+    </section>
+  `;
+}
+
+function clearProjectAzureAccessState(): void {
+  contextsState.azureBinding = null;
+  contextsState.azureConnections = [];
+  contextsState.azureSelectedConnectionId = "";
+  contextsState.azureDefaultTenantId = "";
+  contextsState.azureDefaultSubscriptionId = "";
+  contextsState.azureAllowlist = {};
+  contextsState.azureProjectSharingConfirmed = false;
+  contextsState.azureLoading = false;
+  contextsState.azureBusy = false;
+  contextsState.azureNotice = "";
+}
+
+function seedProjectAzureDraft(connection: AzureConnection | null, binding: AzureBindingView | null): void {
+  const selected = connection ?? binding?.connection ?? null;
+  contextsState.azureSelectedConnectionId = selected?.connectionId ?? "";
+  const existingAllowlist: Record<string, string[]> = {};
+  for (const target of binding?.binding.targetAllowlist ?? [])
+    existingAllowlist[target.tenantId] = [...target.subscriptionIds];
+  if (selected && !Object.keys(existingAllowlist).length) {
+    for (const tenant of selected.tenantAccess ?? []) {
+      existingAllowlist[tenant.tenantId] = tenant.visibleSubscriptions.map((subscription) => subscription.id);
+    }
+  }
+  contextsState.azureAllowlist = existingAllowlist;
+  contextsState.azureDefaultTenantId =
+    binding?.binding.defaultTarget.tenantId ??
+    selected?.tenantAccess?.find((tenant) => (existingAllowlist[tenant.tenantId] ?? []).length > 0)?.tenantId ??
+    selected?.tenantAccess?.[0]?.tenantId ??
+    "";
+  const subscriptions = contextsState.azureAllowlist[contextsState.azureDefaultTenantId] ?? [];
+  contextsState.azureDefaultSubscriptionId =
+    binding?.binding.defaultTarget.subscriptionId ??
+    subscriptions[0] ??
+    selected?.tenantAccess?.[0]?.visibleSubscriptions[0]?.id ??
+    "";
+  contextsState.azureProjectSharingConfirmed = false;
+}
+
+async function loadProjectAzureAccess(context: CoreContext): Promise<void> {
+  if (!context.project || appState.currentView !== "contexts") return;
+  const scopeId = context.scopeId;
+  contextsState.azureLoading = true;
+  contextsState.azureNotice = "";
+  drawContexts();
+  const owner = isProjectOwner(context);
+  let binding: AzureBindingView | null = null;
+  try {
+    const got = await api<AzureBindingView>(`/api/azure/default?scopeId=${encodeURIComponent(scopeId)}`);
+    if (contextsState.selected !== scopeId || appState.currentView !== "contexts") return;
+    binding = got;
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 404) {
+      if (contextsState.selected === scopeId && appState.currentView === "contexts") {
+        contextsState.azureNotice = errMessage(error, "Failed to load Azure binding.");
+      }
+    }
+  }
+  let connections: AzureConnection[] = [];
+  if (owner) {
+    try {
+      const listed = await api<{ connections?: AzureConnection[] }>("/api/azure/connections");
+      if (contextsState.selected !== scopeId || appState.currentView !== "contexts") return;
+      connections = listed.connections ?? [];
+    } catch (error) {
+      if (contextsState.selected === scopeId && appState.currentView === "contexts") {
+        contextsState.azureNotice = errMessage(error, "Failed to load Azure connections.");
+      }
+    }
+  }
+  if (contextsState.selected !== scopeId || appState.currentView !== "contexts") return;
+  contextsState.azureBinding = binding;
+  contextsState.azureConnections = connections;
+  const selected =
+    (binding?.connection?.connectionId
+      ? connections.find((connection) => connection.connectionId === binding.connection!.connectionId)
+      : null) ??
+    binding?.connection ??
+    connections[0] ??
+    null;
+  seedProjectAzureDraft(selected, binding);
+  contextsState.azureLoading = false;
+  drawContexts();
+}
+
+function setProjectAzureConnection(connectionId: string): void {
+  contextsState.azureSelectedConnectionId = connectionId;
+  seedProjectAzureDraft(azureConnectionById(connectionId), contextsState.azureBinding);
+  drawContexts();
+}
+
+function setProjectAzureDefaultTenant(tenantId: string): void {
+  contextsState.azureDefaultTenantId = tenantId;
+  const allowed = contextsState.azureAllowlist[tenantId] ?? [];
+  contextsState.azureDefaultSubscriptionId = allowed[0] ?? "";
+  drawContexts();
+}
+
+async function saveProjectAzureBinding(context: CoreContext): Promise<void> {
+  if (!context.project || !isProjectOwner(context) || contextsState.azureBusy) return;
+  const connection = selectedAzureConnection();
+  if (!connection) {
+    contextsState.azureNotice = "Select an Azure connection first.";
+    drawContexts();
+    return;
+  }
+  const targetAllowlist = Object.entries(contextsState.azureAllowlist)
+    .map(([tenantId, subscriptionIds]) => ({ tenantId, subscriptionIds: [...new Set(subscriptionIds)] }))
+    .filter((target) => target.subscriptionIds.length > 0);
+  if (!contextsState.azureDefaultTenantId || !contextsState.azureDefaultSubscriptionId) {
+    contextsState.azureNotice = "Select a default tenant and subscription.";
+    drawContexts();
+    return;
+  }
+  if (
+    !targetAllowlist.some(
+      (target) =>
+        target.tenantId === contextsState.azureDefaultTenantId &&
+        target.subscriptionIds.includes(contextsState.azureDefaultSubscriptionId),
+    )
+  ) {
+    contextsState.azureNotice = "Default tenant and subscription must be part of the allowlist.";
+    drawContexts();
+    return;
+  }
+  const needsSharingConfirmation = projectBindingNeedsSharingConfirmation(context, connection);
+  contextsState.azureBusy = true;
+  contextsState.azureNotice = "";
+  drawContexts();
+  try {
+    await api("/api/azure/default", {
+      method: "PUT",
+      body: JSON.stringify({
+        scopeId: context.scopeId,
+        connectionId: connection.connectionId,
+        confirmProjectSharing: needsSharingConfirmation ? contextsState.azureProjectSharingConfirmed : false,
+        defaultTarget: {
+          tenantId: contextsState.azureDefaultTenantId,
+          subscriptionId: contextsState.azureDefaultSubscriptionId,
+        },
+        targetAllowlist,
+      }),
+    });
+    contextsState.azureNotice = "Azure access saved.";
+  } catch (error) {
+    const routeError =
+      error instanceof ApiError && typeof error.body === "object" && error.body !== null
+        ? (error.body as { error?: string }).error
+        : undefined;
+    if (routeError === "sharing_confirmation_required") {
+      contextsState.azureNotice = "Confirm Project sharing before saving this binding.";
+      contextsState.azureBusy = false;
+      drawContexts();
+      return;
+    }
+    contextsState.azureNotice = errMessage(error, "Could not save Azure access.");
+  } finally {
+    contextsState.azureBusy = false;
+    drawContexts();
+  }
+  await loadProjectAzureAccess(context);
+}
+
+async function disconnectProjectAzureBinding(context: CoreContext): Promise<void> {
+  if (!context.project || !isProjectOwner(context) || contextsState.azureBusy) return;
+  contextsState.azureBusy = true;
+  contextsState.azureNotice = "";
+  drawContexts();
+  try {
+    await api(`/api/azure/default?scopeId=${encodeURIComponent(context.scopeId)}`, { method: "DELETE" });
+    contextsState.azureNotice = "Azure access disconnected.";
+  } catch (error) {
+    contextsState.azureNotice = errMessage(error, "Could not disconnect Azure access.");
+  } finally {
+    contextsState.azureBusy = false;
+    drawContexts();
+  }
+  await loadProjectAzureAccess(context);
 }
 
 function projectMembersSection(context: CoreContext): TemplateResult {
@@ -1455,6 +1939,7 @@ function selectContext(scopeId: string | null): void {
   contextsState.slackValue = "";
   contextsState.slackBusy = false;
   contextsState.slackError = "";
+  clearProjectAzureAccessState();
   contextsState.selected = scopeId;
   contextsState.resources = null;
   contextsState.resourcesScope = null;
@@ -1470,6 +1955,8 @@ function selectContext(scopeId: string | null): void {
     void loadAmbientPolicy(scopeId, drawContexts);
     void loadContextModel(scopeId, drawContexts);
     void loadChannelHeader(scopeId, drawContexts);
+    const selected = contextsState.list.find((context) => context.scopeId === scopeId);
+    if (selected?.project) void loadProjectAzureAccess(selected);
   }
 }
 

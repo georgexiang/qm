@@ -17,6 +17,7 @@ import {
   DEVICE_FLOW_ORIGIN,
 } from "../src/credentials/device-flow-persist.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
+import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import { installGlobalFakeSprites, type FakeSprites } from "./support/fake-sprites.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAwsRoleBroker } from "../src/auth/aws-role-broker.ts";
@@ -1029,4 +1030,411 @@ test("a nonlegacy policy never places brokered STS on a shared room when isolati
     text: '!run printf \'%s|%s\' "${AWS_ACCESS_KEY_ID-unset}" "$(test -e ~/.acmecli && echo found || echo absent)"',
   });
   assert.equal(only.reply, "unset|absent");
+});
+
+const AZURE_TEST_TENANT = "35fab2a8-2b8f-416a-b5c0-7578d2dfa1e3";
+const AZURE_TEST_SUBSCRIPTION = "483ab1e0-a746-4f34-8276-53e640d6ab09";
+const AZURE_TEST_TENANT_TWO = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+const AZURE_TEST_SUBSCRIPTION_TWO = "a8af42d5-b229-4360-9620-682eec610bc5";
+
+async function publishAzureOpsSkill(built: ReturnType<typeof buildApp>): Promise<void> {
+  const skill = await built.skills.create({
+    scopeId: scopeId("org", "default-org"),
+    createdBy: "system:test",
+    manifest: {
+      name: "azure-ops",
+      description: "azure ops sandbox binding runtime test",
+      requiredCapabilities: [],
+      body: "runtime test skill",
+    },
+  });
+  await built.skills.review(skill.id, "system:test-review", []);
+  await built.skills.publish(skill.id);
+}
+
+async function registerAzureConnection(
+  built: ReturnType<typeof buildApp>,
+  ownerId: string,
+  label: string,
+  cacheValue: string,
+  credentialSlot?: string,
+  accountEmail?: string,
+  tenantId = AZURE_TEST_TENANT,
+  subscriptionId = AZURE_TEST_SUBSCRIPTION,
+  additionalTargets: Array<{ tenantId: string; subscriptionId: string }> = [],
+): Promise<{ credentialId: string; connectionId: string }> {
+  const credential = await built.keychain!.save({
+    ownerId,
+    service: "azure",
+    files: [
+      {
+        path: ".azure/azureProfile.json",
+        contentBase64: Buffer.from(
+          JSON.stringify({
+            subscriptions: [
+              ...[{ tenantId, subscriptionId }, ...additionalTargets].map((target, index) => ({
+                id: target.subscriptionId,
+                name: `${label} subscription ${index + 1}`,
+                state: "Enabled",
+                tenantId: target.tenantId,
+                homeTenantId: tenantId,
+                user: { name: accountEmail ?? `${ownerId}@example.com`, type: "user" },
+              })),
+            ],
+          }),
+          "utf8",
+        ).toString("base64"),
+      },
+      {
+        path: ".azure/msal_token_cache.json",
+        contentBase64: Buffer.from(cacheValue, "utf8").toString("base64"),
+      },
+    ],
+    accountLabel: label,
+    ...(credentialSlot ? { credentialSlot } : {}),
+    origin: DEVICE_FLOW_ORIGIN,
+  });
+  const connection = await built.app.saveAzureAccountConnection({
+    credentialId: credential.id,
+    actorId: ownerId,
+    accountLabel: label,
+  });
+  assert.equal(connection.status, "ok");
+  if (connection.status !== "ok") throw new Error("azure fixture connection setup failed");
+  return { credentialId: connection.connection.credentialId, connectionId: connection.connection.connectionId };
+}
+
+test("azure-ops personal binding restore selects the bound credential and replaces stale .azure files", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dfp-azure-binding-personal-")) }));
+  await publishAzureOpsSkill(built);
+  await built.keychain!.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [
+      {
+        path: ".azure/msal_token_cache.json",
+        contentBase64: Buffer.from("stale-personal-cache", "utf8").toString("base64"),
+      },
+    ],
+    accountLabel: "stale",
+    origin: DEVICE_FLOW_ORIGIN,
+  });
+  const selected = await registerAzureConnection(
+    built,
+    "U1",
+    "selected-personal",
+    "selected-personal-cache",
+    undefined,
+    undefined,
+    AZURE_TEST_TENANT,
+    AZURE_TEST_SUBSCRIPTION,
+    [{ tenantId: AZURE_TEST_TENANT_TWO, subscriptionId: AZURE_TEST_SUBSCRIPTION_TWO }],
+  );
+  const secondary = await registerAzureConnection(
+    built,
+    "U1",
+    "secondary-personal",
+    "secondary-personal-cache",
+    undefined,
+    "secondary-u1@example.com",
+  );
+  const bound = await built.app.setAzureOpsBinding({
+    scopeId: scopeId("personal", "U1"),
+    connectionId: selected.connectionId,
+    defaultTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+    targetAllowlist: [
+      { tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] },
+      { tenantId: AZURE_TEST_TENANT_TWO, subscriptionIds: [AZURE_TEST_SUBSCRIPTION_TWO] },
+    ],
+    actorId: "U1",
+  });
+  assert.equal(bound.status, "ok");
+
+  const run = await built.app.turn(dm("!run cat ~/.azure/msal_token_cache.json"));
+  assert.equal(run.status, "ok", run.reason);
+  assert.equal(run.reply, "selected-personal-cache");
+
+  const envRun = await built.app.turn(
+    dm(
+      '!run printf "%s|%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID" "$QM_AZURE_OPS_TARGET_ALLOWLIST_JSON"',
+    ),
+  );
+  assert.equal(envRun.status, "ok", envRun.reason);
+  assert.equal(
+    envRun.reply,
+    `${AZURE_TEST_TENANT}|${AZURE_TEST_SUBSCRIPTION}|${JSON.stringify([
+      { tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] },
+      { tenantId: AZURE_TEST_TENANT_TWO, subscriptionIds: [AZURE_TEST_SUBSCRIPTION_TWO] },
+    ])}`,
+  );
+
+  const overrideRun = await built.app.turn({
+    ...dm('!run printf "%s|%s" "$QM_AZURE_OPS_TARGET_TENANT_ID" "$QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID"'),
+    azureOpsTarget: { tenantId: AZURE_TEST_TENANT_TWO, subscriptionId: AZURE_TEST_SUBSCRIPTION_TWO },
+  });
+  assert.equal(overrideRun.status, "ok", overrideRun.reason);
+  assert.equal(overrideRun.reply, `${AZURE_TEST_TENANT_TWO}|${AZURE_TEST_SUBSCRIPTION_TWO}`);
+
+  const deniedOverride = await built.app.turn({
+    ...dm("!run printf should-not-run"),
+    azureOpsTarget: { tenantId: AZURE_TEST_TENANT_TWO, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+  });
+  assert.equal(deniedOverride.status, "refused");
+  assert.match(deniedOverride.reason ?? "", /not allowed/);
+
+  const refreshRun = await built.app.turn(
+    dm("!run printf 'selected-personal-cache-refreshed' > ~/.azure/msal_token_cache.json"),
+  );
+  assert.equal(refreshRun.status, "ok", refreshRun.reason);
+  const selectedMaterialized = await built.keychain!.materializeOwnById(
+    "U1",
+    selected.credentialId,
+    scopeId("personal", "U1"),
+  );
+  assert.equal(selectedMaterialized.kind, "file");
+  if (selectedMaterialized.kind !== "file") return;
+  const selectedCacheFile = selectedMaterialized.files.find((file) => file.path === ".azure/msal_token_cache.json");
+  assert.ok(selectedCacheFile);
+  if (!selectedCacheFile) return;
+  assert.equal(
+    Buffer.from(selectedCacheFile.contentBase64, "base64").toString("utf8"),
+    "selected-personal-cache-refreshed",
+  );
+  const secondMaterialized = await built.keychain!.materializeOwnById(
+    "U1",
+    secondary.credentialId,
+    scopeId("personal", "U1"),
+  );
+  assert.equal(secondMaterialized.kind, "file");
+  if (secondMaterialized.kind !== "file") return;
+  const secondaryCacheFile = secondMaterialized.files.find((file) => file.path === ".azure/msal_token_cache.json");
+  assert.ok(secondaryCacheFile);
+  if (!secondaryCacheFile) return;
+  assert.equal(Buffer.from(secondaryCacheFile.contentBase64, "base64").toString("utf8"), "secondary-personal-cache");
+  assert.equal((await built.keychain!.listByOwner("U1")).filter((record) => record.service === "azure").length, 2);
+
+  const inFlight = built.app.turn(
+    dm("!run sleep 0.3; printf 'selected-after-binding-switch' > ~/.azure/msal_token_cache.json"),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const switched = await built.app.setAzureOpsBinding({
+    scopeId: scopeId("personal", "U1"),
+    connectionId: secondary.connectionId,
+    defaultTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+    targetAllowlist: [{ tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] }],
+    actorId: "U1",
+  });
+  assert.equal(switched.status, "ok");
+  const completed = await inFlight;
+  assert.equal(completed.status, "ok", completed.reason);
+  const selectedAfterSwitch = await built.keychain!.materializeOwnById(
+    "U1",
+    selected.credentialId,
+    scopeId("personal", "U1"),
+  );
+  const secondaryAfterSwitch = await built.keychain!.materializeOwnById(
+    "U1",
+    secondary.credentialId,
+    scopeId("personal", "U1"),
+  );
+  assert.equal(selectedAfterSwitch.kind, "file");
+  assert.equal(secondaryAfterSwitch.kind, "file");
+  if (selectedAfterSwitch.kind !== "file" || secondaryAfterSwitch.kind !== "file") return;
+  assert.equal(
+    Buffer.from(
+      selectedAfterSwitch.files.find((file) => file.path === ".azure/msal_token_cache.json")!.contentBase64,
+      "base64",
+    ).toString("utf8"),
+    "selected-after-binding-switch",
+  );
+  assert.equal(
+    Buffer.from(
+      secondaryAfterSwitch.files.find((file) => file.path === ".azure/msal_token_cache.json")!.contentBase64,
+      "base64",
+    ).toString("utf8"),
+    "secondary-personal-cache",
+  );
+
+  assert.equal((await built.app.deleteAzureOpsBinding(scopeId("personal", "U1"), "U1")).status, "ok");
+  const clearedRun = await built.app.turn(dm("!run test ! -e ~/.azure/msal_token_cache.json && printf cleared"));
+  assert.equal(clearedRun.status, "ok", clearedRun.reason);
+  assert.equal(clearedRun.reply, "cleared");
+
+  const usage = await built.credentialUsage.list({ slug: "keychain:azure" });
+  assert.ok(usage.some((row) => row.status === "azure_ops_binding_restored"));
+  const events = await built.auditLog.events();
+  assert.ok(
+    events.some((event) => event.action === "keychain.materialize" && event.resource.includes(selected.credentialId)),
+  );
+});
+
+test("azure-ops project binding restore materializes via standing grant and revocation prevents restore", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dfp-azure-binding-project-")) }));
+  await publishAzureOpsSkill(built);
+
+  await built.app.upsertDirectory([{ principalId: "U1", displayName: "Owner", type: "internal" }]);
+  const project = await built.app.createProject("U1", "Azure Ops");
+  assert.ok(project);
+  if (!project) throw new Error("project setup failed");
+  const projectScope = projectScopeId(project.id);
+  await built.keychain!.save({
+    ownerId: projectScope,
+    service: "azure",
+    files: [
+      {
+        path: ".azure/msal_token_cache.json",
+        contentBase64: Buffer.from("stale-project-cache", "utf8").toString("base64"),
+      },
+    ],
+    accountLabel: "stale-project",
+    origin: DEVICE_FLOW_ORIGIN,
+  });
+  const selected = await registerAzureConnection(
+    built,
+    "credential-owner",
+    "selected-project",
+    "selected-project-cache",
+    "selected-project-slot",
+  );
+  const standingGrant = await built.keychain!.createGrant({
+    credentialId: selected.credentialId,
+    ownerId: "credential-owner",
+    audienceScopeId: projectScope,
+    mode: "standing",
+    purpose: "Azure Ops for project runtime",
+  });
+  const bound = await built.app.setAzureOpsBinding({
+    scopeId: projectScope,
+    connectionId: selected.connectionId,
+    defaultTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+    targetAllowlist: [{ tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] }],
+    actorId: "U1",
+  });
+  assert.equal(bound.status, "ok");
+
+  const projectRun = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U1:azure-ops-binding",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run cat ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(projectRun.status, "ok", projectRun.reason);
+  assert.equal(projectRun.reply, "selected-project-cache");
+  assert.equal(
+    (await built.keychain!.materializeOwnFiles("U1")).some(
+      (record) =>
+        record.service === "azure" &&
+        record.files.some(
+          (file) => Buffer.from(file.contentBase64, "base64").toString("utf8") === "selected-project-cache",
+        ),
+    ),
+    false,
+  );
+  assert.equal(
+    (await built.keychain!.materializeOwnFiles(projectScope)).some(
+      (record) =>
+        record.service === "azure" &&
+        record.files.some(
+          (file) => Buffer.from(file.contentBase64, "base64").toString("utf8") === "selected-project-cache",
+        ),
+    ),
+    false,
+  );
+
+  assert.equal(await built.keychain!.revokeGrant("credential-owner", standingGrant.id), true);
+  assert.equal(
+    (await built.keychain!.grantsForScope(projectScope)).some(({ grant }) => grant.id === standingGrant.id),
+    false,
+  );
+  assert.equal(
+    (await built.keychain!.grantsForScope(projectScope)).some(
+      ({ grant, credential }) =>
+        grant.credentialId === selected.credentialId && credential.id === selected.credentialId,
+    ),
+    false,
+  );
+  const revokedRun = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U1:azure-ops-binding-revoked",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run test ! -e ~/.azure/msal_token_cache.json && echo missing || cat ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(revokedRun.status, "ok", revokedRun.reason);
+  assert.equal(revokedRun.reply, "missing");
+
+  const writeRevoked = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U1:azure-ops-binding-revoked-write",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run mkdir -p ~/.azure && printf 'revoked-write-cache' > ~/.azure/msal_token_cache.json && echo wrote",
+  });
+  assert.equal(writeRevoked.status, "ok", writeRevoked.reason);
+  assert.equal(writeRevoked.reply, "wrote");
+  const ownerMaterialized = await built.keychain!.materializeOwnById(
+    "credential-owner",
+    selected.credentialId,
+    scopeId("personal", "credential-owner"),
+  );
+  assert.equal(ownerMaterialized.kind, "file");
+  if (ownerMaterialized.kind !== "file") return;
+  const ownerCacheFile = ownerMaterialized.files.find((file) => file.path === ".azure/msal_token_cache.json");
+  assert.ok(ownerCacheFile);
+  if (!ownerCacheFile) return;
+  assert.equal(Buffer.from(ownerCacheFile.contentBase64, "base64").toString("utf8"), "selected-project-cache");
+});
+
+test("azure-ops Project Owner connection restores through its binding without a generic grant", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dfp-azure-binding-owner-project-")) }));
+  await publishAzureOpsSkill(built);
+  await built.app.upsertDirectory([{ principalId: "U1", displayName: "Owner", type: "internal" }]);
+  const project = await built.app.createProject("U1", "Owner Azure Ops");
+  assert.ok(project);
+  if (!project) return;
+  const projectScope = projectScopeId(project.id);
+  const selected = await registerAzureConnection(
+    built,
+    "U1",
+    "owner-project",
+    "owner-project-cache",
+    "owner-project-slot",
+  );
+  const bound = await built.app.setAzureOpsBinding({
+    scopeId: projectScope,
+    connectionId: selected.connectionId,
+    defaultTarget: { tenantId: AZURE_TEST_TENANT, subscriptionId: AZURE_TEST_SUBSCRIPTION },
+    targetAllowlist: [{ tenantId: AZURE_TEST_TENANT, subscriptionIds: [AZURE_TEST_SUBSCRIPTION] }],
+    confirmProjectSharing: true,
+    actorId: "U1",
+  });
+  assert.equal(bound.status, "ok");
+  assert.equal((await built.keychain!.listGrants({ ownerId: "U1", audienceScopeId: projectScope })).length, 0);
+
+  const run = await built.app.turn({
+    surface: "web",
+    actor: { externalId: "U1" },
+    conversation: {
+      kind: "group",
+      threadRef: "web:U1:owner-azure-ops-binding",
+      channelRef: projectGroupRef(project.id),
+      audience: [],
+    },
+    text: "!run cat ~/.azure/msal_token_cache.json",
+  });
+  assert.equal(run.status, "ok", run.reason);
+  assert.equal(run.reply, "owner-project-cache");
 });

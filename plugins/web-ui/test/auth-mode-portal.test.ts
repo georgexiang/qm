@@ -58,10 +58,11 @@ test("a verified principal outside WEB_UI_PRINCIPALS is not_allowed, not unauthe
 });
 
 test("a verified allowed principal gets through and /me reports the mode", async () => {
-  const token = mintPortalIdentity({ p: "alice", exp: Date.now() + 60_000 }, SECRET);
+  const token = mintPortalIdentity({ p: "alice", n: "alice@example.com", exp: Date.now() + 60_000 }, SECRET);
   const r = await fetch(`${base}/me`, { headers: { [PORTAL_IDENTITY_HEADER]: token } });
   assert.equal(r.status, 200);
   const body = await r.json();
   assert.equal(body.user, "alice");
+  assert.equal(body.displayName, "alice@example.com");
   assert.equal(body.mode, "portal");
 });

@@ -5,6 +5,7 @@ import type {
   PendingApprovalRecord,
   SurfaceContextQuery,
   SurfaceContextResult,
+  ScopeId,
   TurnRequest,
   TurnResult,
 } from "../../types.ts";
@@ -24,7 +25,12 @@ import type { ProcessRegistry } from "../../processes/process-registry.ts";
 import type { MonitorStore } from "../../monitors/monitor-store.ts";
 import type { CronStore } from "../../cron/cron-store.ts";
 import type { WebhookStore } from "../../webhooks/webhook-store.ts";
-import type { ConnectorTokenStore, Keychain, ServiceCredentialStore } from "../../credentials/keychain.ts";
+import type {
+  ConnectorTokenStore,
+  CredentialFile,
+  Keychain,
+  ServiceCredentialStore,
+} from "../../credentials/keychain.ts";
 import type { DeviceFlowCutoverStore } from "../../credentials/device-flow-cutover.ts";
 import type { CredentialUsageSink } from "../../admin/credential-usage-sink.ts";
 import type { LivenessCache } from "../../credentials/resident-auth.ts";
@@ -59,8 +65,14 @@ import type { BrokeredLayerTool, DeploymentLayerRuntime } from "../../deployment
 import type { FileArtifactStore } from "../../files/file-artifact-store.ts";
 import type { DeployService } from "../../deploy/deploy-service.ts";
 import type { AclStore } from "../../acl/acl-store.ts";
+import type { AzureOpsTarget } from "../../azure/azure-ops-binding-store.ts";
 import type { ChannelPolicyStore } from "../../surface-cache/channel-policy-store.ts";
 import type { SurfaceCache } from "../../surface-cache/types.ts";
+
+export interface AzureOpsRuntimeTargetMetadata {
+  defaultTarget: Readonly<AzureOpsTarget>;
+  targetAllowlist: ReadonlyArray<Readonly<{ tenantId: string; subscriptionIds: readonly string[] }>>;
+}
 
 export interface OrchestratorInput extends Omit<
   TurnRequest,
@@ -162,6 +174,21 @@ export interface OrchestratorDeps {
   sharedOwnerAuthIsolation?: boolean;
   deviceFlowCutover?: DeviceFlowCutoverStore;
   credentialUsage?: CredentialUsageSink;
+  resolveAzureSandboxCredentialForScope?: (input: {
+    scopeId: ScopeId;
+    actorId: string;
+    target?: AzureOpsTarget;
+  }) => Promise<
+    | { service: string; status: "blocked" }
+    | ({
+        service: string;
+        status: "selected";
+        ownerId: string;
+        credentialId: string;
+        files: CredentialFile[];
+      } & AzureOpsRuntimeTargetMetadata)
+    | null
+  >;
   keychain?: Keychain;
   serviceCreds?: ServiceCredentialStore;
   deliveries?: DeliveryStore;

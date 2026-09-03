@@ -354,6 +354,7 @@ export interface RunPoll {
 export interface TurnOptions {
   effortLevel?: string;
   fastMode?: boolean;
+  azureOpsTarget?: { tenantId: string; subscriptionId: string };
   harness?: string;
   scopeId?: string | null;
   channelName?: string | null;
@@ -716,6 +717,7 @@ function turnRequestBody(
     model: model.id,
     ...(thinkingLevel ? { thinkingLevel } : {}),
     ...(typeof turnOptions.fastMode === "boolean" ? { fastMode: turnOptions.fastMode } : {}),
+    ...(turnOptions.azureOpsTarget ? { azureOpsTarget: turnOptions.azureOpsTarget } : {}),
     ...(timezone ? { timezone } : {}),
     ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
     ...(turnOptions.channelName ? { channelName: turnOptions.channelName } : {}),

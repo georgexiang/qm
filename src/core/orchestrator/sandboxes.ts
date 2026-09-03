@@ -6,6 +6,7 @@ import {
   deviceFlowCredOwner,
   materializeDeviceFlowLogins,
   removeDeviceFlowLogins,
+  writeDeviceFlowLoginBundles,
 } from "../../credentials/device-flow-persist.ts";
 import type { DeviceFlowCutoverMode } from "../../credentials/device-flow-cutover.ts";
 import {
@@ -16,6 +17,7 @@ import {
 import { shq } from "../../util/shell.ts";
 import { createSkillMaterializer, safeSkillDirName } from "../../skills/materialize.ts";
 import type { SkillResolution } from "../../skills/skill-store.ts";
+import { AZURE_OPS_SKILL_NAME } from "../../azure/azure-ops-binding-store.ts";
 import { TURN_FILES_DIR } from "../attachments.ts";
 import { errMessage, swallow, swallowAs } from "../../util/errors.ts";
 import { sleep } from "../../util/async.ts";
@@ -47,6 +49,7 @@ export interface TurnSandboxContext {
   brokerCutoverServices: string[];
   cutoverModeOf: (service: string) => DeviceFlowCutoverMode;
   visibleSkills: SkillResolution[];
+  azureOpsRuntimeSelection: Awaited<ReturnType<NonNullable<OrchestratorDeps["resolveAzureSandboxCredentialForScope"]>>>;
   visibleSkillsForTurn: () => Promise<SkillResolution[]>;
   skillMaterializer: ReturnType<typeof createSkillMaterializer>;
   residentAuthConnectors: () => ResidentAuthConnector[];
@@ -78,6 +81,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     brokerCutoverServices,
     cutoverModeOf,
     visibleSkills,
+    azureOpsRuntimeSelection,
     visibleSkillsForTurn,
     skillMaterializer,
     residentAuthConnectors,
@@ -125,6 +129,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     materializeMs?: number;
     residentAuthProbe?: Promise<void>;
   } = { handle: null, pending: null, used: false };
+  const selectedBindingRestoreServices = new Set<string>();
   const scratchBox: { handle: SandboxHandle | null; provisionMs?: number } = { handle: null };
   const ownerAuthBox: { handle: SandboxHandle | null; pending: SandboxHandle | null; provisionMs?: number } = {
     handle: null,
@@ -198,6 +203,74 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     handle.env = { ...handle.env, AGENT_OUTBOX: `${handle.rootDir}/${turnOutboxDir}` };
     if (deps.keychain) {
       const deviceFlowStart = Date.now();
+      const azureOpsVisible = visibleSkills.some((r) => r.skill?.manifest.name === AZURE_OPS_SKILL_NAME);
+      const selectedAzureCredential = azureOpsVisible ? azureOpsRuntimeSelection : null;
+      if (selectedAzureCredential) {
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actor.id,
+          action: "azure.binding.use",
+          resource: scopeId,
+          scopeLabel: scopeId,
+          status: selectedAzureCredential.status,
+          ...(selectedAzureCredential.status === "selected"
+            ? {
+                detail:
+                  `source=provision tenant=${selectedAzureCredential.defaultTarget.tenantId} ` +
+                  `subscription=${selectedAzureCredential.defaultTarget.subscriptionId}`,
+              }
+            : { detail: "source=provision blocked=true" }),
+        });
+        if (selectedAzureCredential.status === "selected") {
+          handle.env = {
+            ...handle.env,
+            QM_AZURE_OPS_TARGET_TENANT_ID: selectedAzureCredential.defaultTarget.tenantId,
+            QM_AZURE_OPS_TARGET_SUBSCRIPTION_ID: selectedAzureCredential.defaultTarget.subscriptionId,
+            QM_AZURE_OPS_TARGET_ALLOWLIST_JSON: JSON.stringify(selectedAzureCredential.targetAllowlist),
+          };
+        }
+      }
+      if (selectedAzureCredential?.status === "selected") {
+        const selectedRoots = [
+          ...new Set(selectedAzureCredential.files.map((file) => file.path.split("/").find(Boolean) ?? file.path)),
+        ];
+        await writeDeviceFlowLoginBundles({
+          sandbox: deps.sandbox,
+          handle,
+          bundles: [{ service: selectedAzureCredential.service, files: selectedAzureCredential.files }],
+          replaceRoots: selectedRoots,
+        });
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actor.id,
+          action: "keychain.materialize",
+          resource: `${selectedAzureCredential.credentialId} (azure-ops binding)`,
+          scopeLabel: scopeId,
+        });
+        deps.credentialUsage?.record({
+          slug: `keychain:${selectedAzureCredential.service}`,
+          host: "local",
+          status: "azure_ops_binding_restored",
+          scopeLabel: scopeId,
+          principalId: actor.id,
+        });
+        selectedBindingRestoreServices.add(selectedAzureCredential.service);
+      } else if (selectedAzureCredential?.status === "blocked") {
+        await writeDeviceFlowLoginBundles({
+          sandbox: deps.sandbox,
+          handle,
+          bundles: [],
+          replaceRoots: [".azure"],
+        });
+        deps.credentialUsage?.record({
+          slug: `keychain:${selectedAzureCredential.service}`,
+          host: "local",
+          status: "azure_ops_binding_blocked",
+          scopeLabel: scopeId,
+          principalId: actor.id,
+        });
+        selectedBindingRestoreServices.add(selectedAzureCredential.service);
+      }
       const restoreOwnerId =
         input.origin.kind === "automation" && input.origin.useOwnerKeychain && !isolateOwnerKeychain
           ? actor.id
@@ -226,12 +299,15 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
         });
       }
       try {
+        const restoreExcludes = [
+          ...new Set([...quarantinedServices, ...(selectedAzureCredential ? [selectedAzureCredential.service] : [])]),
+        ];
         const restoredServices = await materializeDeviceFlowLogins({
           sandbox: deps.sandbox,
           handle,
           keychain: deps.keychain,
           ownerId: restoreOwnerId,
-          ...(quarantinedServices.length ? { excludeServices: quarantinedServices } : {}),
+          ...(restoreExcludes.length ? { excludeServices: restoreExcludes } : {}),
         });
         for (const service of restoredServices) {
           deps.credentialUsage?.record({
@@ -580,5 +656,6 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
     provisionForReach,
     reclaimBox,
     provisionPending: () => provisionInFlight !== null,
+    selectedRestoreServices: () => [...selectedBindingRestoreServices],
   };
 }

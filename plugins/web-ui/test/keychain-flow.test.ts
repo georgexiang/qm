@@ -160,3 +160,38 @@ test("keychain actions keep secondary weight and compact mobile sizing", () => {
   assert.doesNotMatch(shellCssSource, /\.kc-hero-actions \.btn\s*\{\s*flex:\s*1;/);
   assert.doesNotMatch(shellCssSource, /sidebar-closed \.kc-hero-copy/);
 });
+
+test("keychain Azure accounts section lists multi-tenant metadata and routes through captured credentials", () => {
+  assert.match(
+    connectorsSource,
+    /api<\{ credentials\?: AzureCapturedCredential\[\] \}>\("\/api\/azure\/credentials"\)/,
+  );
+  assert.match(connectorsSource, /api<\{ connections\?: AzureAccountConnection\[\] \}>\("\/api\/azure\/connections"\)/);
+  assert.match(connectorsSource, /<h2 id="kc-azure-title">Azure accounts<\/h2>/);
+  assert.match(connectorsSource, /Tenant access/);
+  assert.match(connectorsSource, /visibleSubscriptions/);
+  assert.match(connectorsSource, /No Azure accounts registered/);
+  assert.doesNotMatch(connectorsSource, /tenantAccessJson/);
+  assert.doesNotMatch(connectorsSource, /Tenant access JSON/);
+  assert.doesNotMatch(connectorsSource, /Account email/);
+  assert.doesNotMatch(connectorsSource, /Home tenant ID/);
+});
+
+test("keychain Azure flow explicitly directs Device Code through Personal chat", () => {
+  assert.match(
+    connectorsSource,
+    /Run \/azure-ops in Personal chat and finish the verification URL and code flow there first\./,
+  );
+  assert.match(connectorsSource, /Run Device Code in Personal chat first, then Refresh or Register here\./);
+  assert.match(connectorsSource, /openPersonalChatDraft\("\/azure-ops connect my Azure account using Device Code"\)/);
+});
+
+test("keychain Azure cards manage personal default binding and load it from the dedicated route", () => {
+  assert.match(connectorsSource, /personalAzureScopeId\(\)/);
+  assert.match(connectorsSource, /\/api\/azure\/default\?scopeId=/);
+  assert.match(connectorsSource, /Active default/);
+  assert.match(connectorsSource, /Set personal default/);
+  assert.match(connectorsSource, /Edit default/);
+  assert.match(connectorsSource, /Disconnect/);
+  assert.match(connectorsSource, /Personal Azure default saved\./);
+});

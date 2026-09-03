@@ -877,6 +877,7 @@ const apiRoutes: readonly WebRoute[] = [
       };
       return json(res, 200, {
         user,
+        ...(resolveIdentity(req)?.name ? { displayName: resolveIdentity(req)!.name } : {}),
         org: ORG,
         mode: AUTH_MODE,
         slackWorkspaceUrl: workspaceUrl,
@@ -1596,6 +1597,89 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "GET",
+    path: "/api/azure/credentials",
+    handle: async (c) => relayCap(c.res, "GET", "/v1/azure/credentials"),
+  },
+  {
+    method: "GET",
+    path: "/api/azure/connections",
+    handle: async (c) => relayCap(c.res, "GET", "/v1/azure/connections"),
+  },
+  {
+    method: "POST",
+    path: "/api/azure/connections",
+    handle: async (c) => {
+      const p = await readJson<Record<string, unknown>>(c.req, c.res, false);
+      if (!p) return;
+      const body = {
+        credentialId: typeof p.credentialId === "string" ? p.credentialId : undefined,
+        accountLabel: typeof p.accountLabel === "string" ? p.accountLabel : undefined,
+      };
+      return relayCap(c.res, "POST", "/v1/azure/connections", JSON.stringify(body));
+    },
+  },
+  {
+    method: "PUT",
+    path: "/api/azure/connections/:connectionId",
+    handle: async (c) => {
+      const p = await readJson<Record<string, unknown>>(c.req, c.res, false);
+      if (!p) return;
+      const body = {
+        accountLabel: typeof p.accountLabel === "string" ? p.accountLabel : undefined,
+      };
+      return relayCap(
+        c.res,
+        "PUT",
+        `/v1/azure/connections/${encodeURIComponent(c.params.connectionId!)}`,
+        JSON.stringify(body),
+      );
+    },
+  },
+  {
+    method: "DELETE",
+    path: "/api/azure/connections/:connectionId",
+    handle: async (c) =>
+      relayCap(c.res, "DELETE", `/v1/azure/connections/${encodeURIComponent(c.params.connectionId!)}`),
+  },
+  {
+    method: "GET",
+    path: "/api/azure/default",
+    handle: async (c) => {
+      const scopeId = (new URL(c.req.url ?? "", "http://localhost").searchParams.get("scopeId") ?? "").trim();
+      if (!scopeId) return json(c.res, 400, { error: "bad_request", message: "scopeId required" });
+      return relayCap(c.res, "GET", `/v1/azure/default?scopeId=${encodeURIComponent(scopeId)}`);
+    },
+  },
+  {
+    method: "PUT",
+    path: "/api/azure/default",
+    handle: async (c) => {
+      const p = await readJson<Record<string, unknown>>(c.req, c.res, false);
+      if (!p) return;
+      const body = {
+        scopeId: typeof p.scopeId === "string" ? p.scopeId : undefined,
+        connectionId: typeof p.connectionId === "string" ? p.connectionId : undefined,
+        confirmProjectSharing: p.confirmProjectSharing === true,
+        defaultTarget: typeof p.defaultTarget === "object" && p.defaultTarget !== null ? p.defaultTarget : undefined,
+        targetAllowlist:
+          Array.isArray(p.targetAllowlist) && p.targetAllowlist.every((v) => typeof v === "object" && v !== null)
+            ? p.targetAllowlist
+            : undefined,
+      };
+      return relayCap(c.res, "PUT", "/v1/azure/default", JSON.stringify(body));
+    },
+  },
+  {
+    method: "DELETE",
+    path: "/api/azure/default",
+    handle: async (c) => {
+      const scopeId = (new URL(c.req.url ?? "", "http://localhost").searchParams.get("scopeId") ?? "").trim();
+      if (!scopeId) return json(c.res, 400, { error: "bad_request", message: "scopeId required" });
+      return relayCap(c.res, "DELETE", `/v1/azure/default?scopeId=${encodeURIComponent(scopeId)}`);
+    },
+  },
+  {
+    method: "GET",
     path: "/api/keychain/overview",
     handle: async (c) => {
       const { res } = c;
@@ -1814,6 +1898,7 @@ const apiRoutes: readonly WebRoute[] = [
       let harness: string | undefined;
       let thinkingLevel: string | undefined;
       let fastMode: boolean | undefined;
+      let azureOpsTarget: { tenantId: string; subscriptionId: string } | undefined;
       let timezone: string | undefined;
       let scope: string | undefined;
       let channelName: string | undefined;
@@ -1846,6 +1931,17 @@ const apiRoutes: readonly WebRoute[] = [
         if (typeof p.harness === "string") harness = p.harness;
         if (typeof p.thinkingLevel === "string") thinkingLevel = p.thinkingLevel;
         if (typeof p.fastMode === "boolean") fastMode = p.fastMode;
+        if (p.azureOpsTarget && typeof p.azureOpsTarget === "object") {
+          const target = p.azureOpsTarget as { tenantId?: unknown; subscriptionId?: unknown };
+          const tenantId = typeof target.tenantId === "string" ? target.tenantId.trim().toLowerCase() : "";
+          const subscriptionId =
+            typeof target.subscriptionId === "string" ? target.subscriptionId.trim().toLowerCase() : "";
+          const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!uuid.test(tenantId) || !uuid.test(subscriptionId)) {
+            return json(res, 400, { error: "invalid_azure_target" });
+          }
+          azureOpsTarget = { tenantId, subscriptionId };
+        }
         if (typeof p.timezone === "string" && p.timezone.trim()) timezone = p.timezone.trim().slice(0, 64);
         if (Array.isArray(p.attachments)) {
           for (const raw of p.attachments as unknown[]) {
@@ -1893,6 +1989,7 @@ const apiRoutes: readonly WebRoute[] = [
         ...(model ? { model } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
         ...(typeof fastMode === "boolean" ? { fastMode } : {}),
+        ...(azureOpsTarget ? { azureOpsTarget } : {}),
         ...(timezone ? { timezone } : {}),
         ...(attachments.length ? { attachments } : {}),
         ...(approval ? { approval } : {}),

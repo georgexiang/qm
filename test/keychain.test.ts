@@ -81,6 +81,57 @@ test("envKey defaults from the service name (github → GITHUB_TOKEN)", async ()
   assert.equal(meta.service, "github");
 });
 
+test("azure file credentials can use explicit slots while preserving default behavior", async () => {
+  const k = kc();
+  const slotA = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("slot-a-1").toString("base64") }],
+    credentialSlot: "acct-a",
+    origin: "device-flow-auto-capture",
+  });
+  const slotARefresh = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("slot-a-2").toString("base64") }],
+    credentialSlot: "acct-a",
+    origin: "device-flow-auto-capture",
+  });
+  const slotB = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("slot-b").toString("base64") }],
+    credentialSlot: "acct-b",
+    origin: "device-flow-auto-capture",
+  });
+  const defaultSlot = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("default").toString("base64") }],
+    origin: "device-flow-auto-capture",
+  });
+  const defaultSlotRefresh = await k.save({
+    ownerId: "U1",
+    service: "azure",
+    files: [{ path: ".azure/msal_token_cache.json", contentBase64: Buffer.from("default-2").toString("base64") }],
+    origin: "device-flow-auto-capture",
+  });
+
+  assert.equal(slotARefresh.id, slotA.id);
+  assert.notEqual(slotA.id, slotB.id);
+  assert.equal(defaultSlotRefresh.id, defaultSlot.id);
+  const azureCreds = (await k.listByOwner("U1")).filter((record) => record.service === "azure");
+  assert.equal(azureCreds.length, 3);
+
+  const a = await k.materializeOwnById("U1", slotA.id, "personal:U1");
+  const b = await k.materializeOwnById("U1", slotB.id, "personal:U1");
+  assert.equal(a.kind, "file");
+  assert.equal(b.kind, "file");
+  if (a.kind !== "file" || b.kind !== "file") return;
+  assert.equal(Buffer.from(a.files[0]!.contentBase64, "base64").toString("utf8"), "slot-a-2");
+  assert.equal(Buffer.from(b.files[0]!.contentBase64, "base64").toString("utf8"), "slot-b");
+});
+
 test("only the owner can grant; materialize is scope-checked; once-grants are consumed", async () => {
   const k = kc();
   const cred = await k.save(GH);

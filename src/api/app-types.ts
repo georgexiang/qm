@@ -98,6 +98,63 @@ import type { RuntimeChoice } from "../harness/harness-router.ts";
 import { type ReachOpts, type ReachResolution, type ReachTarget } from "../reach/reach.ts";
 import { type Project, type ProjectStore } from "../projects/project-store.ts";
 import type { SearchHit } from "../search/core-search.ts";
+import type {
+  AzureOpsBinding,
+  AzureOpsBindingStore,
+  AzureOpsTarget,
+  AzureOpsTargetAllowlist,
+} from "../azure/azure-ops-binding-store.ts";
+import type { AzureAccountConnection, AzureAccountConnectionStore } from "../azure/azure-account-connection-store.ts";
+import type { Keychain } from "../credentials/keychain.ts";
+
+export interface AzureBindingConnectionTenantView {
+  tenantId: string;
+  displayName: string;
+  status: "active" | "verification_required" | "unavailable";
+  visibleSubscriptions: Array<{ id: string; name: string; state: string }>;
+}
+
+export interface AzureBindingConnectionView {
+  connectionId?: string;
+  credentialId?: string;
+  ownerPrincipalId?: string;
+  accountLabel: string;
+  accountEmail?: string;
+  homeTenantId?: string;
+  tenantAccess?: AzureBindingConnectionTenantView[];
+  lastVerifiedAt?: number;
+  status: "active" | "verification_required" | "revoked";
+}
+
+export interface AzureOpsBindingView {
+  binding: Omit<AzureOpsBinding, "grantId" | "createdBy" | "updatedBy">;
+  available: boolean;
+  connection?: AzureBindingConnectionView;
+}
+
+export type AzureOpsBindingResult =
+  | { status: "ok"; binding: AzureOpsBindingView }
+  | {
+      status:
+        | "not_found"
+        | "forbidden"
+        | "invalid_scope"
+        | "invalid_credential"
+        | "invalid_allowlist"
+        | "sharing_confirmation_required";
+    };
+
+export interface AzureCapturedCredentialView {
+  credentialId: string;
+  accountLabel?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type AzureAccountConnectionResult =
+  | { status: "ok"; connection: AzureAccountConnection; created?: boolean }
+  | { status: "not_found" | "invalid_credential" | "invalid_metadata" | "invalid_profile" | "verification_required" }
+  | { status: "conflict"; bindingScopes: ScopeId[] };
 
 interface DeploymentVersionView {
   version: number;
@@ -303,6 +360,25 @@ export interface App {
   ): Promise<SessionBackgroundOutput | null>;
   listContexts(principalId: string): Promise<ContextSummary[]>;
   listProjects(principalId: string): Promise<ProjectView[]>;
+  listAzureCapturedCredentials(actorId: string): Promise<AzureCapturedCredentialView[]>;
+  listAzureAccountConnections(actorId: string): Promise<AzureAccountConnection[]>;
+  saveAzureAccountConnection(input: {
+    connectionId?: string;
+    credentialId?: string;
+    actorId: string;
+    accountLabel?: string;
+  }): Promise<AzureAccountConnectionResult>;
+  deleteAzureAccountConnection(connectionId: string, actorId: string): Promise<AzureAccountConnectionResult>;
+  getAzureOpsBinding(scopeId: ScopeId, actorId: string): Promise<AzureOpsBindingResult>;
+  setAzureOpsBinding(input: {
+    scopeId: ScopeId;
+    connectionId: string;
+    defaultTarget: AzureOpsTarget;
+    targetAllowlist: AzureOpsTargetAllowlist[];
+    confirmProjectSharing?: boolean;
+    actorId: string;
+  }): Promise<AzureOpsBindingResult>;
+  deleteAzureOpsBinding(scopeId: ScopeId, actorId: string): Promise<AzureOpsBindingResult>;
   createProject(principalId: string, name: string): Promise<ProjectView | null>;
   addProjectMember(id: string, principalId: string, memberId: string): Promise<ProjectViewMutation>;
   removeProjectMember(id: string, principalId: string, memberId: string): Promise<ProjectViewMutation>;
@@ -548,6 +624,9 @@ export interface AppDeps {
   directory: DirectoryStore;
   emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
+  azureAccountConnections?: AzureAccountConnectionStore;
+  azureOpsBindings?: AzureOpsBindingStore;
+  keychain?: Keychain;
   deploy: DeployService;
   deploymentLayer?: DeploymentLayerRuntime;
   files: FileArtifactStore;
