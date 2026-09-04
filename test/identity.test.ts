@@ -90,10 +90,13 @@ test("principal profiles remain readable across service instances", async () => 
   const profileBacking = createMemoryMap<PrincipalProfile>();
   const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
   const writer = createIdentityService(undefined, { profileBacking });
-  await writer.upsertProfile(principalId, "alex@example.com");
+  await writer.upsertProfile(principalId, "old@example.com", 100);
+  await writer.upsertProfile(principalId, "alex@example.com", 300);
+  await writer.upsertProfile(principalId, "stale@example.com", 200);
 
   const reader = createIdentityService(undefined, { profileBacking });
   assert.equal((await reader.profile(principalId))?.displayName, "alex@example.com");
+  assert.deepEqual((await reader.profile(principalId))?.aliases, ["old@example.com", "stale@example.com"]);
   assert.equal((await reader.profiles())[0]?.principalId, principalId);
 });
 

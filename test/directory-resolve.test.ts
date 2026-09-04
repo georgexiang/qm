@@ -56,13 +56,16 @@ describe("GET /v1/directory/resolve (agent looks up a teammate's mention id)", a
 
   it("resolves an Entra profile by email when the Slack directory has no match", async () => {
     const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
-    await built.identity.upsertProfile(principalId, "alex@example.com");
-    const res = await get("/v1/directory/resolve?q=alex%40example.com");
-    assert.equal(res.status, 200);
-    const { matches } = (await res.json()) as {
-      matches: Array<{ principalId: string; displayName: string; type: string; slackId?: string }>;
-    };
-    assert.deepEqual(matches, [{ principalId, displayName: "alex@example.com", type: "internal" }]);
+    await built.identity.upsertProfile(principalId, "old@example.com", 100);
+    await built.identity.upsertProfile(principalId, "alex@example.com", 200);
+    for (const query of ["alex%40example.com", "old%40example.com"]) {
+      const res = await get(`/v1/directory/resolve?q=${query}`);
+      assert.equal(res.status, 200);
+      const { matches } = (await res.json()) as {
+        matches: Array<{ principalId: string; displayName: string; type: string; slackId?: string }>;
+      };
+      assert.deepEqual(matches, [{ principalId, displayName: "alex@example.com", type: "internal" }]);
+    }
   });
 
   it("prefers the stable Entra principal when a Slack row has the same email", async () => {

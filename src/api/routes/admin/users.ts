@@ -2,6 +2,7 @@ import { scopeId as makeScopeId } from "../../../types.ts";
 import { publicUrlOf } from "../../../deploy/deploy-store.ts";
 import { adminStatusFromGrants, AdminError } from "../../../admin/admin-service.ts";
 import { personKey, samePerson } from "../../../directory/person.ts";
+import { principalProfileNames } from "../../../identity/identity-service.ts";
 import type { AdminRole } from "../../../admin/admin-grant-store.ts";
 import type { DirectoryMember } from "../../../directory/directory-store.ts";
 import { computeUsers } from "../../../admin/users.ts";
@@ -60,6 +61,37 @@ export async function searchDirectory(ctx: ApiCtx): Promise<void> {
   let members: DirectoryMember[] = [];
   if (r.kind === "one") members = [r.member];
   else if (r.kind === "ambiguous") members = r.candidates;
+  if (deps.identity) {
+    const query = q.trim().toLowerCase();
+    const profiles = await deps.identity.profiles();
+    const profileMembers = profiles
+      .filter(
+        (profile) =>
+          deps.identity!.isInternal(deps.identity!.classify(profile.principalId)) &&
+          (personKey(profile.principalId) === personKey(q) ||
+            principalProfileNames(profile).some((name) => name.toLowerCase().includes(query))),
+      )
+      .map((profile) => ({
+        principalId: profile.principalId,
+        displayName: profile.displayName,
+        type: "internal" as const,
+      }));
+    const profileIds = new Set(profileMembers.map((member) => personKey(member.principalId)));
+    members = [
+      ...profileMembers,
+      ...members.filter(
+        (member) =>
+          !profileIds.has(personKey(member.principalId)) &&
+          !profiles.some((profile) =>
+            principalProfileNames(profile).some(
+              (name) =>
+                personKey(name) === personKey(member.principalId) ||
+                name.trim().toLowerCase() === member.displayName.trim().toLowerCase(),
+            ),
+          ),
+      ),
+    ];
+  }
   return sendJson(res, 200, {
     members: members.map((m) => ({ principalId: m.principalId, displayName: m.displayName })),
   });

@@ -13,6 +13,7 @@ import { type ArtifactHome } from "./artifact-share.ts";
 import { randomUUID } from "node:crypto";
 import { MAX_ATTACHMENT_BYTES, mimeFromName, safeAttachmentName } from "../core/attachments.ts";
 import { projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
+import { principalProfileNames } from "../identity/identity-service.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { toFileItem, type ScopeDeployment, type SessionSearchHit } from "./app-types.ts";
@@ -322,22 +323,17 @@ export function createSessionMethods(
       const existing = await deps.projects.get(id);
       if (!existing || existing.orgId !== orgIdOf()) return { status: "not_found" };
       const directoryMember = await deps.directory.get(memberId);
-      let resolvedMemberId = memberId;
-      let profile = await deps.identity.profile(memberId);
+      const resolvedMemberId = memberId;
+      const profile = await deps.identity.profile(memberId);
       if (!profile && directoryMember) {
-        const aliases = (await deps.identity.profiles()).filter(
-          (candidate) =>
-            samePerson(candidate.displayName, directoryMember.principalId) ||
-            candidate.displayName.trim().toLowerCase() === directoryMember.displayName.trim().toLowerCase(),
+        const aliases = (await deps.identity.profiles()).filter((candidate) =>
+          principalProfileNames(candidate).some(
+            (name) =>
+              samePerson(name, directoryMember.principalId) ||
+              name.trim().toLowerCase() === directoryMember.displayName.trim().toLowerCase(),
+          ),
         );
-        const activeAliases = aliases.filter((candidate) =>
-          deps.identity.isInternal(deps.identity.classify(candidate.principalId)),
-        );
-        if (aliases.length && activeAliases.length !== 1) return { status: "invalid_member" };
-        if (activeAliases.length === 1) {
-          profile = activeAliases[0]!;
-          resolvedMemberId = profile.principalId;
-        }
+        if (aliases.length) return { status: "invalid_member" };
       }
       const principal = deps.identity.classify(resolvedMemberId);
       if (

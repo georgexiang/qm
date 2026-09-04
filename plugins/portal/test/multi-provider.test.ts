@@ -13,6 +13,7 @@ process.env.CORE_SIGNING_SECRET = "multi-provider-core-secret";
 process.env.PORTAL_IDENTITY_SECRET = "multi-provider-identity-secret";
 process.env.OIDC_CLIENT_ID = "qm-portal";
 process.env.OIDC_CLIENT_SECRET = "broker-client-secret";
+process.env.OIDC_ALLOWED_EMAILS = "admin@example.com";
 process.env.ENTRA_OIDC_TENANT_ID = "16b3c013-d300-468d-ac64-7eda0820b6d3";
 process.env.ENTRA_OIDC_CLIENT_ID = "16686705-c414-45c4-bd29-94fd67c128bd";
 process.env.ENTRA_OIDC_CLIENT_AUTH_METHOD = "client_secret";
@@ -62,6 +63,64 @@ test("dual-provider login offers Entra and email with provider-bound authorizati
   assert.equal(providerFrom(email), "email");
 });
 
+test("the Portal allowlist rejects an unlisted email even when the broker issues a valid token", async () => {
+  const login = await fetch(`${base}/auth/login/email`, { redirect: "manual" });
+  const authorize = new URL(login.headers.get("location") ?? "");
+  const state = authorize.searchParams.get("state") ?? "";
+  const nonce = authorize.searchParams.get("nonce") ?? "";
+  const tmp = /portal_oidc_tmp=([^;]+)/.exec(login.headers.get("set-cookie") ?? "")?.[1] ?? "";
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const publicJwk = { ...(await exportJWK(publicKey)), kid: "email-key", alg: "EdDSA", use: "sig" };
+  const idToken = await new SignJWT({ nonce })
+    .setProtectedHeader({ alg: "EdDSA", kid: "email-key" })
+    .setIssuer("https://slack.com")
+    .setAudience("qm-portal")
+    .setSubject("unlisted-email-subject")
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(privateKey);
+  const originalFetch = globalThis.fetch;
+  const claimed = new Set<string>();
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+    if (url.origin === new URL(base).origin) return originalFetch(input, init);
+    if (url.pathname === "/v1/auth/broker/claim") {
+      const ids = (JSON.parse(String(init?.body)) as { ids: string[] }).ids;
+      const first = ids.find((id) => !claimed.has(id));
+      if (first) claimed.add(first);
+      return new Response(JSON.stringify({ claimed: first ?? null }), { status: 200 });
+    }
+    if (url.pathname === "/api/openid.connect.token") {
+      return new Response(JSON.stringify({ access_token: "EMAIL_AT", id_token: idToken }), { status: 200 });
+    }
+    if (url.pathname === "/openid/connect/keys") {
+      return new Response(JSON.stringify({ keys: [publicJwk] }), { status: 200 });
+    }
+    if (url.pathname === "/api/openid.connect.userInfo") {
+      return new Response(
+        JSON.stringify({
+          sub: "unlisted-email-subject",
+          email: "intruder@example.com",
+          email_verified: true,
+        }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    const response = await fetch(`${base}/auth/callback?code=EMAIL_CODE&state=${encodeURIComponent(state)}`, {
+      headers: { cookie: `portal_oidc_tmp=${tmp}` },
+      redirect: "manual",
+    });
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /account is not on the permitted email list/);
+    assert.doesNotMatch(response.headers.get("set-cookie") ?? "", /portal_session=/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("environment-configured Entra callback exchanges and verifies tokens with the selected client auth mode", async () => {
   const login = await fetch(`${base}/auth/login/entra`, { redirect: "manual" });
   const authorize = new URL(login.headers.get("location") ?? "");
@@ -70,25 +129,34 @@ test("environment-configured Entra callback exchanges and verifies tokens with t
   const tmp = /portal_oidc_tmp=([^;]+)/.exec(login.headers.get("set-cookie") ?? "")?.[1] ?? "";
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicJwk = { ...(await exportJWK(publicKey)), kid: "entra-key", alg: "EdDSA", use: "sig" };
-  const idToken = await new SignJWT({
-    nonce,
-    tid: "16b3c013-d300-468d-ac64-7eda0820b6d3",
-    oid: "a67c5962-20f5-42c8-8384-c00000000000",
-    email: "Entra.User@Example.com",
-  })
-    .setProtectedHeader({ alg: "EdDSA", kid: "entra-key" })
-    .setIssuer("https://login.microsoftonline.com/16b3c013-d300-468d-ac64-7eda0820b6d3/v2.0")
-    .setAudience("16686705-c414-45c4-bd29-94fd67c128bd")
-    .setSubject("entra-subject")
-    .setIssuedAt()
-    .setExpirationTime("5m")
-    .sign(privateKey);
+  const signIdToken = (tokenNonce: string) =>
+    new SignJWT({
+      nonce: tokenNonce,
+      tid: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+      oid: "a67c5962-20f5-42c8-8384-c00000000000",
+      email: "Entra.User@Example.com",
+      email_verified: true,
+    })
+      .setProtectedHeader({ alg: "EdDSA", kid: "entra-key" })
+      .setIssuer("https://login.microsoftonline.com/16b3c013-d300-468d-ac64-7eda0820b6d3/v2.0")
+      .setAudience("16686705-c414-45c4-bd29-94fd67c128bd")
+      .setSubject("entra-subject")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(privateKey);
+  let idToken = await signIdToken(nonce);
   const originalFetch = globalThis.fetch;
   const claimed = new Set<string>();
   let tokenAuthorization = "";
   let tokenBody = "";
   let profileIdentity = "";
   let profileAttempts = 0;
+  let profileFails = false;
+  const principalId = "entra:16b3c013-d300-468d-ac64-7eda0820b6d3:a67c5962-20f5-42c8-8384-c00000000000";
+  const profiles = new Map([[principalId, { displayName: "old@example.com", aliases: [] as string[] }]]);
+  const personalScopes = new Set([`personal:${principalId}`]);
+  const projectMembers = new Set([principalId]);
+  const adminGrants = new Set([principalId]);
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
     if (url.origin === new URL(base).origin) return originalFetch(input, init);
@@ -101,11 +169,13 @@ test("environment-configured Entra callback exchanges and verifies tokens with t
     if (url.pathname === "/v1/principal-profile") {
       profileAttempts++;
       profileIdentity = (init?.headers as Record<string, string>)["x-portal-identity"] ?? "";
-      if (profileAttempts === 1) {
-        return new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
-        });
-      }
+      if (profileFails) return new Response(JSON.stringify({ ok: false }), { status: 503 });
+      const profile = JSON.parse(String(init?.body)) as { principalId: string; displayName: string };
+      const existing = profiles.get(profile.principalId);
+      profiles.set(profile.principalId, {
+        displayName: profile.displayName,
+        aliases: existing && existing.displayName !== profile.displayName ? [existing.displayName] : [],
+      });
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }
     if (url.pathname.endsWith("/oauth2/v2.0/token")) {
@@ -122,13 +192,11 @@ test("environment-configured Entra callback exchanges and verifies tokens with t
     throw new Error(`unexpected fetch ${url}`);
   }) as typeof fetch;
   try {
-    const callbackStartedAt = Date.now();
     const response = await fetch(`${base}/auth/callback?code=ENTRA_CODE&state=${encodeURIComponent(state)}`, {
       headers: { cookie: `portal_oidc_tmp=${tmp}` },
       redirect: "manual",
     });
     assert.equal(response.status, 302);
-    assert.ok(Date.now() - callbackStartedAt < 1_000, "a stalled profile write must not stall Entra login");
     assert.equal(
       tokenAuthorization,
       `Basic ${Buffer.from("16686705-c414-45c4-bd29-94fd67c128bd:rotated-entra-secret-value").toString("base64")}`,
@@ -137,16 +205,34 @@ test("environment-configured Entra callback exchanges and verifies tokens with t
     assert.equal(body.get("client_assertion"), null);
     assert.equal(body.get("client_assertion_type"), null);
     const session = /portal_session=([^;]+)/.exec(response.headers.get("set-cookie") ?? "")?.[1] ?? "";
-    assert.equal(
-      open(decodeURIComponent(session), sessionKey)?.sub,
-      "entra:16b3c013-d300-468d-ac64-7eda0820b6d3:a67c5962-20f5-42c8-8384-c00000000000",
+    assert.equal(open(decodeURIComponent(session), sessionKey)?.sub, principalId);
+    assert.equal(verifyPortalIdentity(profileIdentity, "multi-provider-identity-secret", Date.now())?.p, principalId);
+    assert.equal(profileAttempts, 1);
+    assert.deepEqual(
+      [...profiles],
+      [[principalId, { displayName: "entra.user@example.com", aliases: ["old@example.com"] }]],
     );
-    assert.equal(
-      verifyPortalIdentity(profileIdentity, "multi-provider-identity-secret", Date.now())?.p,
-      "entra:16b3c013-d300-468d-ac64-7eda0820b6d3:a67c5962-20f5-42c8-8384-c00000000000",
+    assert.deepEqual([...personalScopes], [`personal:${principalId}`]);
+    assert.deepEqual([...projectMembers], [principalId]);
+    assert.deepEqual([...adminGrants], [principalId]);
+
+    const failedLogin = await fetch(`${base}/auth/login/entra`, { redirect: "manual" });
+    const failedAuthorize = new URL(failedLogin.headers.get("location") ?? "");
+    const failedState = failedAuthorize.searchParams.get("state") ?? "";
+    const failedNonce = failedAuthorize.searchParams.get("nonce") ?? "";
+    const failedTmp = /portal_oidc_tmp=([^;]+)/.exec(failedLogin.headers.get("set-cookie") ?? "")?.[1] ?? "";
+    idToken = await signIdToken(failedNonce);
+    profileFails = true;
+    const failedCallback = await fetch(
+      `${base}/auth/callback?code=ENTRA_CODE&state=${encodeURIComponent(failedState)}`,
+      {
+        headers: { cookie: `portal_oidc_tmp=${failedTmp}` },
+        redirect: "manual",
+      },
     );
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.equal(profileAttempts, 2, "a transient profile failure is retried without blocking login");
+    assert.equal(failedCallback.status, 400);
+    assert.match(await failedCallback.text(), /principal profile registration failed: HTTP 503/);
+    assert.doesNotMatch(failedCallback.headers.get("set-cookie") ?? "", /portal_session=/);
   } finally {
     globalThis.fetch = originalFetch;
   }

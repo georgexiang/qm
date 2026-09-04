@@ -277,6 +277,7 @@ test("/v1/admin/directory: org_admin resolves a name or id to candidates; empty 
     memory: built.memory,
     auditLog: built.auditLog,
     directory: built.directory,
+    identity: built.identity,
   });
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -285,6 +286,9 @@ test("/v1/admin/directory: org_admin resolves a name or id to candidates; empty 
       { principalId: "dana@example.com", displayName: "Dana Example", type: "internal" },
       { principalId: "jane@example.com", displayName: "Jane Doe", type: "internal" },
     ]);
+    const entraPrincipal = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+    await built.identity.upsertProfile(entraPrincipal, "old@example.com", 100);
+    await built.identity.upsertProfile(entraPrincipal, "alex@example.com", 200);
 
     const r = await fetch(`${base}/v1/admin/directory?q=${encodeURIComponent("dana")}`, {
       headers: { "x-admin-actor": "admin-alice@default-org" },
@@ -304,6 +308,25 @@ test("/v1/admin/directory: org_admin resolves a name or id to candidates; empty 
     assert.deepEqual(((await onboarded.json()) as any).members, [
       { principalId: "new@example.com", displayName: "new@example.com" },
     ]);
+
+    const entra = await fetch(`${base}/v1/admin/directory?q=${encodeURIComponent("old@example.com")}`, {
+      headers: { "x-admin-actor": "admin-alice@default-org" },
+    });
+    assert.equal(entra.status, 200);
+    assert.deepEqual(((await entra.json()) as any).members, [
+      { principalId: entraPrincipal, displayName: "alex@example.com" },
+    ]);
+
+    await built.directory.replace([
+      { principalId: "dana@example.com", displayName: "Dana Example", type: "internal" },
+      { principalId: "old@example.com", displayName: "Former Entra User", type: "internal" },
+    ]);
+    await built.identity.deactivate(entraPrincipal);
+    const deactivatedAlias = await fetch(`${base}/v1/admin/directory?q=${encodeURIComponent("old@example.com")}`, {
+      headers: { "x-admin-actor": "admin-alice@default-org" },
+    });
+    assert.equal(deactivatedAlias.status, 200);
+    assert.deepEqual(((await deactivatedAlias.json()) as any).members, []);
 
     const empty = await fetch(`${base}/v1/admin/directory`, {
       headers: { "x-admin-actor": "admin-alice@default-org" },

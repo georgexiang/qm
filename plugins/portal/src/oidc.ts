@@ -141,6 +141,7 @@ export async function verifyIdToken(
     requiredClaims: ["sub", "iat", "exp", "nonce"],
     clockTolerance: 5,
   });
+  if (typeof payload.sub !== "string" || !payload.sub) throw new Error("ID token subject is invalid");
   if (payload.nonce !== nonce) throw new Error("nonce mismatch");
   const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
   if (
@@ -173,7 +174,9 @@ export function resolveEntraEmail(
   claims: Record<string, unknown>,
   userinfo: Record<string, unknown>,
 ): string | undefined {
-  for (const candidate of [userinfo.email, claims.email, userinfo.preferred_username, claims.preferred_username]) {
+  for (const source of [userinfo, claims]) {
+    if (source.email_verified !== true && source.email_verified !== "true") continue;
+    const candidate = source.email;
     if (typeof candidate !== "string") continue;
     const email = candidate.trim().toLowerCase();
     if (email.length <= 320 && /^[^\s@]+@[^\s@]+$/.test(email) && !email.includes("#ext#")) return email;

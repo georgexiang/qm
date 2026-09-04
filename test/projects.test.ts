@@ -21,6 +21,7 @@ import {
   createMembershipControlsScope,
 } from "../src/resolution/scope-membership.ts";
 import { buildApp } from "../src/wiring.ts";
+import { personalScope } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
 test("ProjectStore atomically maintains a managed-group roster", async () => {
@@ -648,7 +649,29 @@ test("a verified Entra profile can join a Project and is labeled by email", asyn
   );
 });
 
-test("a Project canonicalizes an email directory alias to the stable Entra principal", async () => {
+test("an existing Entra principal keeps one identity, Personal Scope, Project membership, and admin grant", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-entra-upgrade-")) }));
+  const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  await built.identity.upsertProfile(principalId, "old@example.com", 100);
+  const project = await built.app.createProject("owner", "Upgrade Identity");
+  assert.ok(project);
+  assert.equal((await built.app.addProjectMember(project.id, "owner", principalId)).status, "ok");
+  await built.admin.createGrant(
+    { id: "admin-alice", type: "internal" },
+    { principalId, role: "org_admin", scopeId: "org:default-org" },
+  );
+  const scopeBeforeLogin = personalScope(principalId);
+
+  await built.identity.upsertProfile(principalId, "alex@example.com", 200);
+
+  assert.equal(personalScope(principalId), scopeBeforeLogin);
+  assert.equal((await built.identity.profiles()).filter((profile) => profile.principalId === principalId).length, 1);
+  assert.ok((await built.projects.get(project.id))?.memberIds.includes(principalId));
+  assert.ok((await built.admin.listGrants()).some((grant) => grant.principalId === principalId));
+});
+
+test("a Project requires the stable Entra principal instead of an email alias", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-profile-alias-")) }));
   await built.app.upsertDirectory([
     { principalId: "owner", displayName: "Owner", type: "internal" },
@@ -659,16 +682,9 @@ test("a Project canonicalizes an email directory alias to the stable Entra princ
   const project = await built.app.createProject("owner", "Profile Alias");
   assert.ok(project);
   const added = await built.app.addProjectMember(project.id, "owner", "alex@example.com");
-  assert.equal(added.status, "ok");
-  if (added.status !== "ok") return;
-  assert.deepEqual(
-    added.project.members.find((member) => member.principalId === principalId),
-    { principalId, displayName: "alex@example.com" },
-  );
-  assert.equal(
-    added.project.members.some((member) => member.principalId === "alex@example.com"),
-    false,
-  );
+  assert.equal(added.status, "invalid_member");
+  assert.equal((await built.app.addProjectMember(project.id, "owner", principalId)).status, "ok");
+  assert.deepEqual((await built.projects.get(project.id))?.memberIds, ["owner", principalId]);
 });
 
 test("a deactivated Entra profile cannot join a Project", async () => {

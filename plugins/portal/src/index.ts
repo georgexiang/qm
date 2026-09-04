@@ -795,9 +795,14 @@ async function coreImpersonate(
   }
 }
 
-async function registerPrincipalProfile(principalId: string, displayName: string, timeoutMs = 2_000): Promise<void> {
+async function registerPrincipalProfile(
+  principalId: string,
+  displayName: string,
+  observedAt: number,
+  timeoutMs = 2_000,
+): Promise<void> {
   const path = withSourceAuthNonce("/v1/principal-profile", CORE_SIGNING_SECRET);
-  const body = JSON.stringify({ principalId, displayName });
+  const body = JSON.stringify({ principalId, displayName, observedAt });
   const r = await fetch(`${CORE}${path}`, {
     method: "POST",
     headers: {
@@ -815,26 +820,6 @@ async function registerPrincipalProfile(principalId: string, displayName: string
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!r.ok) throw new Error(`principal profile registration failed: HTTP ${r.status}`);
-}
-
-async function registerPrincipalProfileWithRetry(principalId: string, displayName: string): Promise<void> {
-  try {
-    await registerPrincipalProfile(principalId, displayName, 250);
-  } catch {
-    void (async () => {
-      for (const delayMs of [250, 1_000]) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        try {
-          await registerPrincipalProfile(principalId, displayName);
-          return;
-        } catch (error) {
-          if (delayMs === 1_000) {
-            console.error("[portal] principal profile registration failed:", errMessage(error));
-          }
-        }
-      }
-    })();
-  }
 }
 
 function isOAuthPublicPassthrough(method: string, pathname: string): boolean {
@@ -1319,7 +1304,10 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     if (provider.entraTenantId) {
       sub = resolveEntraPrincipal(provider.entraTenantId, claims);
       const email = resolveEntraEmail(claims, info);
-      if (email) await registerPrincipalProfileWithRetry(sub, email);
+      if (email) {
+        const observedAt = typeof claims.iat === "number" ? claims.iat * 1_000 : Date.now();
+        await registerPrincipalProfile(sub, email, observedAt);
+      }
     } else {
       sub = resolvePrincipal(provider.principalRule!, { sub: infoSub, claims, userinfo: info });
     }

@@ -18,7 +18,12 @@ export interface DeactivationRecord {
 export interface PrincipalProfile {
   principalId: string;
   displayName: string;
+  aliases?: string[];
   updatedAt: number;
+}
+
+export function principalProfileNames(profile: PrincipalProfile): string[] {
+  return [...new Set([profile.displayName, ...(profile.aliases ?? [])].map((value) => value.trim()).filter(Boolean))];
 }
 
 interface DirectorySyncOutcome {
@@ -32,7 +37,7 @@ export interface IdentityService extends IdentityProvider {
   deactivate(externalId: string, source?: DeactivationSource): Promise<void>;
   reactivate(externalId: string): Promise<void>;
   recordDirectorySync(removedIds: string[], presentIds: string[]): Promise<DirectorySyncOutcome>;
-  upsertProfile(principalId: string, displayName: string): Promise<PrincipalProfile>;
+  upsertProfile(principalId: string, displayName: string, observedAt?: number): Promise<PrincipalProfile>;
   profile(principalId: string): Promise<PrincipalProfile | null>;
   profiles(): Promise<PrincipalProfile[]>;
   hydrate(): Promise<void>;
@@ -94,9 +99,33 @@ export function createIdentityService(
       }
       return outcome;
     },
-    async upsertProfile(principalId, displayName) {
-      const profile = { principalId, displayName, updatedAt: Date.now() };
-      await profileStore.put(personKey(principalId), profile);
+    async upsertProfile(principalId, displayName, observedAt = Date.now()) {
+      const key = personKey(principalId);
+      const nextName = displayName.trim();
+      const nextObservedAt = Number.isFinite(observedAt) ? observedAt : Date.now();
+      const initial: PrincipalProfile = { principalId, displayName: nextName, aliases: [], updatedAt: nextObservedAt };
+      await profileStore.putIfAbsent(key, initial);
+      const mergeProfile = (current: PrincipalProfile): PrincipalProfile => {
+        const isCurrent = nextObservedAt >= current.updatedAt;
+        const primaryName = isCurrent ? nextName : current.displayName;
+        const aliases = [
+          ...new Set(
+            [...principalProfileNames(current), nextName].filter(
+              (value) => personKey(value) !== personKey(primaryName),
+            ),
+          ),
+        ];
+        return {
+          principalId: current.principalId,
+          displayName: primaryName,
+          aliases,
+          updatedAt: isCurrent ? nextObservedAt : current.updatedAt,
+        };
+      };
+      if (profileStore.update) return (await profileStore.update(key, mergeProfile)) ?? initial;
+      const current = (await profileStore.get(key)) ?? initial;
+      const profile = mergeProfile(current);
+      await profileStore.put(key, profile);
       return profile;
     },
     profile(principalId) {

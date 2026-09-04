@@ -203,6 +203,43 @@ test("verifyIdToken requires a valid signature, issuer, audience, subject, nonce
   const tamperedSignature = `${signature?.startsWith("A") ? "B" : "A"}${signature?.slice(1)}`;
   await assert.rejects(verifyIdToken(provider, `${header}.${payload}.${tamperedSignature}`, "N", fetchJwks));
   await assert.rejects(verifyIdToken(provider, signed, "wrong", fetchJwks), /nonce/);
+  const signVariant = async (options: {
+    issuer?: string | false;
+    audience?: string | false;
+    subject?: string | false;
+    issuedAt?: number | false;
+    expirationTime?: number | false;
+    notBefore?: number;
+  }) => {
+    let token = new SignJWT({ nonce: "N" }).setProtectedHeader({ alg: "EdDSA", kid: "key-1" });
+    if (options.issuer !== false) token = token.setIssuer(options.issuer ?? "https://idp.example.test");
+    if (options.audience !== false) token = token.setAudience(options.audience ?? "client-1");
+    if (options.subject !== false) token = token.setSubject(options.subject ?? "subject-1");
+    if (options.issuedAt !== false) token = token.setIssuedAt(options.issuedAt);
+    if (options.expirationTime !== false) token = token.setExpirationTime(options.expirationTime ?? "5m");
+    if (options.notBefore !== undefined) token = token.setNotBefore(options.notBefore);
+    return token.sign(privateKey);
+  };
+  await assert.rejects(
+    verifyIdToken(provider, await signVariant({ issuer: "https://evil.example.test" }), "N", fetchJwks),
+  );
+  await assert.rejects(verifyIdToken(provider, await signVariant({ audience: "other-client" }), "N", fetchJwks));
+  await assert.rejects(verifyIdToken(provider, await signVariant({ subject: false }), "N", fetchJwks));
+  const numericSubject = await new SignJWT({ nonce: "N", sub: 123 as unknown as string })
+    .setProtectedHeader({ alg: "EdDSA", kid: "key-1" })
+    .setIssuer("https://idp.example.test")
+    .setAudience("client-1")
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(privateKey);
+  await assert.rejects(verifyIdToken(provider, numericSubject, "N", fetchJwks), /subject/);
+  await assert.rejects(verifyIdToken(provider, await signVariant({ issuedAt: false }), "N", fetchJwks));
+  await assert.rejects(verifyIdToken(provider, await signVariant({ expirationTime: false }), "N", fetchJwks));
+  const now = Math.floor(Date.now() / 1_000);
+  await assert.rejects(
+    verifyIdToken(provider, await signVariant({ issuedAt: now - 600, expirationTime: now - 300 }), "N", fetchJwks),
+  );
+  await assert.rejects(verifyIdToken(provider, await signVariant({ notBefore: now + 60 }), "N", fetchJwks));
 });
 
 test("resolvePrincipal claim=sub returns the subject untouched", () => {
@@ -232,18 +269,10 @@ test("resolveEntraPrincipal binds identity to the verified tenant and object ids
   );
 });
 
-test("resolveEntraEmail prefers a normal email and ignores an Entra guest UPN", () => {
-  assert.equal(
-    resolveEntraEmail(
-      { email: "Guest@Example.com", preferred_username: "guest_example.com#EXT#@tenant.onmicrosoft.com" },
-      {},
-    ),
-    "guest@example.com",
-  );
-  assert.equal(
-    resolveEntraEmail({ preferred_username: "guest_example.com#EXT#@tenant.onmicrosoft.com" }, {}),
-    undefined,
-  );
+test("resolveEntraEmail accepts only explicitly verified email claims", () => {
+  assert.equal(resolveEntraEmail({ email: "Guest@Example.com", email_verified: true }, {}), "guest@example.com");
+  assert.equal(resolveEntraEmail({ email: "unverified@example.com" }, {}), undefined);
+  assert.equal(resolveEntraEmail({ preferred_username: "user@example.com", email_verified: true }, {}), undefined);
 });
 
 test("resolvePrincipal claim=email returns the verified email, normalized", () => {

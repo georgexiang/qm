@@ -1,6 +1,7 @@
 import type { PrincipalType } from "../../types.ts";
 import { MAX_CANDIDATES, normDirectoryQuery, type DirectoryMember } from "../../directory/directory-store.ts";
 import { personKey } from "../../directory/person.ts";
+import { principalProfileNames } from "../../identity/identity-service.ts";
 import { sendJson } from "../http.ts";
 import { audit, isObj, orgScope } from "./shared.ts";
 import { type ApiCtx, type Route } from "./route.ts";
@@ -127,13 +128,14 @@ async function pushDirectory(ctx: ApiCtx): Promise<void> {
 async function upsertPrincipalProfile(ctx: ApiCtx): Promise<void> {
   const { res, deps, body } = ctx;
   if (!deps.identity) return sendJson(res, 404, { error: "not_found" });
-  const b = body as { principalId?: unknown; displayName?: unknown };
+  const b = body as { principalId?: unknown; displayName?: unknown; observedAt?: unknown };
   const principalId = typeof b.principalId === "string" ? b.principalId.trim() : "";
   const displayName = typeof b.displayName === "string" ? b.displayName.trim() : "";
+  const observedAt = typeof b.observedAt === "number" && Number.isFinite(b.observedAt) ? b.observedAt : undefined;
   if (!principalId || !displayName || principalId.length > 500 || displayName.length > 320) {
     return sendJson(res, 400, { error: "bad_request", message: "principalId and displayName required" });
   }
-  await deps.identity.upsertProfile(principalId, displayName);
+  await deps.identity.upsertProfile(principalId, displayName, observedAt);
   audit(deps, {
     principalId,
     action: "principal.profile.upsert",
@@ -170,10 +172,12 @@ async function resolveDirectory(ctx: ApiCtx): Promise<void> {
       type: "internal",
     });
     const canonicalDirectoryMatches = directoryMatches.flatMap((member) => {
-      const aliases = profiles.filter(
-        (profile) =>
-          personKey(profile.displayName) === personKey(member.principalId) ||
-          normDirectoryQuery(profile.displayName) === normDirectoryQuery(member.displayName),
+      const aliases = profiles.filter((profile) =>
+        principalProfileNames(profile).some(
+          (name) =>
+            personKey(name) === personKey(member.principalId) ||
+            normDirectoryQuery(name) === normDirectoryQuery(member.displayName),
+        ),
       );
       if (!aliases.length) return [member];
       return aliases
@@ -181,15 +185,19 @@ async function resolveDirectory(ctx: ApiCtx): Promise<void> {
         .map(profileMember);
     });
     const exactProfiles = activeProfiles.filter(
-      (profile) => personKey(profile.principalId) === personKey(q) || normDirectoryQuery(profile.displayName) === query,
+      (profile) =>
+        personKey(profile.principalId) === personKey(q) ||
+        principalProfileNames(profile).some((name) => normDirectoryQuery(name) === query),
     );
     const prefixProfiles = activeProfiles.filter((profile) =>
-      normDirectoryQuery(profile.displayName).startsWith(query),
+      principalProfileNames(profile).some((name) => normDirectoryQuery(name).startsWith(query)),
     );
     let profileMatches = exactProfiles;
     if (!profileMatches.length) profileMatches = prefixProfiles;
     if (!profileMatches.length) {
-      profileMatches = activeProfiles.filter((profile) => normDirectoryQuery(profile.displayName).includes(query));
+      profileMatches = activeProfiles.filter((profile) =>
+        principalProfileNames(profile).some((name) => normDirectoryQuery(name).includes(query)),
+      );
     }
     const profileMembers = profileMatches.map(profileMember);
     if (exactProfiles.length) {
