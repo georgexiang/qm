@@ -68,6 +68,12 @@ test("production and unauthenticated-core escape hatch are parsed once", () => {
   assert.throws(() => loadConfig({ ALLOW_UNAUTHENTICATED_CORE: "sometimes" }), /not a recognized boolean/);
 });
 
+test("QM_CORE_CONTAINER configures only the local sandbox", () => {
+  const config = loadConfig({ QM_CORE_CONTAINER: "qm-agentops-core" });
+  assert.equal(config.localSandbox.coreContainer, "qm-agentops-core");
+  assert.equal((config.awsSandbox as unknown as Record<string, unknown>).coreContainer, undefined);
+});
+
 test("harness security posture defaults to auto and validates named modes", () => {
   assert.equal(loadConfig({}).securityPosture, "auto");
   assert.equal(loadConfig({}).securityScreenBackend, "model");
