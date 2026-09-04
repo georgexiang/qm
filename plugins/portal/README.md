@@ -132,6 +132,7 @@ Non-secret (`[env]`): `PORT` (8097 local / 8080 image), `PORTAL_PUBLIC_URL`, `CO
 `CORE_ORG_ID`, `WEB_UI_UPSTREAM`, `ADMIN_UPSTREAM`,
 `OIDC_AUTH_ENDPOINT` / `OIDC_TOKEN_ENDPOINT` / `OIDC_USERINFO_ENDPOINT` / `OIDC_ISSUER` /
 `OIDC_JWKS_URI` / `OIDC_SCOPES` / `OIDC_CLIENT_ID`, `PORTAL_EXPECTED_TEAM_ID`,
+`ENTRA_OIDC_TENANT_ID` / `ENTRA_OIDC_CLIENT_ID` / `ENTRA_OIDC_CLIENT_AUTH_METHOD`,
 `PORTAL_SESSION_TTL_S`, `PORTAL_SESSION_MAX_TTL_S`. `PORTAL_SESSION_MAX_TTL_S` caps a session's total life from authentication; it defaults to the larger of one day and `PORTAL_SESSION_TTL_S`, and boot fails if it is set below the TTL.
 There is no `PORTAL_ADMIN_PRINCIPALS` — admin
 access is derived from the core (see the security model above).
@@ -154,7 +155,8 @@ The OIDC client is generic, so Google is pure config. One-time setup:
    `https://<portal-host>/auth/callback`. On the consent screen choose **Internal** (members
    of the Workspace only).
 2. Point the portal at Google:
-   ```
+
+   ```bash
    OIDC_AUTH_ENDPOINT=https://accounts.google.com/o/oauth2/v2/auth
    OIDC_TOKEN_ENDPOINT=https://oauth2.googleapis.com/token
    OIDC_USERINFO_ENDPOINT=https://openidconnect.googleapis.com/v1/userinfo
@@ -164,7 +166,9 @@ The OIDC client is generic, so Google is pure config. One-time setup:
    OIDC_CLIENT_ID=<client id>
    OIDC_ALLOWED_EMAIL_DOMAIN=<org domain, e.g. example.com>
    ```
+
    (unset `PORTAL_EXPECTED_TEAM_ID` — it's a Slack-OIDC concept).
+
 3. The Slack plugin keys on emails by default too (bot scope `users:read.email`, already in the
    repo manifest — reinstall the app if it predates the scope), so Slack turns and web logins
    resolve to the same principal.
@@ -174,6 +178,10 @@ The OIDC client is generic, so Google is pure config. One-time setup:
 
 Secrets: `OIDC_CLIENT_SECRET`, `PORTAL_SESSION_SECRET`, and `PORTAL_IDENTITY_SECRET`; each must be
 distinct from `CORE_SIGNING_SECRET`.
+Dual-provider deployments use `ENTRA_OIDC_CLIENT_AUTH_METHOD=client_secret` by default and require
+`ENTRA_OIDC_CLIENT_SECRET`. Certificate-bound authentication requires the explicit
+`ENTRA_OIDC_CLIENT_AUTH_METHOD=private_key_jwt` mode and `ENTRA_OIDC_CLIENT_ASSERTION_JWK` instead.
+Credentials for the inactive mode are ignored.
 
 ## Run / test
 

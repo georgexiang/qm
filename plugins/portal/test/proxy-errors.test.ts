@@ -7,8 +7,20 @@ import { verifyPortalIdentity } from "../../chassis/src/portal-identity.ts";
 
 let whoamiMode: "ok" | "down" | "fail-once" | "malformed" = "ok";
 let whoamiRequests = 0;
+const claimedIds = new Set<string>();
 
 const upstream = createServer((req: IncomingMessage, res) => {
+  if ((req.url ?? "").startsWith("/v1/auth/broker/claim")) {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    return void req.on("end", () => {
+      const ids = (JSON.parse(body) as { ids: string[] }).ids;
+      const claimed = ids.find((id) => !claimedIds.has(id));
+      if (claimed) claimedIds.add(claimed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ claimed: claimed ?? null }));
+    });
+  }
   if (req.url === "/api/whoami") {
     whoamiRequests++;
     if (whoamiMode === "down" || (whoamiMode === "fail-once" && whoamiRequests === 1)) {
@@ -50,7 +62,7 @@ process.env.WEB_UI_UPSTREAM = upstreamUrl;
 process.env.ADMIN_UPSTREAM = upstreamUrl;
 process.env.CORE_API_URL = upstreamUrl;
 
-const { server, consumeState, consumedStates } = await import("../src/index.ts");
+const { server, consumeState } = await import("../src/index.ts");
 const { deriveKey, seal } = await import("../src/session.ts");
 await new Promise<void>((r) => server.listen(0, r));
 const port = (server.address() as AddressInfo).port;
@@ -166,20 +178,9 @@ test("a malformed admin verdict fails readiness instead of being cached as non-a
   whoamiMode = "ok";
 });
 
-test("consumeState: single-use, TTL-bounded, never wholesale-wiped", () => {
-  assert.equal(consumeState("state-a"), true);
-  assert.equal(consumeState("state-a"), false, "a consumed state cannot be replayed");
-  const exp = consumedStates.get("state-a");
-  assert.ok(
-    exp !== undefined && exp <= Date.now() + 600_000,
-    `replay is gated on the cookie's own wall clock (exp=${exp})`,
-  );
-  const remaining = consumedStates.getRemainingTTL("state-a");
-  assert.ok(
-    remaining > 0 && remaining <= 1_200_000,
-    `consumed state must lapse after its tmp cookie is dead (ttl=${remaining})`,
-  );
-  assert.equal(consumeState("state-b"), true);
-  for (let i = 0; i < 5000; i++) consumeState(`flood-${i}`);
-  assert.equal(consumeState("state-b"), false, "a live state survives a flood of other states");
+test("consumeState: single-use through the durable core claim store", async () => {
+  assert.equal(await consumeState("state-a"), true);
+  assert.equal(await consumeState("state-a"), false, "a consumed state cannot be replayed");
+  assert.equal(await consumeState("state-b"), true);
+  assert.equal(await consumeState("state-b"), false, "independent live states remain consumed");
 });

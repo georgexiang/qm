@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createPrivateKey, type JsonWebKey } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { LRUCache } from "lru-cache";
 import {
@@ -22,6 +23,8 @@ import {
   buildAuthorizeUrl,
   exchangeCode,
   fetchUserinfo,
+  resolveEntraEmail,
+  resolveEntraPrincipal,
   resolvePrincipal,
   verifyIdToken,
   type OidcConfig,
@@ -38,7 +41,7 @@ import {
   FORWARD_WEBHOOK_HEADERS,
 } from "./proxy.ts";
 import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
-import { coreClaimStore, withinRateLimit, ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
+import { claimOnce, coreClaimStore, withinRateLimit, ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
 import { json, escapeHtml, serveEmojiFavicon } from "../../chassis/src/http.ts";
@@ -52,6 +55,7 @@ import {
 
 const PORT = portFromEnv(8097);
 const PUBLIC_URL = (process.env.PORTAL_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
+const BRAND_NAME = process.env.PORTAL_BRAND_NAME?.trim() || "QM";
 const SESSION_SECRET = process.env.PORTAL_SESSION_SECRET;
 const SESSION_TTL_S = Number(process.env.PORTAL_SESSION_TTL_S ?? 28800);
 const SESSION_MAX_TTL_S = Number(process.env.PORTAL_SESSION_MAX_TTL_S ?? Math.max(86400, SESSION_TTL_S));
@@ -146,6 +150,44 @@ const OIDC: OidcConfig = {
 };
 const OIDC_JWKS_CONFIGURED = Boolean(process.env.OIDC_JWKS_URI?.trim());
 
+interface OidcProvider {
+  config: OidcConfig;
+  principalRule?: PrincipalRule;
+  entraTenantId?: string;
+}
+
+const ENTRA_TENANT_ID = process.env.ENTRA_OIDC_TENANT_ID?.trim() ?? "";
+const ENTRA_CLIENT_ID = process.env.ENTRA_OIDC_CLIENT_ID?.trim() ?? "";
+const ENTRA_CLIENT_SECRET = process.env.ENTRA_OIDC_CLIENT_SECRET?.trim() ?? "";
+const ENTRA_ASSERTION_JWK = process.env.ENTRA_OIDC_CLIENT_ASSERTION_JWK?.trim() ?? "";
+const ENTRA_CLIENT_AUTH_METHOD = process.env.ENTRA_OIDC_CLIENT_AUTH_METHOD?.trim() || "client_secret";
+const ENTRA_CONFIG_REQUESTED = Boolean(
+  ENTRA_TENANT_ID ||
+  ENTRA_CLIENT_ID ||
+  ENTRA_CLIENT_SECRET ||
+  ENTRA_ASSERTION_JWK ||
+  process.env.ENTRA_OIDC_CLIENT_AUTH_METHOD,
+);
+const ENTRA_PROVIDER: OidcProvider | undefined =
+  ENTRA_TENANT_ID && ENTRA_CLIENT_ID
+    ? {
+        config: {
+          authEndpoint: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/authorize`,
+          tokenEndpoint: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/token`,
+          userinfoEndpoint: "https://graph.microsoft.com/oidc/userinfo",
+          clientId: ENTRA_CLIENT_ID,
+          clientSecret: ENTRA_CLIENT_SECRET,
+          clientAuthMethod: ENTRA_CLIENT_AUTH_METHOD as OidcConfig["clientAuthMethod"],
+          ...(ENTRA_CLIENT_AUTH_METHOD === "private_key_jwt" ? { clientAssertionJwk: ENTRA_ASSERTION_JWK } : {}),
+          scopes: "openid profile email",
+          redirectUri: `${PUBLIC_URL}/auth/callback`,
+          issuer: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/v2.0`,
+          jwksUri: `https://login.microsoftonline.com/${ENTRA_TENANT_ID}/discovery/v2.0/keys`,
+        },
+        entraTenantId: ENTRA_TENANT_ID,
+      }
+    : undefined;
+
 const AUTH_BROKER_UPSTREAM = (process.env.AUTH_BROKER_UPSTREAM ?? "").replace(/\/$/, "");
 const AUTH_BROKER_PREFIX = (process.env.AUTH_BROKER_PREFIX ?? "/idp").replace(/\/$/, "");
 const BROKER_PUBLIC_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
@@ -187,6 +229,13 @@ const PRINCIPAL_RULE: PrincipalRule = {
     .filter(Boolean),
 };
 
+function oidcProvider(id: string | undefined): OidcProvider | undefined {
+  if (id === undefined || id === "default") return { config: OIDC, principalRule: PRINCIPAL_RULE };
+  if (id === "email") return { config: OIDC, principalRule: PRINCIPAL_RULE };
+  if (id === "entra") return ENTRA_PROVIDER;
+  return undefined;
+}
+
 const DEV_SECRET = "dev-only-insecure-portal-session-secret";
 const sessionKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.session.v1");
 const tmpKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.tmp.v1");
@@ -195,14 +244,12 @@ const IMPERSONATE_TTL_S = Number(process.env.PORTAL_IMPERSONATE_TTL_S ?? 3600);
 
 const TMP_TTL_S = 600;
 const LOCAL_LOGOUT_COOKIE = "portal_local_logout";
-const CONSUMED_STATES_MAX = 10_000;
-export const consumedStates = new LRUCache<string, number>({ max: CONSUMED_STATES_MAX, ttl: 2 * TMP_TTL_S * 1000 });
-export function consumeState(state: string): boolean {
-  const now = Date.now();
-  const existing = consumedStates.get(state);
-  if (existing !== undefined && existing > now) return false;
-  consumedStates.set(state, now + TMP_TTL_S * 1000);
-  return true;
+const TMP_COOKIE = SECURE_COOKIES ? "__Host-portal_oidc_tmp" : "portal_oidc_tmp";
+const TMP_COOKIE_PATH = SECURE_COOKIES ? "/" : "/auth";
+const oidcClaims = coreClaimStore(CORE, CORE_SIGNING_SECRET, "portal");
+
+export function consumeState(state: string, expiresAtMs = Date.now() + TMP_TTL_S * 1000): Promise<boolean> {
+  return claimOnce(oidcClaims, `portal-state:${state}`, expiresAtMs);
 }
 
 const ADMIN_TTL_MS = 60_000;
@@ -346,7 +393,7 @@ export function isPrivateNetworkUrl(raw: string): boolean {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "localhost" || host.endsWith(".localhost") || host === "auth") return true;
   if (host.endsWith(".internal") || host.endsWith(".flycast") || host.endsWith(".local")) return true;
   if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
   if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
@@ -488,6 +535,19 @@ export function signInErrorHtml(detail: string): string {
     actions: `<a class="btn primary" href="/auth/login">Try signing in again</a>
         <a class="btn ghost" href="/">Back to start</a>`,
     help: "Still stuck? Make sure you're a member of the approved workspace, then contact your admin.",
+  });
+}
+
+function signInChoiceHtml(returnTo: string): string {
+  const query = `?returnTo=${encodeURIComponent(returnTo)}`;
+  return cardPage({
+    title: "Sign in",
+    heading: `Sign in to ${BRAND_NAME}`,
+    msg: "Use your organization account. The email link is reserved for emergency administrator access.",
+    icon: LOCK_ICON,
+    actions: `<a class="btn primary" href="/auth/login/entra${query}">Continue with Microsoft Entra ID</a>
+        <a class="btn ghost" href="/auth/login/email${query}">Administrator email link</a>`,
+    help: "Access is limited to people assigned to this application.",
   });
 }
 
@@ -735,6 +795,48 @@ async function coreImpersonate(
   }
 }
 
+async function registerPrincipalProfile(principalId: string, displayName: string, timeoutMs = 2_000): Promise<void> {
+  const path = withSourceAuthNonce("/v1/principal-profile", CORE_SIGNING_SECRET);
+  const body = JSON.stringify({ principalId, displayName });
+  const r = await fetch(`${CORE}${path}`, {
+    method: "POST",
+    headers: {
+      ...signedHeaders(CORE_SIGNING_SECRET, "POST", path, body),
+      ...(PORTAL_IDENTITY_SECRET
+        ? {
+            [PORTAL_IDENTITY_HEADER]: mintPortalIdentity(
+              { p: principalId, exp: Date.now() + 60_000 },
+              PORTAL_IDENTITY_SECRET,
+            ),
+          }
+        : {}),
+    },
+    body,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!r.ok) throw new Error(`principal profile registration failed: HTTP ${r.status}`);
+}
+
+async function registerPrincipalProfileWithRetry(principalId: string, displayName: string): Promise<void> {
+  try {
+    await registerPrincipalProfile(principalId, displayName, 250);
+  } catch {
+    void (async () => {
+      for (const delayMs of [250, 1_000]) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        try {
+          await registerPrincipalProfile(principalId, displayName);
+          return;
+        } catch (error) {
+          if (delayMs === 1_000) {
+            console.error("[portal] principal profile registration failed:", errMessage(error));
+          }
+        }
+      }
+    })();
+  }
+}
+
 function isOAuthPublicPassthrough(method: string, pathname: string): boolean {
   if (method !== "GET") return false;
   if (/^\/v1\/connectors\/oauth\/[^/]+\/callback$/.test(pathname)) return true;
@@ -881,14 +983,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return serveEmojiFavicon(res, process.env.PORTAL_FAVICON_EMOJI ?? "\u{1F3F4}\u{200D}\u2620\uFE0F", "max-age=86400");
   }
 
-  if (pathname === "/auth/login" && method === "GET") return authLogin(req, res, url);
+  if (pathname === "/auth/login" && method === "GET") {
+    const returnTo = sanitizeReturnTo(url.searchParams.get("returnTo"), PUBLIC_URL, APPS_DOMAIN);
+    if (ENTRA_PROVIDER) return sendHtml(res, 200, signInChoiceHtml(returnTo));
+    return authLogin(req, res, url);
+  }
+  if (pathname === "/auth/login/email" && method === "GET") return authLogin(req, res, url, "email");
+  if (pathname === "/auth/login/entra" && method === "GET") return authLogin(req, res, url, "entra");
   if (pathname === "/auth/callback" && method === "GET") return authCallback(req, res, url);
   if (pathname === "/auth/logout" && method === "POST") {
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
     setSession(res, [
       clearCookie("portal_session", "/", SECURE_COOKIES, COOKIE_DOMAIN),
       ...(COOKIE_DOMAIN ? [clearCookie("portal_session", "/", SECURE_COOKIES)] : []),
-      clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
+      clearCookie(TMP_COOKIE, TMP_COOKIE_PATH, SECURE_COOKIES),
       ...(LOCAL_AUTH_BYPASS && isLoopbackAddress(req.socket.remoteAddress)
         ? [setCookie(LOCAL_LOGOUT_COOKIE, "1", { path: "/", maxAge: SESSION_TTL_S, secure: SECURE_COOKIES })]
         : []),
@@ -1135,59 +1243,86 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   });
 }
 
-function authLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
+function authLogin(req: IncomingMessage, res: ServerResponse, url: URL, providerId?: string): void {
   const returnTo = sanitizeReturnTo(url.searchParams.get("returnTo"), PUBLIC_URL, APPS_DOMAIN);
   const localSession = localDevSession(req, Date.now(), true);
   if (localSession) {
     setSession(res, [
       ...sessionCookieSet(seal(localSession, sessionKey)),
-      clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
+      clearCookie(TMP_COOKIE, TMP_COOKIE_PATH, SECURE_COOKIES),
       clearCookie(LOCAL_LOGOUT_COOKIE, "/", SECURE_COOKIES),
     ]);
     res.writeHead(302, { location: returnTo, "cache-control": "no-store" });
     return void res.end();
   }
+  const provider = oidcProvider(providerId);
+  if (!provider) return sendHtml(res, 404, signInErrorHtml("identity provider is not configured"));
   const state = randomToken();
   const nonce = randomToken();
   const { verifier, challenge } = pkcePair();
   const now = Math.floor(Date.now() / 1000);
-  const tmp: TmpClaims = { k: "tmp", state, nonce, pkceVerifier: verifier, returnTo, iat: now, exp: now + TMP_TTL_S };
+  const tmp: TmpClaims = {
+    k: "tmp",
+    ...(providerId ? { provider: providerId } : {}),
+    state,
+    nonce,
+    pkceVerifier: verifier,
+    returnTo,
+    iat: now,
+    exp: now + TMP_TTL_S,
+  };
   setSession(res, [
-    setCookie("portal_oidc_tmp", seal(tmp, tmpKey), { path: "/auth", maxAge: TMP_TTL_S, secure: SECURE_COOKIES }),
+    setCookie(TMP_COOKIE, seal(tmp, tmpKey), {
+      path: TMP_COOKIE_PATH,
+      maxAge: TMP_TTL_S,
+      secure: SECURE_COOKIES,
+    }),
   ]);
-  res.writeHead(302, { location: buildAuthorizeUrl(OIDC, { state, nonce, challenge }), "cache-control": "no-store" });
+  res.writeHead(302, {
+    location: buildAuthorizeUrl(provider.config, { state, nonce, challenge }),
+    "cache-control": "no-store",
+  });
   res.end();
 }
 
 async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const fail = (detail: string): void => {
-    setSession(res, [clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES)]);
+    setSession(res, [clearCookie(TMP_COOKIE, TMP_COOKIE_PATH, SECURE_COOKIES)]);
     sendHtml(res, 400, signInErrorHtml(detail));
   };
 
-  if (url.searchParams.get("error")) return fail(`identity provider returned: ${url.searchParams.get("error") ?? ""}`);
   const code = url.searchParams.get("code") ?? "";
   const stateParam = url.searchParams.get("state") ?? "";
 
-  const tmp = openTmp(readCookie(req.headers.cookie, "portal_oidc_tmp"), tmpKey, Date.now());
+  const tmp = openTmp(readCookie(req.headers.cookie, TMP_COOKIE), tmpKey, Date.now());
   if (!tmp) return fail("login session expired — please try again");
-  if (!code || !stateParam || !safeEqual(stateParam, tmp.state)) return fail("invalid login state");
-  if (!consumeState(tmp.state)) return fail("login already used — please try again");
+  if (!stateParam || !safeEqual(stateParam, tmp.state)) return fail("invalid login state");
+  if (!(await consumeState(tmp.state, tmp.exp * 1000))) return fail("login already used — please try again");
+  if (url.searchParams.get("error")) return fail(`identity provider returned: ${url.searchParams.get("error") ?? ""}`);
+  if (!code) return fail("invalid login state");
 
   let sub: string;
   let name = "";
+  const provider = oidcProvider(tmp.provider);
+  if (!provider) return fail("identity provider is not configured");
   try {
-    const { accessToken, idToken } = await exchangeCode(OIDC, { code, codeVerifier: tmp.pkceVerifier });
-    const claims = await verifyIdToken(OIDC, idToken, tmp.nonce);
-    if (OIDC.expectedTeamId) {
+    const { accessToken, idToken } = await exchangeCode(provider.config, { code, codeVerifier: tmp.pkceVerifier });
+    const claims = await verifyIdToken(provider.config, idToken, tmp.nonce);
+    if (provider.config.expectedTeamId) {
       const team = claims["https://slack.com/team_id"];
-      if (team !== OIDC.expectedTeamId) throw new Error("workspace not permitted");
+      if (team !== provider.config.expectedTeamId) throw new Error("workspace not permitted");
     }
-    const info = await fetchUserinfo(OIDC, accessToken);
+    const info = await fetchUserinfo(provider.config, accessToken);
     const infoSub = typeof info.sub === "string" ? info.sub : "";
     if (!infoSub) throw new Error("userinfo missing sub");
     if (typeof claims.sub === "string" && claims.sub !== infoSub) throw new Error("subject mismatch");
-    sub = resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info });
+    if (provider.entraTenantId) {
+      sub = resolveEntraPrincipal(provider.entraTenantId, claims);
+      const email = resolveEntraEmail(claims, info);
+      if (email) await registerPrincipalProfileWithRetry(sub, email);
+    } else {
+      sub = resolvePrincipal(provider.principalRule!, { sub: infoSub, claims, userinfo: info });
+    }
     const rawName = info.name ?? claims.name;
     if (typeof rawName === "string") name = rawName.trim().slice(0, 200);
   } catch (e) {
@@ -1200,13 +1335,14 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     sub,
     org: ORG,
     auth: now,
+    ...(tmp.provider ? { idp: tmp.provider } : {}),
     iat: now,
     exp: now + SESSION_TTL_S,
     ...(name ? { name } : {}),
   };
   setSession(res, [
     ...sessionCookieSet(seal(session, sessionKey)),
-    clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
+    clearCookie(TMP_COOKIE, TMP_COOKIE_PATH, SECURE_COOKIES),
   ]);
   res.writeHead(302, {
     location: sanitizeReturnTo(tmp.returnTo, PUBLIC_URL, APPS_DOMAIN),
@@ -1278,6 +1414,39 @@ export function bootChecks(): void {
   }
   if ((PRINCIPAL_RULE.allowedEmailDomain || PRINCIPAL_RULE.allowedEmails?.length) && PRINCIPAL_RULE.claim !== "email") {
     problems.push("OIDC_ALLOWED_EMAIL_DOMAIN and OIDC_ALLOWED_EMAILS require OIDC_PRINCIPAL_CLAIM=email");
+  }
+  if (ENTRA_CONFIG_REQUESTED) {
+    if (!uuid(ENTRA_TENANT_ID)) problems.push("ENTRA_OIDC_TENANT_ID must be a non-placeholder GUID");
+    if (!uuid(ENTRA_CLIENT_ID)) problems.push("ENTRA_OIDC_CLIENT_ID must be a non-placeholder GUID");
+    if (ENTRA_CLIENT_AUTH_METHOD !== "client_secret" && ENTRA_CLIENT_AUTH_METHOD !== "private_key_jwt") {
+      problems.push('ENTRA_OIDC_CLIENT_AUTH_METHOD must be "client_secret" or "private_key_jwt"');
+    }
+    if (ENTRA_CLIENT_AUTH_METHOD === "client_secret" && isMissingOrPlaceholder(ENTRA_CLIENT_SECRET)) {
+      problems.push(
+        "ENTRA_OIDC_CLIENT_SECRET is required and may not be a placeholder when ENTRA_OIDC_CLIENT_AUTH_METHOD is client_secret",
+      );
+    }
+    if (ENTRA_CLIENT_AUTH_METHOD === "private_key_jwt" && !ENTRA_ASSERTION_JWK) {
+      problems.push(
+        "ENTRA_OIDC_CLIENT_ASSERTION_JWK is required when ENTRA_OIDC_CLIENT_AUTH_METHOD is private_key_jwt",
+      );
+    }
+    if (ENTRA_CLIENT_AUTH_METHOD === "private_key_jwt" && ENTRA_ASSERTION_JWK) {
+      try {
+        const jwk = JSON.parse(ENTRA_ASSERTION_JWK) as JsonWebKey & Record<string, unknown>;
+        const thumbprint = jwk["x5t#S256"];
+        if (jwk.kty !== "RSA" || typeof jwk.d !== "string" || typeof thumbprint !== "string") throw new Error();
+        if (!/^[A-Za-z0-9_-]{43}$/.test(thumbprint)) throw new Error();
+        createPrivateKey({ key: jwk, format: "jwk" });
+      } catch {
+        problems.push('ENTRA_OIDC_CLIENT_ASSERTION_JWK must be an RSA private JWK with "x5t#S256"');
+      }
+    }
+    if (AUTH_BROKER_UPSTREAM && (PRINCIPAL_RULE.allowedEmailDomain || !PRINCIPAL_RULE.allowedEmails?.length)) {
+      problems.push(
+        "Entra dual-provider mode requires OIDC_ALLOWED_EMAILS with explicit emergency administrators; OIDC_ALLOWED_EMAIL_DOMAIN is not permitted",
+      );
+    }
   }
   if (IS_PROD) {
     if (isMissingOrPlaceholder(SESSION_SECRET))
@@ -1365,6 +1534,10 @@ function validEmailDomain(value: string): boolean {
     .every(
       (label) => label.length > 0 && label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label),
     );
+}
+
+function uuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 export function startServer(): void {

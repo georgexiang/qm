@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { exportJWK, SignJWT } from "jose";
+import { decodeJwt, decodeProtectedHeader, exportJWK, SignJWT } from "jose";
 import {
   pkcePair,
   buildAuthorizeUrl,
   exchangeCode,
   fetchUserinfo,
+  resolveEntraEmail,
+  resolveEntraPrincipal,
   resolvePrincipal,
   verifyIdToken,
   type OidcConfig,
@@ -68,6 +70,60 @@ test("exchangeCode posts client_secret_basic + PKCE verifier and parses the toke
   assert.equal(body.get("code"), "CODE");
   assert.equal(body.get("code_verifier"), "VER");
   assert.equal(body.get("redirect_uri"), cfg.redirectUri);
+});
+
+test("exchangeCode uses a PS256 private_key_jwt client assertion when configured", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const privateJwk = { ...(await exportJWK(privateKey)), "x5t#S256": "certificate-thumbprint" };
+  let seen: RequestInit = {};
+  const stub = (async (_url: string | URL | Request, init?: RequestInit) => {
+    seen = init ?? {};
+    return new Response(JSON.stringify({ access_token: "AT", id_token: jwt({ sub: "U1" }) }), { status: 200 });
+  }) as typeof fetch;
+
+  await exchangeCode(
+    { ...cfg, clientAuthMethod: "private_key_jwt", clientAssertionJwk: JSON.stringify(privateJwk) },
+    { code: "CODE", codeVerifier: "VER" },
+    stub,
+  );
+
+  const headers = seen.headers as Record<string, string>;
+  assert.equal(headers.authorization, undefined);
+  const body = new URLSearchParams(String(seen.body));
+  assert.equal(body.get("client_id"), cfg.clientId);
+  assert.equal(body.get("client_assertion_type"), "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+  const assertion = body.get("client_assertion") ?? "";
+  assert.deepEqual(decodeProtectedHeader(assertion), {
+    alg: "PS256",
+    typ: "JWT",
+    "x5t#S256": "certificate-thumbprint",
+  });
+  const claims = decodeJwt(assertion);
+  assert.equal(claims.iss, cfg.clientId);
+  assert.equal(claims.sub, cfg.clientId);
+  assert.equal(claims.aud, cfg.tokenEndpoint);
+  assert.ok(claims.jti);
+  assert.equal(claims.exp! - claims.iat!, 300);
+});
+
+test("exchangeCode keeps client_secret authoritative when a dormant JWK is also configured", async () => {
+  let seen: RequestInit = {};
+  const stub = (async (_url: string | URL | Request, init?: RequestInit) => {
+    seen = init ?? {};
+    return new Response(JSON.stringify({ access_token: "AT", id_token: jwt({ sub: "U1" }) }), { status: 200 });
+  }) as typeof fetch;
+
+  await exchangeCode(
+    { ...cfg, clientAuthMethod: "client_secret", clientAssertionJwk: "not-even-json" },
+    { code: "CODE", codeVerifier: "VER" },
+    stub,
+  );
+
+  const headers = seen.headers as Record<string, string>;
+  assert.equal(headers.authorization, `Basic ${Buffer.from("123.456:shh").toString("base64")}`);
+  const body = new URLSearchParams(String(seen.body));
+  assert.equal(body.get("client_assertion"), null);
+  assert.equal(body.get("client_assertion_type"), null);
 });
 
 test("exchangeCode treats Slack's 200 {ok:false} as an error", async () => {
@@ -151,6 +207,43 @@ test("verifyIdToken requires a valid signature, issuer, audience, subject, nonce
 
 test("resolvePrincipal claim=sub returns the subject untouched", () => {
   assert.equal(resolvePrincipal({ claim: "sub" }, { sub: "U1", claims: {}, userinfo: { email: "a@b.com" } }), "U1");
+});
+
+test("resolveEntraPrincipal binds identity to the verified tenant and object ids", () => {
+  assert.equal(
+    resolveEntraPrincipal("16B3C013-D300-468D-AC64-7EDA0820B6D3", {
+      tid: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+      oid: "A67C5962-20F5-42C8-8384-C00000000000",
+    }),
+    "entra:16b3c013-d300-468d-ac64-7eda0820b6d3:a67c5962-20f5-42c8-8384-c00000000000",
+  );
+  assert.throws(
+    () =>
+      resolveEntraPrincipal("16b3c013-d300-468d-ac64-7eda0820b6d3", {
+        tid: "72f988bf-86f1-41af-91ab-2d7cd011db47",
+        oid: "a67c5962-20f5-42c8-8384-c00000000000",
+      }),
+    /tenant is not permitted/,
+  );
+  assert.throws(
+    () =>
+      resolveEntraPrincipal("16b3c013-d300-468d-ac64-7eda0820b6d3", { tid: "16b3c013-d300-468d-ac64-7eda0820b6d3" }),
+    /object id/,
+  );
+});
+
+test("resolveEntraEmail prefers a normal email and ignores an Entra guest UPN", () => {
+  assert.equal(
+    resolveEntraEmail(
+      { email: "Guest@Example.com", preferred_username: "guest_example.com#EXT#@tenant.onmicrosoft.com" },
+      {},
+    ),
+    "guest@example.com",
+  );
+  assert.equal(
+    resolveEntraEmail({ preferred_username: "guest_example.com#EXT#@tenant.onmicrosoft.com" }, {}),
+    undefined,
+  );
 });
 
 test("resolvePrincipal claim=email returns the verified email, normalized", () => {

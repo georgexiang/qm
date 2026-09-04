@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from "jose";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createRemoteJWKSet, customFetch, importJWK, jwtVerify, SignJWT, type JWK, type JWTPayload } from "jose";
 
 type FetchLike = typeof fetch;
 
@@ -9,6 +9,8 @@ export interface OidcConfig {
   userinfoEndpoint: string;
   clientId: string;
   clientSecret: string;
+  clientAssertionJwk?: string;
+  clientAuthMethod?: "client_secret" | "private_key_jwt";
   scopes: string;
   redirectUri: string;
   issuer: string;
@@ -40,6 +42,31 @@ export interface TokenResponse {
   idToken: string | null;
 }
 
+async function clientAssertion(cfg: OidcConfig): Promise<string> {
+  let jwk: JWK;
+  try {
+    jwk = JSON.parse(cfg.clientAssertionJwk ?? "") as JWK;
+  } catch {
+    throw new Error("OIDC client assertion JWK is not valid JSON");
+  }
+  const thumbprint = jwk["x5t#S256"];
+  if (jwk.kty !== "RSA" || typeof thumbprint !== "string" || !thumbprint) {
+    throw new Error('OIDC client assertion JWK must be an RSA private JWK with "x5t#S256"');
+  }
+  const key = await importJWK(jwk, "PS256");
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "PS256", typ: "JWT", "x5t#S256": thumbprint })
+    .setIssuer(cfg.clientId)
+    .setSubject(cfg.clientId)
+    .setAudience(cfg.tokenEndpoint)
+    .setJti(randomUUID())
+    .setIssuedAt(now)
+    .setNotBefore(now)
+    .setExpirationTime(now + 300)
+    .sign(key);
+}
+
 export async function exchangeCode(
   cfg: OidcConfig,
   args: { code: string; codeVerifier: string },
@@ -51,14 +78,20 @@ export async function exchangeCode(
     redirect_uri: cfg.redirectUri,
     code_verifier: args.codeVerifier,
   });
-  const basic = Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString("base64");
+  const headers: Record<string, string> = {
+    "content-type": "application/x-www-form-urlencoded",
+    accept: "application/json",
+  };
+  if (cfg.clientAuthMethod === "private_key_jwt") {
+    body.set("client_id", cfg.clientId);
+    body.set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+    body.set("client_assertion", await clientAssertion(cfg));
+  } else {
+    headers.authorization = `Basic ${Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString("base64")}`;
+  }
   const r = await fetchImpl(cfg.tokenEndpoint, {
     method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      authorization: `Basic ${basic}`,
-      accept: "application/json",
-    },
+    headers,
     body: body.toString(),
   });
   const json = await readJson(r, "token endpoint");
@@ -123,6 +156,29 @@ export interface PrincipalRule {
   claim: "sub" | "email";
   allowedEmailDomain?: string;
   allowedEmails?: readonly string[];
+}
+
+export function resolveEntraPrincipal(expectedTenantId: string, claims: Record<string, unknown>): string {
+  const tenantId = typeof claims.tid === "string" ? claims.tid.toLowerCase() : "";
+  const objectId = typeof claims.oid === "string" ? claims.oid.toLowerCase() : "";
+  if (!expectedTenantId || tenantId !== expectedTenantId.toLowerCase())
+    throw new Error("Entra tenant is not permitted");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(objectId)) {
+    throw new Error("Entra token is missing a valid object id");
+  }
+  return `entra:${tenantId}:${objectId}`;
+}
+
+export function resolveEntraEmail(
+  claims: Record<string, unknown>,
+  userinfo: Record<string, unknown>,
+): string | undefined {
+  for (const candidate of [userinfo.email, claims.email, userinfo.preferred_username, claims.preferred_username]) {
+    if (typeof candidate !== "string") continue;
+    const email = candidate.trim().toLowerCase();
+    if (email.length <= 320 && /^[^\s@]+@[^\s@]+$/.test(email) && !email.includes("#ext#")) return email;
+  }
+  return undefined;
 }
 
 export function resolvePrincipal(

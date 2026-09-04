@@ -128,6 +128,164 @@ test("production boot requires an explicit JWKS URI for custom issuers", () => {
   assert.equal(accepted.status, 0, accepted.stderr);
 });
 
+test("production boot requires a complete Entra client credential configuration", () => {
+  const command = "import('./src/index.ts').then(m => m.bootChecks())";
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_ENV: "production",
+    PORTAL_PUBLIC_URL: "https://agent.example.com",
+    PORTAL_SESSION_SECRET: "portal-session-secret",
+    CORE_SIGNING_SECRET: "core-signing-secret",
+    OIDC_CLIENT_ID: "client-id",
+    OIDC_CLIENT_SECRET: "client-secret",
+    OIDC_ALLOWED_EMAILS: "admin@example.com",
+  };
+  const boot = (env: NodeJS.ProcessEnv) =>
+    spawnSync(process.execPath, ["--input-type=module", "-e", command], {
+      cwd: process.cwd(),
+      env,
+      encoding: "utf8",
+    });
+  const partial = boot({ ...baseEnv, ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3" });
+  assert.notEqual(partial.status, 0);
+  assert.match(partial.stderr, /ENTRA_OIDC_CLIENT_ID/);
+  assert.match(partial.stderr, /ENTRA_OIDC_CLIENT_SECRET is required/);
+
+  const accepted = boot({
+    ...baseEnv,
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+  });
+  assert.equal(accepted.status, 0, accepted.stderr);
+
+  const domainOnly = { ...baseEnv };
+  delete domainOnly.OIDC_ALLOWED_EMAILS;
+  const externalProviderDomain = boot({
+    ...domainOnly,
+    OIDC_ALLOWED_EMAIL_DOMAIN: "example.com",
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+  });
+  assert.equal(externalProviderDomain.status, 0, externalProviderDomain.stderr);
+
+  const unsafeEmergencyDomain = boot({
+    ...domainOnly,
+    OIDC_ALLOWED_EMAIL_DOMAIN: "example.com",
+    OIDC_ISSUER: "https://agent.example.com/idp",
+    OIDC_AUTH_ENDPOINT: "https://agent.example.com/idp/authorize",
+    OIDC_TOKEN_ENDPOINT: "http://auth.internal:8080/token",
+    OIDC_USERINFO_ENDPOINT: "http://auth.internal:8080/userinfo",
+    OIDC_JWKS_URI: "http://auth.internal:8080/.well-known/jwks.json",
+    AUTH_BROKER_UPSTREAM: "http://auth.internal:8080",
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+  });
+  assert.notEqual(unsafeEmergencyDomain.status, 0);
+  assert.match(unsafeEmergencyDomain.stderr, /requires OIDC_ALLOWED_EMAILS with explicit emergency administrators/);
+
+  const unsafeEmergencyDomainWithAllowlist = boot({
+    ...domainOnly,
+    OIDC_ALLOWED_EMAILS: "admin@example.com",
+    OIDC_ALLOWED_EMAIL_DOMAIN: "example.com",
+    OIDC_ISSUER: "https://agent.example.com/idp",
+    OIDC_AUTH_ENDPOINT: "https://agent.example.com/idp/authorize",
+    OIDC_TOKEN_ENDPOINT: "http://auth.internal:8080/token",
+    OIDC_USERINFO_ENDPOINT: "http://auth.internal:8080/userinfo",
+    OIDC_JWKS_URI: "http://auth.internal:8080/.well-known/jwks.json",
+    AUTH_BROKER_UPSTREAM: "http://auth.internal:8080",
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+  });
+  assert.notEqual(unsafeEmergencyDomainWithAllowlist.status, 0);
+  assert.match(
+    unsafeEmergencyDomainWithAllowlist.stderr,
+    /requires OIDC_ALLOWED_EMAILS with explicit emergency administrators/,
+  );
+
+  const placeholderSecret = boot({
+    ...baseEnv,
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "replace-me",
+  });
+  assert.notEqual(placeholderSecret.status, 0);
+  assert.match(placeholderSecret.stderr, /may not be a placeholder/);
+
+  const dormantMalformedJwk = boot({
+    ...baseEnv,
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+    ENTRA_OIDC_CLIENT_ASSERTION_JWK: JSON.stringify({ kty: "RSA", d: "broken", "x5t#S256": "A".repeat(43) }),
+  });
+  assert.equal(dormantMalformedJwk.status, 0, dormantMalformedJwk.stderr);
+
+  const jwkOnlyDefaultsToSecret = boot({
+    ...baseEnv,
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_ASSERTION_JWK: JSON.stringify({ kty: "RSA", d: "broken", "x5t#S256": "A".repeat(43) }),
+  });
+  assert.notEqual(jwkOnlyDefaultsToSecret.status, 0);
+  assert.match(jwkOnlyDefaultsToSecret.stderr, /ENTRA_OIDC_CLIENT_SECRET is required/);
+
+  const badMethod = boot({
+    ...baseEnv,
+    ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+    ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+    ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+    ENTRA_OIDC_CLIENT_AUTH_METHOD: "automatic",
+  });
+  assert.notEqual(badMethod.status, 0);
+  assert.match(badMethod.stderr, /ENTRA_OIDC_CLIENT_AUTH_METHOD/);
+});
+
+test("production OIDC temporary state uses a __Host cookie immune to sibling-domain planting", async () => {
+  const PORT = "18098";
+  const child = spawn(process.execPath, ["src/index.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT,
+      NODE_ENV: "production",
+      PORTAL_PUBLIC_URL: "https://agent.example.com",
+      PORTAL_SESSION_SECRET: "portal-session-secret",
+      CORE_SIGNING_SECRET: "core-signing-secret",
+      OIDC_CLIENT_ID: "client-id",
+      OIDC_CLIENT_SECRET: "client-secret",
+      OIDC_ALLOWED_EMAILS: "admin@example.com",
+      ENTRA_OIDC_TENANT_ID: "16b3c013-d300-468d-ac64-7eda0820b6d3",
+      ENTRA_OIDC_CLIENT_ID: "16686705-c414-45c4-bd29-94fd67c128bd",
+      ENTRA_OIDC_CLIENT_SECRET: "rotated-entra-secret-value",
+    },
+    stdio: "ignore",
+  });
+  try {
+    const deadline = Date.now() + 8000;
+    let response: Response | undefined;
+    while (Date.now() < deadline) {
+      try {
+        response = await fetch(`http://localhost:${PORT}/auth/login/entra`, { redirect: "manual" });
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    }
+    assert.ok(response);
+    const cookie = response.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /^__Host-portal_oidc_tmp=/);
+    assert.match(cookie, /; Path=\//);
+    assert.match(cookie, /; Secure/);
+    assert.doesNotMatch(cookie, /; Domain=/i);
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
 test("a session TTL above the default max ceiling still boots, but a contradictory pair does not", () => {
   const command = "import('./src/index.ts').then(m => m.bootChecks())";
   const baseEnv: NodeJS.ProcessEnv = {

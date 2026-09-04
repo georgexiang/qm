@@ -31,6 +31,7 @@ export interface SessionClaims {
   sub: string;
   org: string;
   name?: string;
+  idp?: string;
   auth?: number;
   anon?: boolean;
   iat: number;
@@ -48,6 +49,7 @@ export interface ImpersonationClaims {
 
 export interface TmpClaims {
   k: "tmp";
+  provider?: string;
   state: string;
   nonce: string;
   pkceVerifier: string;
