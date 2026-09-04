@@ -494,7 +494,7 @@ function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: s
     }
   }
   if (def.docker.hostPortOffset !== undefined) {
-    args.push("-p", `${baseHostPort(ctx) + def.docker.hostPortOffset}:${def.docker.internalPort}`);
+    args.push("-p", `127.0.0.1:${baseHostPort(ctx) + def.docker.hostPortOffset}:${def.docker.internalPort}`);
   }
   args.push(image);
   return { args, cleanup };
