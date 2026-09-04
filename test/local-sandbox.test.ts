@@ -278,9 +278,13 @@ test("concurrent teardown and provision for one scope serialize (no stop of a fr
 
 test("a replacement core reattaches to an already-running sandbox", async () => {
   const fake = installFakeDocker(daemonPort);
+  let healthChecks = 0;
   const fetchImpl: typeof fetch = (input) => {
     const url = typeof input === "string" ? input : input.toString();
-    if (url.endsWith("/health")) return Promise.resolve(new Response("", { status: 200 }));
+    if (url.endsWith("/health")) {
+      healthChecks++;
+      return Promise.resolve(new Response("", { status: 200 }));
+    }
     return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
   };
   const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
@@ -292,8 +296,33 @@ test("a replacement core reattaches to an already-running sandbox", async () => 
   const second = await sb.provision(layers);
   assert.equal(second.id, first.id);
   assert.equal(fake.connections.has(connection), true);
+  assert.equal(healthChecks, 2, "the replacement core waits for the existing sandbox daemon after reconnecting");
   await sb.teardown(first);
   await sb.teardown(second, { destroy: true });
+});
+
+test("a replacement core waits for an already-running scratch sandbox", async () => {
+  const fake = installFakeDocker(daemonPort);
+  let healthChecks = 0;
+  const fetchImpl: typeof fetch = (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/health")) {
+      healthChecks++;
+      return Promise.resolve(new Response("", { status: 200 }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
+  };
+  const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
+  const layers = rw(scopeId("personal", "U39-scratch"));
+  const first = await sb.provision(layers, { scratch: { key: "replacement-core" } });
+  const connection = `${localNetworkName(first.id)}|qm-test-core`;
+  fake.connections.delete(connection);
+  const second = await sb.provision(layers, { scratch: { key: "replacement-core" } });
+  assert.equal(second.id, first.id);
+  assert.equal(fake.connections.has(connection), true);
+  assert.equal(healthChecks, 2, "the replacement core waits for the existing scratch daemon after reconnecting");
+  await sb.teardown(first);
+  await sb.teardown(second);
 });
 
 test("containerized core joins each sandbox network and reaches the daemon by container name", async () => {

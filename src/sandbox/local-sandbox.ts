@@ -295,7 +295,10 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       const state = await containerState(name);
       if (state && state.imageId === imageId) {
         if (!state.running) await startContainer(name);
-        else await connectCore(await ensureNetwork(name));
+        else {
+          await connectCore(await ensureNetwork(name));
+          await waitDaemon(name);
+        }
         activeByContainer.set(name, (activeByContainer.get(name) ?? 0) + 1);
         return { name, coldStart: false };
       }
@@ -320,7 +323,10 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       const state = await containerState(name);
       if (state) {
         if (!state.running) await startContainer(name);
-        else await connectCore(await ensureNetwork(name));
+        else {
+          await connectCore(await ensureNetwork(name));
+          await waitDaemon(name);
+        }
         activeByContainer.set(name, (activeByContainer.get(name) ?? 0) + 1);
         return { name, coldStart: false };
       }
