@@ -25,6 +25,7 @@ const USER_SCOPED: Rule[] = [
   pat("GET", "/v1/contexts", { in: "query", name: "principalId" }),
   pat("GET", "/v1/projects", { in: "query", name: "principalId" }),
   pat("POST", "/v1/projects", { in: "body", name: "principalId" }),
+  pat("POST", "/v1/principal-profile", { in: "body", name: "principalId" }),
   pat("POST", "/v1/projects/:id/members", { in: "body", name: "principalId" }),
   pat("DELETE", "/v1/projects/:id/members/:memberId", { in: "body", name: "principalId" }),
   pat("GET", "/v1/scope-resources", { in: "query", name: "principalId" }),

@@ -39,6 +39,13 @@ test("parseAdminGrants: parses org_admin grants and skips malformed / removed-ro
   assert.deepEqual(parseAdminGrants("", "default-org"), []);
 });
 
+test("parseAdminGrants preserves an Entra tenant and object id principal", () => {
+  const principal = "entra:16b3c013-d300-468d-ac64-7eda0820b6d3:a67c5962-20f5-42c8-8384-c00000000000";
+  assert.deepEqual(parseAdminGrants(`${principal}:org_admin`, "default-org"), [
+    { principalId: principal, scopeId: scopeId("org", "default-org"), role: "org_admin" },
+  ]);
+});
+
 test("ADMIN_GRANTS-seeded admins resolve and authorize org-wide; non-admins do not", async () => {
   const store = createAdminGrantStore(createMemoryAdminGrantPersistence(), {
     seed: parseAdminGrants("U1:org_admin", "default-org"),

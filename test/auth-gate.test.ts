@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
+import { mintSignedPayload } from "../src/auth/signed-token.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -17,6 +18,69 @@ const SECRET = "test-signing-secret".repeat(3);
 test("the normal server refuses to start without source-auth material", () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "auth-required-")) }));
   assert.throws(() => createServer(built.app), /CORE_SIGNING_SECRET must be at least 32 characters/);
+});
+
+test("principal profile registration requires source auth", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "auth-profile-")) }));
+  const portalIdentitySecret = `${SECRET}-portal`;
+  const server = createServer(built.app, {
+    signingSecret: SECRET,
+    identity: built.identity,
+    capabilitySecret: `${SECRET}-capability`,
+    portalIdentitySecret,
+    requireSignedPortalIdentity: true,
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const body = JSON.stringify({
+    principalId: "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222",
+    displayName: "alex@example.com",
+  });
+  try {
+    const unsigned = await fetch(`${base}/v1/principal-profile`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.equal(unsigned.status, 401);
+    const signedPath = "/v1/principal-profile?nonce=source-only";
+    const signed = await fetch(`${base}${signedPath}`, {
+      method: "POST",
+      headers: sign("POST", signedPath, body),
+      body,
+    });
+    assert.equal(signed.status, 401);
+    const wrongPath = "/v1/principal-profile?nonce=wrong-principal";
+    const wrongPrincipal = await fetch(`${base}${wrongPath}`, {
+      method: "POST",
+      headers: {
+        ...sign("POST", wrongPath, body),
+        "x-portal-identity": await mintSignedPayload(
+          { p: "entra:another:principal", exp: Date.now() + 60_000 },
+          portalIdentitySecret,
+        ),
+      },
+      body,
+    });
+    assert.equal(wrongPrincipal.status, 403);
+    const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+    const acceptedPath = "/v1/principal-profile?nonce=accepted";
+    const accepted = await fetch(`${base}${acceptedPath}`, {
+      method: "POST",
+      headers: {
+        ...sign("POST", acceptedPath, body),
+        "x-portal-identity": await mintSignedPayload(
+          { p: principalId, exp: Date.now() + 60_000 },
+          portalIdentitySecret,
+        ),
+      },
+      body,
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal((await built.identity.profiles())[0]?.displayName, "alex@example.com");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 function start(signingSecret?: string): { base: string; close: () => Promise<void> } {

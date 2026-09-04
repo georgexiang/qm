@@ -16,7 +16,7 @@ const USER_CONVERSATIONS_MAX = 100;
 const USER_FILES_MAX = 200;
 
 export async function listUsers(ctx: ApiCtx): Promise<void> {
-  const { res, deps } = ctx;
+  const { res, app, deps } = ctx;
   const scope = orgScope(deps);
   const actor = await authorizeAdmin(ctx, scope);
   if (!actor) return;
@@ -25,7 +25,29 @@ export async function listUsers(ctx: ApiCtx): Promise<void> {
   const turns = (await deps.sessions?.attributedTurns()) ?? [];
   const grants = (await deps.admin?.listGrants()) ?? [];
   const users = computeUsers({ participants, turns, grants });
-  return sendJson(res, 200, { scopeId: scope, users, grants });
+  const [members, profiles] = await Promise.all([
+    app.directoryMembers(),
+    deps.identity?.profiles() ?? Promise.resolve([]),
+  ]);
+  const namesByKey = new Map<string, string>();
+  for (const profile of profiles) {
+    const displayName = profile.displayName.trim();
+    if (displayName) namesByKey.set(personKey(profile.principalId), displayName);
+  }
+  for (const member of members) {
+    const displayName = member.displayName.trim();
+    if (displayName) namesByKey.set(personKey(member.principalId), displayName);
+  }
+  const withDisplayName = <T extends { principalId: string }>(rows: T[]) =>
+    rows.map((row) => {
+      const displayName = namesByKey.get(personKey(row.principalId));
+      return displayName ? { ...row, displayName } : row;
+    });
+  return sendJson(res, 200, {
+    scopeId: scope,
+    users: withDisplayName(users),
+    grants: withDisplayName(grants),
+  });
 }
 
 export async function searchDirectory(ctx: ApiCtx): Promise<void> {
@@ -105,6 +127,7 @@ export async function getUserDetail(ctx: ApiCtx): Promise<void> {
 
   const grants = (await deps.admin?.listGrants()) ?? [];
   const member = await app.directoryMember(principalId);
+  const profile = await deps.identity?.profile(principalId);
 
   const participants = (await deps.sessions?.listParticipants()) ?? [];
   const attributed = (await deps.sessions?.attributedTurns()) ?? [];
@@ -228,7 +251,9 @@ export async function getUserDetail(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, {
     principalId,
     scopeId: personal,
-    ...(member?.displayName ? { displayName: member.displayName } : {}),
+    ...(member?.displayName || profile?.displayName
+      ? { displayName: member?.displayName || profile?.displayName }
+      : {}),
     admin: adminStatusFromGrants(grants, principalId),
     stats: { sessions: mySessionIds.size, turns, firstSeenAt, lastSeenAt },
     conversations,

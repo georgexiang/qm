@@ -631,6 +631,65 @@ test("Project routes use ordinary group sessions with the durable roster as auth
   }
 });
 
+test("a verified Entra profile can join a Project and is labeled by email", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-entra-profile-")) }));
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+  await built.identity.upsertProfile(principalId, "alex@example.com");
+
+  const project = await built.app.createProject("owner", "Profile Members");
+  assert.ok(project);
+  const added = await built.app.addProjectMember(project.id, "owner", principalId);
+  assert.equal(added.status, "ok");
+  if (added.status !== "ok") return;
+  assert.deepEqual(
+    added.project.members.find((member) => member.principalId === principalId),
+    { principalId, displayName: "alex@example.com" },
+  );
+});
+
+test("a Project canonicalizes an email directory alias to the stable Entra principal", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-profile-alias-")) }));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "alex@example.com", displayName: "Alex Example", type: "internal" },
+  ]);
+  const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+  await built.identity.upsertProfile(principalId, "alex@example.com");
+  const project = await built.app.createProject("owner", "Profile Alias");
+  assert.ok(project);
+  const added = await built.app.addProjectMember(project.id, "owner", "alex@example.com");
+  assert.equal(added.status, "ok");
+  if (added.status !== "ok") return;
+  assert.deepEqual(
+    added.project.members.find((member) => member.principalId === principalId),
+    { principalId, displayName: "alex@example.com" },
+  );
+  assert.equal(
+    added.project.members.some((member) => member.principalId === "alex@example.com"),
+    false,
+  );
+});
+
+test("a deactivated Entra profile cannot join a Project", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-inactive-profile-")) }));
+  await built.app.upsertDirectory([{ principalId: "owner", displayName: "Owner", type: "internal" }]);
+  const principalId = "entra:11111111-1111-4111-8111-111111111111:00000000-0000-4000-8000-000000000001";
+  await built.identity.upsertProfile(principalId, "former.user@example.com");
+  await built.identity.deactivate(principalId);
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "former.user@example.com", displayName: "Former User", type: "internal" },
+  ]);
+  const project = await built.app.createProject("owner", "Inactive Profiles");
+  assert.ok(project);
+  assert.equal((await built.app.addProjectMember(project.id, "owner", principalId)).status, "invalid_member");
+  assert.equal(
+    (await built.app.addProjectMember(project.id, "owner", "former.user@example.com")).status,
+    "invalid_member",
+  );
+});
+
 test("a member added mid-turn sees the thread but never the prior roster's output", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-roster-race-")) }));
   await built.app.upsertDirectory([

@@ -322,19 +322,40 @@ export function createSessionMethods(
       const existing = await deps.projects.get(id);
       if (!existing || existing.orgId !== orgIdOf()) return { status: "not_found" };
       const directoryMember = await deps.directory.get(memberId);
-      const principal = deps.identity.classify(memberId);
-      if (!directoryMember || directoryMember.type !== "internal" || !deps.identity.isInternal(principal))
+      let resolvedMemberId = memberId;
+      let profile = await deps.identity.profile(memberId);
+      if (!profile && directoryMember) {
+        const aliases = (await deps.identity.profiles()).filter(
+          (candidate) =>
+            samePerson(candidate.displayName, directoryMember.principalId) ||
+            candidate.displayName.trim().toLowerCase() === directoryMember.displayName.trim().toLowerCase(),
+        );
+        const activeAliases = aliases.filter((candidate) =>
+          deps.identity.isInternal(deps.identity.classify(candidate.principalId)),
+        );
+        if (aliases.length && activeAliases.length !== 1) return { status: "invalid_member" };
+        if (activeAliases.length === 1) {
+          profile = activeAliases[0]!;
+          resolvedMemberId = profile.principalId;
+        }
+      }
+      const principal = deps.identity.classify(resolvedMemberId);
+      if (
+        (!directoryMember && !profile) ||
+        (directoryMember && directoryMember.type !== "internal") ||
+        !deps.identity.isInternal(principal)
+      )
         return { status: "invalid_member" };
-      const result = await deps.projects.addMember(id, principalId, memberId, async ({ project, changed }) => {
+      const result = await deps.projects.addMember(id, principalId, resolvedMemberId, async ({ project, changed }) => {
         if (changed)
           deps.auditLog.record({
             at: Date.now(),
             principalId,
             action: "project.member.add",
-            resource: memberId,
+            resource: resolvedMemberId,
             scopeLabel: projectScopeId(project.id),
           });
-        await reconcileProjectMember(project, memberId, true);
+        await reconcileProjectMember(project, resolvedMemberId, true);
       });
       if (result.status === "ok") {
         return { ...result, project: await projectView(result.project) };

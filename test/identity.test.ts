@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createIdentityService, type DeactivationRecord } from "../src/identity/identity-service.ts";
+import {
+  createIdentityService,
+  type DeactivationRecord,
+  type PrincipalProfile,
+} from "../src/identity/identity-service.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
 const id = createIdentityService();
@@ -80,6 +84,17 @@ test("deactivation is durable: a fresh service over the same backing rehydrates 
   assert.equal(second.classify("U-leaver").type, "internal");
   await second.hydrate();
   assert.equal(second.classify("U-leaver").type, "guest");
+});
+
+test("principal profiles remain readable across service instances", async () => {
+  const profileBacking = createMemoryMap<PrincipalProfile>();
+  const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+  const writer = createIdentityService(undefined, { profileBacking });
+  await writer.upsertProfile(principalId, "alex@example.com");
+
+  const reader = createIdentityService(undefined, { profileBacking });
+  assert.equal((await reader.profile(principalId))?.displayName, "alex@example.com");
+  assert.equal((await reader.profiles())[0]?.principalId, principalId);
 });
 
 test("a running instance refreshes deactivations written by another instance", async () => {

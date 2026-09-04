@@ -24,7 +24,11 @@ describe("GET /v1/directory/resolve (agent looks up a teammate's mention id)", a
 
   before(async () => {
     built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dir-resolve-")), signingSecret: SECRET }));
-    server = createServer(built.app, { signingSecret: SECRET, scheduler: built.scheduler });
+    server = createServer(built.app, {
+      signingSecret: SECRET,
+      scheduler: built.scheduler,
+      identity: built.identity,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
     await built.app.upsertDirectory([
@@ -48,6 +52,44 @@ describe("GET /v1/directory/resolve (agent looks up a teammate's mention id)", a
     assert.equal(matches.length, 1);
     assert.equal(matches[0]!.principalId, "carol@acme.com");
     assert.equal(matches[0]!.slackId, "U0CAROL");
+  });
+
+  it("resolves an Entra profile by email when the Slack directory has no match", async () => {
+    const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+    await built.identity.upsertProfile(principalId, "alex@example.com");
+    const res = await get("/v1/directory/resolve?q=alex%40example.com");
+    assert.equal(res.status, 200);
+    const { matches } = (await res.json()) as {
+      matches: Array<{ principalId: string; displayName: string; type: string; slackId?: string }>;
+    };
+    assert.deepEqual(matches, [{ principalId, displayName: "alex@example.com", type: "internal" }]);
+  });
+
+  it("prefers the stable Entra principal when a Slack row has the same email", async () => {
+    const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+    await built.app.upsertDirectory([
+      { principalId: "alex@example.com", displayName: "Alex Example", type: "internal" },
+    ]);
+    for (const query of ["alex%40example.com", "Alex%20Example", "alex"]) {
+      const res = await get(`/v1/directory/resolve?q=${query}`);
+      assert.equal(res.status, 200);
+      const { matches } = (await res.json()) as { matches: Array<{ principalId: string; displayName: string }> };
+      assert.deepEqual(matches, [{ principalId, displayName: "alex@example.com", type: "internal" }]);
+    }
+  });
+
+  it("does not offer a deactivated Entra profile", async () => {
+    const principalId = "entra:11111111-1111-4111-8111-111111111111:00000000-0000-4000-8000-000000000001";
+    await built.identity.upsertProfile(principalId, "former.user@example.com");
+    await built.identity.deactivate(principalId);
+    await built.app.upsertDirectory([
+      { principalId: "former.user@example.com", displayName: "Former User", type: "internal" },
+    ]);
+    for (const query of ["former.user%40example.com", "Former%20User", "former.user"]) {
+      const res = await get(`/v1/directory/resolve?q=${query}`);
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { matches: [] });
+    }
   });
 
   it("recovers the mention id from the principal id in slack-id identity mode (no slackId field)", async () => {

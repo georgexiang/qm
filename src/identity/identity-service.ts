@@ -15,6 +15,12 @@ export interface DeactivationRecord {
   at: number;
 }
 
+export interface PrincipalProfile {
+  principalId: string;
+  displayName: string;
+  updatedAt: number;
+}
+
 interface DirectorySyncOutcome {
   deactivated: string[];
   reactivated: string[];
@@ -26,15 +32,19 @@ export interface IdentityService extends IdentityProvider {
   deactivate(externalId: string, source?: DeactivationSource): Promise<void>;
   reactivate(externalId: string): Promise<void>;
   recordDirectorySync(removedIds: string[], presentIds: string[]): Promise<DirectorySyncOutcome>;
+  upsertProfile(principalId: string, displayName: string): Promise<PrincipalProfile>;
+  profile(principalId: string): Promise<PrincipalProfile | null>;
+  profiles(): Promise<PrincipalProfile[]>;
   hydrate(): Promise<void>;
   refresh(): Promise<void>;
 }
 
 export function createIdentityService(
   backing?: DurableMap<DeactivationRecord>,
-  opts: { directorySyncProtected?: readonly string[] } = {},
+  opts: { directorySyncProtected?: readonly string[]; profileBacking?: DurableMap<PrincipalProfile> } = {},
 ): IdentityService {
   const store = backing ?? createMemoryMap<DeactivationRecord>();
+  const profileStore = opts.profileBacking ?? createMemoryMap<PrincipalProfile>();
   const deactivated = new Map<string, DeactivationRecord>();
   const directorySyncProtected = new Set((opts.directorySyncProtected ?? []).map(personKey).filter(Boolean));
   const REFRESH_TTL_MS = 10_000;
@@ -83,6 +93,17 @@ export function createIdentityService(
         outcome.reactivated.push(id);
       }
       return outcome;
+    },
+    async upsertProfile(principalId, displayName) {
+      const profile = { principalId, displayName, updatedAt: Date.now() };
+      await profileStore.put(personKey(principalId), profile);
+      return profile;
+    },
+    profile(principalId) {
+      return profileStore.get(personKey(principalId));
+    },
+    profiles() {
+      return profileStore.all();
     },
     hydrate(): Promise<void> {
       if (!hydrateP) {

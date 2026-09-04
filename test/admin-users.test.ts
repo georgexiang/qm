@@ -66,6 +66,8 @@ function start() {
     sessions: built.sessions,
     memory: built.memory,
     auditLog: built.auditLog,
+    directory: built.directory,
+    identity: built.identity,
   });
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -82,6 +84,24 @@ test("/v1/admin/users: org_admin sees the roster + grants; a non-admin is denied
       text: "hello",
     };
     assert.equal((await s.built.app.turn(dm)).status, "ok");
+    const principalId = "entra:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222";
+    const profile = await fetch(`${s.base}/v1/principal-profile`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ principalId, displayName: "alex@example.com" }),
+    });
+    assert.equal(profile.status, 200);
+    assert.equal(
+      (
+        await s.built.app.turn({
+          surface: "test",
+          actor: { externalId: principalId },
+          conversation: { kind: "dm", threadRef: `dm:${principalId}:t1` },
+          text: "hello",
+        })
+      ).status,
+      "ok",
+    );
 
     const r = await fetch(`${s.base}/v1/admin/users`, { headers: { "x-admin-actor": "admin-alice@default-org" } });
     assert.equal(r.status, 200);
@@ -93,6 +113,13 @@ test("/v1/admin/users: org_admin sees the roster + grants; a non-admin is denied
     assert.ok(
       Array.isArray(d.grants) && d.grants.some((g: { principalId: string }) => g.principalId === "admin-alice"),
       "authoritative grants present",
+    );
+    assert.ok(
+      d.users.some(
+        (u: { principalId: string; displayName?: string }) =>
+          u.principalId === principalId && u.displayName === "alex@example.com",
+      ),
+      "the Entra principal keeps its stable id and gains its email display name",
     );
 
     const denied = await fetch(`${s.base}/v1/admin/users`, { headers: { "x-admin-actor": "user-uma@default-org" } });

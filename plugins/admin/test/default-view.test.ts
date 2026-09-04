@@ -21,6 +21,13 @@ test("admin shell defaults bare admin URLs to org history", () => {
   );
 });
 
+test("admin users render email profiles while operations keep stable principal ids", () => {
+  assert.match(html, /matches\(\[u\.displayName \|\| "", u\.principalId,/);
+  assert.match(html, /\{ text: u\.displayName \|\| u\.principalId, cls: "mono" \}/);
+  assert.match(html, /\{ text: g\.displayName \|\| g\.principalId, cls: "mono" \}/);
+  assert.match(html, /openWebUiAs\(u\.principalId\)/);
+});
+
 test("connector setup uses the live catalog and shows exact provider and callback links", () => {
   assert.match(html, /api\("GET", "\/api\/connector-catalog"\)/);
   assert.match(html, /setupGuide\.url/);

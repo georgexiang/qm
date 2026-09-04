@@ -9,7 +9,12 @@ import {
   type Config,
 } from "./config.ts";
 import type { ServerDeps } from "./api/deps.ts";
-import { createIdentityService, type DeactivationRecord, type IdentityService } from "./identity/identity-service.ts";
+import {
+  createIdentityService,
+  type DeactivationRecord,
+  type IdentityService,
+  type PrincipalProfile,
+} from "./identity/identity-service.ts";
 import {
   createMemoryConfigStore,
   type ScopedConfigStore,
@@ -453,6 +458,7 @@ export function buildApp(
   });
   const identity = createIdentityService(artifactMap<DeactivationRecord>("deactivated_principals"), {
     directorySyncProtected: config.emailAuthPrincipals,
+    profileBacking: artifactMap<PrincipalProfile>("principal_profiles"),
   });
   void identity.hydrate();
   const leaderLease: LeaderLease = pgArtifactMap

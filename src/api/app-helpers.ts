@@ -225,9 +225,10 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     const members = await Promise.all(
       memberIds.map(async (principalId) => {
         const member = await deps.directory.get(principalId).catch(() => null);
+        const profile = member ? null : await deps.identity.profile(principalId);
         return {
           principalId,
-          displayName: member?.displayName?.trim() || principalId,
+          displayName: member?.displayName?.trim() || profile?.displayName?.trim() || principalId,
           ...(manual.has(principalId) ? {} : { viaChannel: true }),
         };
       }),

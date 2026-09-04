@@ -329,6 +329,10 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
 });
 
 describe("service-to-service writes are classified", () => {
+  it("principal profile registration is bound to the portal user", () => {
+    assert.equal(isUnclassifiedWrite("POST", "/v1/principal-profile"), false);
+  });
+
   it("every auth:source write route is classified, so production gating cannot demand a portal identity from a plugin", () => {
     const unclassified = authBrokerRoutes
       .filter((route) => "path" in route && route.auth === "source")

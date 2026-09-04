@@ -11225,16 +11225,18 @@
         const matches = (parts) => parts.join(" ").toLowerCase().includes(filterVal.trim().toLowerCase());
         const drawLists = () => {
           lists.textContent = "";
-          const filteredGrants = grants.filter((g) => matches([g.principalId, g.role, g.scopeId, g.grantedBy || ""]));
+          const filteredGrants = grants.filter((g) =>
+            matches([g.displayName || "", g.principalId, g.role, g.scopeId, g.grantedBy || ""]),
+          );
           const filteredUsers = users.filter((u) =>
-            matches([u.principalId, u.admin?.role || "", u.admin?.scopeId || "member"]),
+            matches([u.displayName || "", u.principalId, u.admin?.role || "", u.admin?.scopeId || "member"]),
           );
 
           const admins = actionTable(
             ["Principal", "Role", "Scope", "Granted by", ""],
             filteredGrants,
             (g) => [
-              { text: g.principalId, cls: "mono" },
+              { text: g.displayName || g.principalId, cls: "mono" },
               nodeCell(mutedText(g.role ? labelRole(g.role) : "member")),
               nodeCell(stacked(g.scopeId, scopeKind(g.scopeId)), "mono"),
               g.grantedBy || "-",
@@ -11258,7 +11260,7 @@
             ["Principal", "Role", "Last seen", "Sessions", "Turns", "", ""],
             filteredUsers,
             (u) => [
-              { text: u.principalId, cls: "mono" },
+              { text: u.displayName || u.principalId, cls: "mono" },
               nodeCell(mutedText(u.admin?.isAdmin ? labelRole(u.admin.role) : "member")),
               u.lastSeenAt ? timeCell(u.lastSeenAt) : { text: "-", cls: "num" },
               { text: String(u.sessionCount), cls: "num" },
