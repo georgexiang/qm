@@ -9,11 +9,14 @@ export const NONINTERACTIVE_ENV: ReadonlyArray<readonly [string, string]> = [
   ["AWS_PAGER", ""],
 ];
 
-export function nonInteractiveShellPrefix(): string {
+export function nonInteractiveShellPrefix(env: Record<string, string> = {}): string {
   const exports = NONINTERACTIVE_ENV.map(([name, def]) =>
     def === "" ? `export ${name}="\${${name}-}"` : `export ${name}="\${${name}:-${def}}"`,
   ).join("; ");
-  return `exec </dev/null; ${exports}; `;
+  const overrides = Object.entries(env)
+    .map(([name, value]) => `export ${name}=${shq(value)}`)
+    .join("; ");
+  return `exec </dev/null; ${exports}; ${overrides ? `${overrides}; ` : ""}export PATH="\${HOME:-/root}/.local/bin:\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"; `;
 }
 
 export const DROPPED_PROXY_ENV = new Set([

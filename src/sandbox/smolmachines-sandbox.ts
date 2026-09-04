@@ -515,10 +515,7 @@ export function createSmolmachinesSandbox(workspace: WorkspaceStore, opts: Smolm
 
     async run(handle, command, execOpts?: ExecOptions): Promise<ExecResult> {
       const timeoutSec = execOpts?.timeoutMs ? Math.ceil(execOpts.timeoutMs / 1000) : defaultTimeoutSec;
-      const exports = Object.entries(handle.env ?? {})
-        .map(([k, v]) => `export ${k}=${shq(v)}`)
-        .join("; ");
-      const script = `${nonInteractiveShellPrefix()}${exports ? exports + "; " : ""}cd ${handle.rootDir} 2>/dev/null; ${command}`;
+      const script = `${nonInteractiveShellPrefix(handle.env)}cd ${handle.rootDir} 2>/dev/null; ${command}`;
       const signal = execOpts?.signal;
       if (!signal) return execRaw(handle.id, script, timeoutSec);
       const killUid = randomUUID();
