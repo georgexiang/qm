@@ -24,6 +24,8 @@ Do not run `qm down --purge`, `docker volume rm`, or broad Docker cleanup during
 
 Sandbox commands must:
 
+- Map `QM_CORE_CONTAINER` into `config.localSandbox.coreContainer`.
+- Keep `QM_CORE_CONTAINER` out of AWS sandbox options.
 - Apply explicit per-turn `HOME` and `PATH` values before augmenting command discovery.
 - Prepend the resolved `$HOME/.local/bin` to the resolved `PATH`.
 - Reconnect a replacement Core to an already-running sandbox network.
@@ -35,6 +37,7 @@ The required fixes are present in:
 
 - `1f8724c`: restore persisted CLI command discovery.
 - `0d1c5a9`: wait for the daemon after replacement-Core reconnect.
+- `635d6c8`: map the Core container name into local sandbox runtime options.
 
 ## Authorization Contract
 
@@ -97,6 +100,15 @@ npm run typecheck
 
 The local sandbox suite must cover replacement Core reconnect for both resident and scratch containers. The regression must prove a second daemon health check occurs after reconnecting to an already-running sandbox.
 
+The config suite must prove:
+
+```text
+loadConfig({ QM_CORE_CONTAINER: "qm-agentops-core" }).localSandbox.coreContainer
+  == "qm-agentops-core"
+```
+
+It must also prove that AWS sandbox options do not receive `coreContainer`.
+
 ## Required Production Fault Injection
 
 After replacing Core, keep an existing test sandbox and its home volume. Disconnect only the replacement Core from the sandbox network:
@@ -122,6 +134,14 @@ The release passes only when:
 - The original sandbox container and home volume remain unchanged.
 - Core is connected to the sandbox network after the test.
 - No new `tree_materialize_failed`, `device_flow_restore_failed`, or `resident_auth_probe_failed` event appears.
+
+For a newly created local sandbox, also verify:
+
+- The sandbox does not publish daemon port `8080` to a VM host port.
+- Its dedicated Docker network contains both the sandbox and Core endpoints while the sandbox is active.
+- Core reaches the daemon through the sandbox container name on that network.
+
+If the daemon is published as `127.0.0.1:<random-port>`, stop the release. A containerized Core cannot reach the VM host through its own loopback address.
 
 Park the test sandbox normally after validation. Do not destroy its home volume.
 
