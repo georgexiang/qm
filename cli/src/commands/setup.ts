@@ -90,6 +90,16 @@ const PLAYBOOKS: Readonly<Record<string, readonly string[]>> = {
     "<public-url>/auth/callback as its exact redirect URI, then copy its Client ID.",
   ],
   OIDC_CLIENT_SECRET: ["Only for an external identity provider: the Client Secret of the same OAuth/OIDC client."],
+  ENTRA_OIDC_CLIENT_SECRET: [
+    "The Client Secret Value from the QM Portal Entra app registration.",
+    "Use the Value shown once when the secret is created, not its Secret ID.",
+    "Keep it in the deployment secret store; never commit it or include it in screenshots.",
+  ],
+  ENTRA_OIDC_CLIENT_ASSERTION_JWK: [
+    "The RSA private JWK for a certificate uploaded to the Entra app registration.",
+    'It must include the certificate SHA-256 thumbprint as "x5t#S256".',
+    "Keep the private JWK in the deployment secret store; never commit it.",
+  ],
   PORTAL_EXPECTED_TEAM_ID: [
     "Copy the Slack workspace ID from the workspace About dialog or the team_id",
     "returned after installing the Slack sign-in app.",

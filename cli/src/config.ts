@@ -1,3 +1,4 @@
+import { createPrivateKey, type JsonWebKey } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { CliError, die, errMessage } from "./log.ts";
@@ -879,8 +880,67 @@ function isSlackIssuer(issuer: string): boolean {
   }
 }
 
+function validateEntraTrust(config: QmConfig, path: string, secrets?: ReadonlyMap<string, string>): void {
+  const portalEnv = config.env.portal ?? {};
+  const authEnv = config.env.auth ?? {};
+  const tenantId = portalEnv.ENTRA_OIDC_TENANT_ID?.trim();
+  const clientId = portalEnv.ENTRA_OIDC_CLIENT_ID?.trim();
+  const authMethod = portalEnv.ENTRA_OIDC_CLIENT_AUTH_METHOD?.trim() || "client_secret";
+  const configured =
+    tenantId !== undefined || clientId !== undefined || portalEnv.ENTRA_OIDC_CLIENT_AUTH_METHOD !== undefined;
+  if (!configured) return;
+  const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!tenantId || !guid.test(tenantId)) {
+    throw new CliError(`${path}: env.portal.ENTRA_OIDC_TENANT_ID must be a non-placeholder GUID`);
+  }
+  if (!clientId || !guid.test(clientId)) {
+    throw new CliError(`${path}: env.portal.ENTRA_OIDC_CLIENT_ID must be a non-placeholder GUID`);
+  }
+  if (authMethod !== "client_secret" && authMethod !== "private_key_jwt") {
+    throw new CliError(
+      `${path}: env.portal.ENTRA_OIDC_CLIENT_AUTH_METHOD must be "client_secret" or "private_key_jwt"`,
+    );
+  }
+  if (portalEnv.ENTRA_OIDC_CLIENT_ASSERTION_JWK !== undefined) {
+    throw new CliError(`${path}: ENTRA_OIDC_CLIENT_ASSERTION_JWK is a secret and must not be stored in env.portal`);
+  }
+  if (portalEnv.ENTRA_OIDC_CLIENT_SECRET !== undefined) {
+    throw new CliError(`${path}: ENTRA_OIDC_CLIENT_SECRET is a secret and must not be stored in env.portal`);
+  }
+  if (config.services.includes("auth") && authEnv.AUTH_ALLOWED_EMAIL_DOMAIN !== undefined) {
+    throw new CliError(
+      `${path}: Entra dual-provider mode requires an explicit AUTH_ALLOWED_EMAILS allowlist; AUTH_ALLOWED_EMAIL_DOMAIN would bypass Entra access policy for an entire domain`,
+    );
+  }
+  if (!secrets) return;
+  if (authMethod === "client_secret" && isMissingOrPlaceholder(secrets.get("ENTRA_OIDC_CLIENT_SECRET"))) {
+    throw new CliError(`${path}: portal requires ENTRA_OIDC_CLIENT_SECRET in the target secret store`);
+  }
+  const rawJwk = secrets.get("ENTRA_OIDC_CLIENT_ASSERTION_JWK");
+  if (authMethod === "private_key_jwt" && isMissingOrPlaceholder(rawJwk)) {
+    throw new CliError(`${path}: portal requires ENTRA_OIDC_CLIENT_ASSERTION_JWK in the target secret store`);
+  }
+  if (authMethod === "private_key_jwt" && rawJwk) {
+    try {
+      const jwk = JSON.parse(rawJwk) as JsonWebKey & Record<string, unknown>;
+      const thumbprint = jwk["x5t#S256"];
+      if (jwk.kty !== "RSA" || typeof jwk.d !== "string" || typeof thumbprint !== "string") throw new Error();
+      if (!/^[A-Za-z0-9_-]{43}$/.test(thumbprint)) throw new Error();
+      createPrivateKey({ key: jwk, format: "jwk" });
+    } catch {
+      throw new CliError(
+        `${path}: ENTRA_OIDC_CLIENT_ASSERTION_JWK must be an importable RSA private JWK with a valid "x5t#S256"`,
+      );
+    }
+  }
+  if (config.services.includes("auth") && isMissingOrPlaceholder(secrets.get("AUTH_ALLOWED_EMAILS"))) {
+    throw new CliError(`${path}: Entra dual-provider mode requires AUTH_ALLOWED_EMAILS in the target secret store`);
+  }
+}
+
 export function validatePortalTrust(config: QmConfig, path = "config", secrets?: ReadonlyMap<string, string>): void {
   if (!config.services.includes("portal")) return;
+  validateEntraTrust(config, path, secrets);
   if (config.services.includes("auth")) return validateBrokerTrust(config, path, secrets);
   const env = config.env.portal ?? {};
   const issuer = env.OIDC_ISSUER?.trim() || "https://slack.com";

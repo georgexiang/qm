@@ -264,6 +264,45 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       "Client secret issued by an external identity provider; the built-in auth broker mints its own instead.",
   },
   {
+    name: "ENTRA_OIDC_CLIENT_SECRET",
+    service: "portal",
+    required: {
+      when: {
+        kind: "all",
+        conditions: [
+          { kind: "env-present", service: "portal", name: "ENTRA_OIDC_TENANT_ID" },
+          {
+            kind: "any",
+            conditions: [
+              { kind: "env-absent", service: "portal", name: "ENTRA_OIDC_CLIENT_AUTH_METHOD" },
+              {
+                kind: "env-equals",
+                service: "portal",
+                name: "ENTRA_OIDC_CLIENT_AUTH_METHOD",
+                value: "client_secret",
+              },
+            ],
+          },
+        ],
+      },
+    },
+    description: "Client secret issued by the Entra app registration for QM Portal.",
+  },
+  {
+    name: "ENTRA_OIDC_CLIENT_ASSERTION_JWK",
+    service: "portal",
+    required: {
+      when: {
+        kind: "env-equals",
+        service: "portal",
+        name: "ENTRA_OIDC_CLIENT_AUTH_METHOD",
+        value: "private_key_jwt",
+      },
+      optionalOtherwise: true,
+    },
+    description: "RSA private JWK for certificate-bound Entra client authentication.",
+  },
+  {
     name: "PORTAL_EXPECTED_TEAM_ID",
     service: "portal",
     required: {

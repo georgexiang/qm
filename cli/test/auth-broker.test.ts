@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -167,6 +168,95 @@ test("the broker's generated secrets reach both sides under the right names", ()
   assert.ok(names.has("RESEND_API_KEY"));
   assert.ok(!names.has("SMTP_HOST"), "only the configured transport's credentials are collected");
   assert.ok(secretsForService(config, "auth").some((secret) => secret.name === "CORE_SIGNING_SECRET"));
+});
+
+test("broker mode can add an Entra provider with an explicit emergency-email allowlist", () => {
+  const config = configWith(
+    configText({
+      env: `{
+        "portal": {
+          "ENTRA_OIDC_TENANT_ID": "16b3c013-d300-468d-ac64-7eda0820b6d3",
+          "ENTRA_OIDC_CLIENT_ID": "16686705-c414-45c4-bd29-94fd67c128bd"
+        },
+        "auth": { "AUTH_EMAIL_TRANSPORT": "resend" }
+      }`,
+    }),
+  );
+  const secret = computedSecrets(config).find((item) => item.name === "ENTRA_OIDC_CLIENT_SECRET")!;
+  assert.ok(secret.required);
+  assert.deepEqual(runtimeSecretNames("portal", secret), ["ENTRA_OIDC_CLIENT_SECRET"]);
+  const optionalJwk = computedSecrets(config).find((item) => item.name === "ENTRA_OIDC_CLIENT_ASSERTION_JWK")!;
+  assert.equal(optionalJwk.required, false);
+  assert.ok(serviceDef("portal").fly?.stackKeys.includes("ENTRA_OIDC_TENANT_ID"));
+  assert.ok(serviceDef("portal").fly?.stackKeys.includes("ENTRA_OIDC_CLIENT_ID"));
+
+  assert.throws(() => validatePortalTrust(config, "config", new Map()), /ENTRA_OIDC_CLIENT_SECRET/);
+  assert.throws(
+    () => validatePortalTrust(config, "config", new Map([["ENTRA_OIDC_CLIENT_SECRET", "rotated-entra-secret-value"]])),
+    /requires AUTH_ALLOWED_EMAILS/,
+  );
+  assert.doesNotThrow(() =>
+    validatePortalTrust(
+      config,
+      "config",
+      new Map([
+        ["ENTRA_OIDC_CLIENT_SECRET", "rotated-entra-secret-value"],
+        ["AUTH_ALLOWED_EMAILS", "admin@example.com"],
+      ]),
+    ),
+  );
+});
+
+test("Entra dual-provider mode refuses a domain-wide emergency email rule", () => {
+  assert.throws(
+    () =>
+      configWith(
+        configText({
+          env: `{
+            "portal": {
+              "ENTRA_OIDC_TENANT_ID": "16b3c013-d300-468d-ac64-7eda0820b6d3",
+              "ENTRA_OIDC_CLIENT_ID": "16686705-c414-45c4-bd29-94fd67c128bd"
+            },
+            "auth": { "AUTH_EMAIL_TRANSPORT": "resend", "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com" }
+          }`,
+        }),
+      ),
+    /requires an explicit AUTH_ALLOWED_EMAILS allowlist/,
+  );
+});
+
+test("Entra private_key_jwt mode requires JWK instead of client secret", () => {
+  const config = configWith(
+    configText({
+      env: `{
+        "portal": {
+          "ENTRA_OIDC_TENANT_ID": "16b3c013-d300-468d-ac64-7eda0820b6d3",
+          "ENTRA_OIDC_CLIENT_ID": "16686705-c414-45c4-bd29-94fd67c128bd",
+          "ENTRA_OIDC_CLIENT_AUTH_METHOD": "private_key_jwt"
+        },
+        "auth": { "AUTH_EMAIL_TRANSPORT": "resend" }
+      }`,
+    }),
+  );
+  const secrets = computedSecrets(config);
+  assert.equal(
+    secrets.find((item) => item.name === "ENTRA_OIDC_CLIENT_SECRET"),
+    undefined,
+  );
+  assert.equal(secrets.find((item) => item.name === "ENTRA_OIDC_CLIENT_ASSERTION_JWK")?.required, true);
+  assert.throws(() => validatePortalTrust(config, "config", new Map()), /ENTRA_OIDC_CLIENT_ASSERTION_JWK/);
+
+  const privateJwk = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "jwk" });
+  assert.doesNotThrow(() =>
+    validatePortalTrust(
+      config,
+      "config",
+      new Map([
+        ["ENTRA_OIDC_CLIENT_ASSERTION_JWK", JSON.stringify({ ...privateJwk, "x5t#S256": "A".repeat(43) })],
+        ["AUTH_ALLOWED_EMAILS", "admin@example.com"],
+      ]),
+    ),
+  );
 });
 
 test("without a configured domain the allowlist becomes a required secret on both services", () => {
