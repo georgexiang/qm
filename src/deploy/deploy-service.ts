@@ -20,6 +20,7 @@ import { createNoopLeaderLease, type LeaderLease } from "../persistence/leader-l
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { errMessage, swallow } from "../util/errors.ts";
+import { DockerDeploymentInvalidSnapshot, DockerDeploymentUnavailable } from "./docker-deploy-provider.ts";
 
 export interface DeployFile {
   path: string;
@@ -149,7 +150,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     return deployQueue(id, () => advisoryLock.withLock(`deploy:${id}`, fn));
   }
 
-  const applyVersion = async (
+  const applyVersionUnchecked = async (
     id: string,
     version: DeploymentVersion,
     fromVersion?: number,
@@ -181,32 +182,63 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     return endpoint;
   };
 
+  const applyVersion = async (
+    id: string,
+    version: DeploymentVersion,
+    fromVersion?: number,
+  ): Promise<DeployEndpoint> => {
+    try {
+      return await applyVersionUnchecked(id, version, fromVersion);
+    } catch (error) {
+      if (error instanceof DockerDeploymentUnavailable) {
+        await deps.deployStore.setStatus(id, "stopped", error.message);
+      }
+      throw error;
+    }
+  };
+
   const markVersionRunning = async (id: string, version: number, endpoint: DeployEndpoint): Promise<void> => {
     await deps.deployStore.setEndpoint(id, endpoint);
     await deps.deployStore.setStatus(id, "running");
     await deps.deployStore.setAppliedVersion(id, version);
   };
 
-  const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint> => {
-    if (!deps.provider.resolveEndpoint || d.endpoint == null) return d.endpoint!;
-    const version = d.versions.find((v) => v.version === d.currentVersion);
-    if (!version) return d.endpoint;
-    const resolved = await deps.provider.resolveEndpoint(d, version);
-    if (resolved) {
-      if (!endpointsEqual(resolved, d.endpoint)) await deps.deployStore.setEndpoint(d.id, resolved);
-      return resolved;
+  const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint | null> => {
+    if (!deps.provider.resolveEndpoint) return d.endpoint;
+    if (!deps.provider.serializeEndpointResolution) {
+      const version = d.versions.find((entry) => entry.version === d.currentVersion);
+      if (!version || !d.endpoint) return d.endpoint;
+      const resolved = await deps.provider.resolveEndpoint(d, version);
+      if (resolved) {
+        if (!endpointsEqual(resolved, d.endpoint)) await deps.deployStore.setEndpoint(d.id, resolved);
+        return resolved;
+      }
     }
     return withDeployLock(d.id, async () => {
-      const cur = (await deps.deployStore.get(d.id)) ?? d;
-      const v = cur.versions.find((x) => x.version === cur.currentVersion) ?? version;
-      const again = await deps.provider.resolveEndpoint!(cur, v);
-      if (again) {
-        if (!endpointsEqual(again, cur.endpoint)) await deps.deployStore.setEndpoint(cur.id, again);
-        return again;
+      const cur = await deps.deployStore.get(d.id);
+      if (!cur || cur.status !== "running" || !cur.endpoint) return null;
+      const version =
+        (deps.provider.serializeEndpointResolution
+          ? cur.versions.find((entry) => entry.version === cur.appliedVersion)
+          : undefined) ?? cur.versions.find((entry) => entry.version === cur.currentVersion);
+      if (!version) return null;
+      try {
+        const resolved = await deps.provider.resolveEndpoint!(cur, version);
+        if (resolved) {
+          if (!endpointsEqual(resolved, cur.endpoint)) await deps.deployStore.setEndpoint(cur.id, resolved);
+          return resolved;
+        }
+        const fresh = await applyVersion(cur.id, version, cur.appliedVersion ?? cur.currentVersion);
+        await markVersionRunning(cur.id, version.version, fresh);
+        return fresh;
+      } catch (error) {
+        if (error instanceof DockerDeploymentUnavailable || error instanceof DockerDeploymentInvalidSnapshot) {
+          const reason =
+            error instanceof DockerDeploymentInvalidSnapshot ? `${error.message}; republish required` : error.message;
+          await deps.deployStore.setStatus(cur.id, "stopped", reason);
+        }
+        throw error;
       }
-      const fresh = await applyVersion(cur.id, v, cur.appliedVersion ?? cur.currentVersion);
-      await markVersionRunning(cur.id, v.version, fresh);
-      return fresh;
     });
   };
 
@@ -352,16 +384,28 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ...(input.createdInScope !== undefined ? { createdInScope: input.createdInScope } : {}),
         ...(input.env ? { env: input.env } : {}),
       });
-      const endpoint = await applyVersion(d.id, d.versions[0]!);
-      await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
-      deps.auditLog.record({
-        at: Date.now(),
-        principalId: input.createdBy,
-        action: "deploy",
-        resource: d.id,
-        scopeLabel: input.ownerScopeId,
+      return withDeployLock(d.id, async () => {
+        const cur = await deps.deployStore.get(d.id);
+        if (!cur) throw new Error(`unknown deployment: ${d.id}`);
+        const version = d.versions[0]!;
+        if (
+          cur.status !== "stopped" ||
+          cur.appliedVersion !== undefined ||
+          cur.failureReason ||
+          cur.currentVersion !== version.version
+        )
+          return structuredClone(cur);
+        const endpoint = await applyVersion(cur.id, version);
+        await markVersionRunning(cur.id, version.version, endpoint);
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: input.createdBy,
+          action: "deploy",
+          resource: cur.id,
+          scopeLabel: input.ownerScopeId,
+        });
+        return structuredClone((await deps.deployStore.get(cur.id))!);
       });
-      return (await deps.deployStore.get(d.id))!;
     },
 
     async redeploy(id, input) {
@@ -503,6 +547,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       if (!d || d.status !== "running" || d.endpoint == null) return { status: "not_found" };
       if (!opts.bypassAcl && !(await reachAllowed(d, principalId))) return { status: "denied" };
       const endpoint = await liveEndpoint(d);
+      if (!endpoint) return { status: "not_found" };
       await deps.deployStore.touch(d.id, Date.now());
       return { status: "ok", endpoint };
     },
@@ -510,7 +555,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     async deploymentLogs(idOrName, opts): Promise<string | null> {
       if (!deps.provider.logs) return null;
       const d = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
-      if (!d || d.status !== "running") return null;
+      if (!d || (d.status !== "running" && !(d.status === "stopped" && d.failureReason))) return null;
       return deps.provider.logs(d, opts);
     },
 

@@ -1013,7 +1013,11 @@ export function buildApp(
     });
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
-    docker: createDockerDeployProvider,
+    docker: () =>
+      createDockerDeployProvider({
+        ...(config.localSandbox.coreContainer ? { coreContainer: config.localSandbox.coreContainer } : {}),
+        snapshotRoot: join(config.dataDir, "deployments"),
+      }),
     fly: () => createFlyDeployProvider(config.flyDeploy),
     porter: () =>
       createPorterDeployProvider({

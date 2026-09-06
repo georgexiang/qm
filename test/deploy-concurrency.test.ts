@@ -86,7 +86,7 @@ function spyLock(): { lock: AdvisoryLock; keys: string[] } {
   return { lock, keys };
 }
 
-test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex keyed deploy:<id>", async () => {
+test("withDeployLock: create/redeploy/rollback/archive each acquire the advisory mutex keyed deploy:<id>", async () => {
   const { lock, keys } = spyLock();
   const { deploy } = svc({ lock });
   const d = await deploy.deploy({
@@ -95,14 +95,14 @@ test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex 
     entrypoint: "x",
     files: [],
   });
-  assert.deepEqual(keys, [], "the initial create takes no deploy lock");
+  assert.deepEqual(keys, [`deploy:${d.id}`], "the initial create takes the deploy lock");
 
   await deploy.redeploy(d.id, { entrypoint: "y", files: [] });
   await deploy.rollbackDeployment(d.id, 1);
   await deploy.archiveDeployment(d.id);
 
   const want = `deploy:${d.id}`;
-  assert.deepEqual(keys, [want, want, want], "redeploy, rollback, archive each lock deploy:<id>");
+  assert.deepEqual(keys, [want, want, want, want], "create, redeploy, rollback, archive each lock deploy:<id>");
 });
 
 test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)", async () => {

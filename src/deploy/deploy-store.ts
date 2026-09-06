@@ -62,6 +62,7 @@ export interface Deployment {
   displayName?: string;
   currentVersion: number;
   status: DeploymentStatus;
+  failureReason?: string;
   endpoint: DeployEndpoint | null;
   lastAccessAt?: number;
   appliedVersion?: number;
@@ -87,7 +88,7 @@ export interface DeployStore {
   list(): Promise<Deployment[]>;
   setCurrentVersion(id: string, version: number): Promise<void>;
   setVersionImage(id: string, version: number, image: string): Promise<void>;
-  setStatus(id: string, status: DeploymentStatus): Promise<void>;
+  setStatus(id: string, status: DeploymentStatus, failureReason?: string): Promise<void>;
   setEndpoint(id: string, endpoint: DeployEndpoint | null): Promise<void>;
   setName(id: string, name: string): Promise<void>;
   setOwnerScope(id: string, ownerScopeId: ScopeId): Promise<void>;
@@ -237,10 +238,14 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       v.image = image;
       await backingMap.put(id, d);
     },
-    async setStatus(id, status) {
+    async setStatus(id, status, failureReason) {
       const d = await backingMap.get(id);
       if (d) {
         d.status = status;
+        if (status === "stopped" && failureReason) {
+          d.failureReason = failureReason;
+          d.endpoint = null;
+        } else delete d.failureReason;
         await backingMap.put(id, d);
       }
     },

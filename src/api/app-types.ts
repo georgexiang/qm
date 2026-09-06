@@ -117,6 +117,7 @@ export interface DeploymentView {
   currentVersion: number;
   appliedVersion?: number;
   status: Deployment["status"];
+  failureReason?: string;
   lastAccessAt?: number;
   createdAt?: number;
   updatedAt?: number;
@@ -144,6 +145,7 @@ export function deploymentView(d: Deployment): DeploymentView {
     currentVersion: d.currentVersion,
     ...(d.appliedVersion !== undefined ? { appliedVersion: d.appliedVersion } : {}),
     status: d.status,
+    ...(d.failureReason ? { failureReason: d.failureReason } : {}),
     ...(d.lastAccessAt !== undefined ? { lastAccessAt: d.lastAccessAt } : {}),
     ...(versions[0] ? { createdAt: versions[0].createdAt } : {}),
     ...(versions.at(-1) ? { updatedAt: versions.at(-1)!.createdAt } : {}),

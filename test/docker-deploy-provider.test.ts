@@ -4,14 +4,57 @@ import { createDockerDeployProvider, dockerDaemonFailure } from "../src/deploy/d
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import type { DockerExec } from "../src/sandbox/docker-exec.ts";
 import { scopeId } from "../src/types.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-test("Docker deployments use isolated networks and remove them on destroy", async () => {
+const healthyState = (networks: Record<string, unknown> = {}) =>
+  JSON.stringify({
+    State: { Running: true, ExitCode: 0 },
+    NetworkSettings: { Networks: networks, Ports: { "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "9200" }] } },
+  });
+
+async function snapshot() {
+  const path = await mkdtemp(join(tmpdir(), "docker-deploy-test-"));
+  await writeFile(join(path, "server.js"), "process.exit(0)");
+  return path;
+}
+
+test("a stopped Docker deployment never returns its stale endpoint", async () => {
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/stopped",
+  });
+  await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
+  const running = (await store.get(deployment.id))!;
+  const dockerExec: DockerExec = async (args) => ({
+    code: 0,
+    stdout:
+      args[0] === "inspect"
+        ? JSON.stringify({
+            State: { Running: false, ExitCode: 1, Status: "exited" },
+            NetworkSettings: { Networks: {}, Ports: {} },
+          })
+        : "",
+    stderr: "",
+  });
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  await assert.rejects(provider.resolveEndpoint!(running, running.versions[0]!), /not running.*1/);
+});
+
+test("Docker deployments use isolated networks and remove them on destroy", async (context) => {
+  const snapshotDir = await snapshot();
+  context.after(() => rm(snapshotDir, { recursive: true, force: true }));
   const calls: string[][] = [];
   const dockerExec: DockerExec = async (args) => {
     calls.push(args);
     return {
       code: args[1] === "inspect" ? 1 : 0,
-      stdout: "",
+      stdout: args[0] === "inspect" ? healthyState() : "",
       stderr: args[1] === "inspect" ? "No such network" : "",
     };
   };
@@ -20,15 +63,15 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
     entrypoint: "node server.js",
-    snapshotDir: "/snap/one",
+    snapshotDir,
   });
   const second = await store.create({
     ownerScopeId: scopeId("personal", "U2"),
     createdBy: "U2",
     entrypoint: "node server.js",
-    snapshotDir: "/snap/two",
+    snapshotDir,
   });
-  const provider = createDockerDeployProvider({ dockerExec });
+  const provider = createDockerDeployProvider({ dockerExec, fetch: async () => new Response("ok") });
 
   await provider.apply(first, first.versions[0]!);
   await provider.apply(second, second.versions[0]!);
@@ -54,16 +97,16 @@ test("Docker provider migrates running deployments off the legacy shared network
     if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
       return { code: 0, stdout: legacyAttached ? `${containerName}\n` : "", stderr: "" };
     }
-    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
-    if (args[0] === "network" && args[1] === "connect" && ++connectAttempts === 1) {
-      return { code: 1, stdout: "", stderr: "transient" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
+    if (args[0] === "network" && args[1] === "connect") {
+      connectAttempts++;
+      targetAttached = true;
     }
-    if (args[0] === "network" && args[1] === "connect") targetAttached = true;
     if (args[0] === "network" && args[1] === "disconnect") legacyAttached = false;
     if (args[0] === "inspect") {
       return {
         code: 0,
-        stdout: JSON.stringify({
+        stdout: healthyState({
           ...(legacyAttached ? { "agent-deploynet": {} } : {}),
           ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
         }),
@@ -82,10 +125,10 @@ test("Docker provider migrates running deployments off the legacy shared network
   containerName = `agent-deploy-${deployment.id.slice(0, 12)}`;
   await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
   const running = (await store.get(deployment.id))!;
-  const provider = createDockerDeployProvider({ dockerExec });
+  const provider = createDockerDeployProvider({ dockerExec, fetch: async () => new Response("ok") });
 
   assert.deepEqual(await provider.resolveEndpoint!(running, running.versions[0]!), running.endpoint);
-  assert.equal(connectAttempts, 2);
+  assert.equal(connectAttempts, 1);
   assert.ok(calls.some((args) => args.join(" ") === `network connect ${containerName}-net ${containerName}`));
   assert.ok(calls.some((args) => args.join(" ") === `network disconnect agent-deploynet ${containerName}`));
 });
@@ -102,13 +145,18 @@ test("constructing a Docker provider does not inspect or migrate unrelated deplo
   assert.deepEqual(calls, []);
 });
 
-test("an unrelated legacy migration failure does not block a new deployment", async () => {
+test("an unrelated legacy migration failure does not block a new deployment", async (context) => {
+  const snapshotDir = await snapshot();
+  context.after(() => rm(snapshotDir, { recursive: true, force: true }));
   const dockerExec: DockerExec = async (args) => {
     if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
       return { code: 0, stdout: "agent-deploy-broken\n", stderr: "" };
     }
-    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "daemon unavailable" };
-    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "inspect" && args.at(-1) === "agent-deploy-broken") {
+      return { code: 1, stdout: "", stderr: "daemon unavailable" };
+    }
+    if (args[0] === "inspect") return { code: 0, stdout: healthyState(), stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
     return { code: 0, stdout: "", stderr: "" };
   };
   const store = createDeployStore();
@@ -116,9 +164,9 @@ test("an unrelated legacy migration failure does not block a new deployment", as
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
     entrypoint: "node server.js",
-    snapshotDir: "/snap/new",
+    snapshotDir,
   });
-  const provider = createDockerDeployProvider({ dockerExec });
+  const provider = createDockerDeployProvider({ dockerExec, fetch: async () => new Response("ok") });
 
   await assert.doesNotReject(provider.apply(deployment, deployment.versions[0]!));
 });

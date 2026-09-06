@@ -17,6 +17,7 @@ export interface DeployReconcileInput {
 
 export interface DeployProvider {
   readonly profile: DeployProfile;
+  readonly serializeEndpointResolution?: boolean;
   apply(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint>;
   reconcile?(d: Deployment, version: DeploymentVersion, input: DeployReconcileInput): Promise<DeployEndpoint>;
   destroy(d: Deployment): Promise<void>;
