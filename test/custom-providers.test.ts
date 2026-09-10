@@ -5,6 +5,7 @@ import {
   resolveCustomModel,
   isCustomModelId,
   customModelCatalog,
+  customModelsJson,
   validateCustomProviderSpec,
 } from "../src/model/custom-providers.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
@@ -32,6 +33,22 @@ test("a registered custom model resolves with the provider's protocol and base U
   assert.equal(model.baseUrl, "https://llm.acme.internal/v1");
   assert.equal(model.contextWindow, 200_000);
   assert.equal(model.cost.input, 2);
+});
+
+test("OpenAI Responses providers use the Responses adapter in both runtime registries", () => {
+  setCustomProviders([
+    {
+      ...GATEWAY,
+      protocol: "openai-responses",
+      models: [{ id: "gpt-6-astra", name: "GPT-6 Astra" }],
+    },
+  ]);
+  assert.equal(resolveCustomModel("gpt-6-astra")?.api, "openai-responses");
+  const provider = customModelsJson()?.providers["acme-gateway"] as { api?: string } | undefined;
+  assert.equal(provider?.api, "openai-responses");
+  assert.equal(modelSupportedByHarness("gpt-6-astra", "pi"), true);
+  assert.equal(modelSupportedByHarness("gpt-6-astra", "opencode"), false);
+  assert.equal(modelSupportedByHarness("gpt-6-astra", "mock"), true);
 });
 
 test("anthropic-protocol providers produce anthropic-messages models with defaults", () => {

@@ -3963,6 +3963,7 @@
                   >Protocol
                   <select id="custom-provider-protocol">
                     <option value="openai">OpenAI-compatible</option>
+                    <option value="openai-responses">OpenAI Responses-compatible</option>
                     <option value="anthropic">Anthropic-compatible</option>
                   </select></label
                 >
@@ -7470,7 +7471,11 @@
           const tr = document.createElement("tr");
           const cells = [
             provider.name + " (" + provider.id + ")",
-            provider.protocol === "anthropic" ? "Anthropic" : "OpenAI",
+            provider.protocol === "anthropic"
+              ? "Anthropic"
+              : provider.protocol === "openai-responses"
+                ? "OpenAI Responses"
+                : "OpenAI",
             provider.baseUrl,
             provider.models.map((model) => model.id).join(", "),
             provider.hasKey ? "set (write-only)" : "none",

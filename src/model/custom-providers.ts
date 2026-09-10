@@ -15,7 +15,7 @@
 
 import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 
-export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "anthropic"] as const;
+export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
 
 interface CustomModelSpec {
@@ -85,7 +85,7 @@ export interface CustomRuntimeModel {
   id: string;
   name: string;
   provider: string;
-  api: "openai-completions" | "anthropic-messages";
+  api: "openai-completions" | "openai-responses" | "anthropic-messages";
   baseUrl: string;
   reasoning: boolean;
   input: ("text" | "image")[];
@@ -97,12 +97,17 @@ export interface CustomRuntimeModel {
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 
+function runtimeApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"] {
+  if (protocol === "anthropic") return "anthropic-messages";
+  return protocol === "openai-responses" ? "openai-responses" : "openai-completions";
+}
+
 function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
   return {
     id: m.id,
     name: m.name?.trim() || m.id,
     provider: provider.id,
-    api: provider.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+    api: runtimeApi(provider.protocol),
     baseUrl: provider.baseUrl,
     reasoning: false,
     input: ["text"],
@@ -167,7 +172,7 @@ export function customModelsJson(): { providers: Record<string, unknown> } | und
         {
           name: spec.name,
           baseUrl: spec.baseUrl,
-          api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+          api: runtimeApi(spec.protocol),
           models: spec.models.map((m) => ({
             id: m.id,
             name: m.name ?? m.id,
