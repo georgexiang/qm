@@ -12,6 +12,7 @@ import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
+import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
 
@@ -64,6 +65,40 @@ function parseSse(body: string): Array<{ event: string; data: unknown }> {
   }
   return out;
 }
+
+test("POST /api/turn accepts a registered custom-provider model from the default picker", async () => {
+  setCustomProviders([
+    {
+      id: "acme-gateway",
+      name: "Acme Gateway",
+      protocol: "openai",
+      baseUrl: "https://llm.acme.internal/v1",
+      models: [{ id: "acme-large", name: "Acme Large" }],
+    },
+  ]);
+  try {
+    const response = await fetch(
+      `${webBase}/api/turn`,
+      asUser("alice", {
+        method: "POST",
+        body: JSON.stringify({ text: "hello", model: "acme-large" }),
+      }),
+    );
+    assert.notEqual(response.status, 403);
+    const { runId } = (await response.json()) as { runId?: string };
+    assert.ok(runId);
+    const events = await fetch(
+      `${webBase}/api/runs/${encodeURIComponent(runId)}/events`,
+      asUser("alice", { signal: AbortSignal.timeout(20_000) }),
+    );
+    assert.equal(events.status, 200);
+    const done = parseSse(await events.text()).find((event) => event.event === "done");
+    assert.ok(done);
+    assert.equal((done.data as { result?: { status?: string } }).result?.status, "ok");
+  } finally {
+    setCustomProviders([]);
+  }
+});
 
 test("SSE streams partial frames then a terminal done frame carrying the reply", async () => {
   const submit = (await (

@@ -7,6 +7,7 @@ import {
   ALL_PROVIDERS_AVAILABLE,
   type ModelProviderAvailability,
 } from "../model/pi-models.ts";
+import { customModelCatalog } from "../model/custom-providers.ts";
 
 export const NON_INTERACTIVE_THINKING_LEVEL = "xhigh";
 export const NON_INTERACTIVE_FAST_MODE = false;
@@ -49,7 +50,14 @@ export function validateWebTurnModelOptions(
   enabledModels: readonly string[] | null,
   providers: ModelProviderAvailability = ALL_PROVIDERS_AVAILABLE,
 ): string | null {
-  const enabled = enabledModels?.length ? enabledModels : DEFAULT_WEBUI_MODEL_IDS;
+  const enabled = enabledModels?.length
+    ? enabledModels
+    : [
+        ...DEFAULT_WEBUI_MODEL_IDS,
+        ...customModelCatalog()
+          .filter((model) => resolveModel(model.id)?.provider === model.provider)
+          .map((model) => model.id),
+      ];
   const allowedModels = serviceableModelIds(enabled, providers);
   if (input.model && !allowedModels.includes(input.model)) {
     return resolveModel(input.model) && !modelServiceable(input.model, providers)

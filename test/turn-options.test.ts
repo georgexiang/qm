@@ -7,6 +7,7 @@ import {
   validateWebTurnModelOptions,
   webTurnRuntimeModelRefusal,
 } from "../src/core/turn-options.ts";
+import { setCustomProviders } from "../src/model/custom-providers.ts";
 
 test("triggered turns default to extra-high thinking and non-fast mode", () => {
   assert.deepEqual(turnModelOptions({ triggered: true }), {
@@ -29,6 +30,35 @@ test("web model controls are bounded by admin configuration", () => {
   );
   assert.equal(validateWebTurnModelOptions({ thinkingLevel: "infinite" }, null), "unsupported thinking level");
   assert.equal(validateWebTurnModelOptions({ model: "claude-opus-4-8", thinkingLevel: "high" }, null), null);
+});
+
+test("registered custom models are enabled by the default web picker", () => {
+  setCustomProviders([
+    {
+      id: "acme-gateway",
+      name: "Acme Gateway",
+      protocol: "openai",
+      baseUrl: "https://llm.acme.internal/v1",
+      models: [
+        { id: "acme-large", name: "Acme Large" },
+        { id: "claude-opus-4-6", name: "Colliding Model" },
+      ],
+    },
+  ]);
+  try {
+    assert.equal(validateWebTurnModelOptions({ model: "acme-large" }, null), null);
+    assert.equal(
+      validateWebTurnModelOptions({ model: "claude-opus-4-6" }, null),
+      "that model is not enabled for the web UI",
+    );
+    assert.equal(
+      validateWebTurnModelOptions({ model: "acme-large" }, ["gpt-5.6-sol"]),
+      "that model is not enabled for the web UI",
+    );
+  } finally {
+    setCustomProviders([]);
+  }
+  assert.equal(validateWebTurnModelOptions({ model: "acme-large" }, null), "that model is not enabled for the web UI");
 });
 
 test("a resolved scope override outside the configured picker is refused, the org default is not", () => {
