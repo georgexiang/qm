@@ -134,8 +134,7 @@ test("environment-configured Entra callback exchanges and verifies tokens with t
       nonce: tokenNonce,
       tid: "16b3c013-d300-468d-ac64-7eda0820b6d3",
       oid: "a67c5962-20f5-42c8-8384-c00000000000",
-      email: "Entra.User@Example.com",
-      email_verified: true,
+      preferred_username: "Entra.User@Example.com",
     })
       .setProtectedHeader({ alg: "EdDSA", kid: "entra-key" })
       .setIssuer("https://login.microsoftonline.com/16b3c013-d300-468d-ac64-7eda0820b6d3/v2.0")

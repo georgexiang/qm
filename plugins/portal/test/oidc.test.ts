@@ -269,10 +269,12 @@ test("resolveEntraPrincipal binds identity to the verified tenant and object ids
   );
 });
 
-test("resolveEntraEmail accepts only explicitly verified email claims", () => {
+test("resolveEntraEmail accepts Entra email-shaped display claims", () => {
   assert.equal(resolveEntraEmail({ email: "Guest@Example.com", email_verified: true }, {}), "guest@example.com");
-  assert.equal(resolveEntraEmail({ email: "unverified@example.com" }, {}), undefined);
-  assert.equal(resolveEntraEmail({ preferred_username: "user@example.com", email_verified: true }, {}), undefined);
+  assert.equal(resolveEntraEmail({ email: "unverified@example.com" }, {}), "unverified@example.com");
+  assert.equal(resolveEntraEmail({ preferred_username: "user@example.com" }, {}), "user@example.com");
+  assert.equal(resolveEntraEmail({ preferred_username: "not-an-email" }, {}), undefined);
+  assert.equal(resolveEntraEmail({ preferred_username: "guest_example.com#EXT#@tenant.onmicrosoft.com" }, {}), undefined);
 });
 
 test("resolvePrincipal claim=email returns the verified email, normalized", () => {

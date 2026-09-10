@@ -175,11 +175,11 @@ export function resolveEntraEmail(
   userinfo: Record<string, unknown>,
 ): string | undefined {
   for (const source of [userinfo, claims]) {
-    if (source.email_verified !== true && source.email_verified !== "true") continue;
-    const candidate = source.email;
-    if (typeof candidate !== "string") continue;
-    const email = candidate.trim().toLowerCase();
-    if (email.length <= 320 && /^[^\s@]+@[^\s@]+$/.test(email) && !email.includes("#ext#")) return email;
+    for (const candidate of [source.email, source.preferred_username]) {
+      if (typeof candidate !== "string") continue;
+      const email = candidate.trim().toLowerCase();
+      if (email.length <= 320 && /^[^\s@]+@[^\s@]+$/.test(email) && !email.includes("#ext#")) return email;
+    }
   }
   return undefined;
 }
