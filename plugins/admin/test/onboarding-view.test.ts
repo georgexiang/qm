@@ -75,6 +75,38 @@ async function runLoadOnboarding(modelProviders: unknown): Promise<Record<string
   return elements;
 }
 
+async function runLoadOnboardingView(
+  results: { onboarding?: boolean | Error; customProviders?: boolean | Error } = {},
+): Promise<{ onboarding: number; customProviders: number; loadedAt: number }> {
+  const src =
+    slice("async function loadOnboardingView()", "async function loadOnboarding()") + "\nloadOnboardingView();";
+  const calls = { onboarding: 0, customProviders: 0, loadedAt: 0 };
+  const context = vm.createContext({
+    loadOnboarding: async () => {
+      calls.onboarding += 1;
+      if (results.onboarding instanceof Error) throw results.onboarding;
+      return results.onboarding ?? true;
+    },
+    loadCustomProviders: async () => {
+      calls.customProviders += 1;
+      if (results.customProviders instanceof Error) throw results.customProviders;
+      return results.customProviders ?? true;
+    },
+    viewLoadedAt: new Proxy(
+      {},
+      {
+        set(_target, property, value) {
+          if (property === "onboarding") calls.loadedAt = value as number;
+          return true;
+        },
+      },
+    ),
+    Date,
+  });
+  await vm.runInContext(src, context);
+  return calls;
+}
+
 const UNCONFIGURED_PROVIDERS = [
   { provider: "anthropic", configured: false, source: "absent" },
   { provider: "openai", configured: false, source: "absent" },
@@ -126,6 +158,34 @@ test("onboarding is a navigable view", () => {
 
 test("/admin/onboarding resolves to the onboarding view", () => {
   assert.equal(resolveView("/admin/onboarding", ""), "onboarding");
+});
+
+test("the onboarding view loads setup and saved custom providers", async () => {
+  const calls = await runLoadOnboardingView();
+  assert.equal(calls.onboarding, 1);
+  assert.equal(calls.customProviders, 1);
+  assert.ok(calls.loadedAt > 0);
+});
+
+test("saved custom providers still load when setup loading fails", async () => {
+  const calls = await runLoadOnboardingView({ onboarding: false });
+  assert.equal(calls.onboarding, 1);
+  assert.equal(calls.customProviders, 1);
+  assert.equal(calls.loadedAt, 0);
+});
+
+test("failed custom-provider loads do not mark onboarding fresh", async () => {
+  for (const customProviders of [false, new Error("unavailable")]) {
+    const calls = await runLoadOnboardingView({ customProviders });
+    assert.equal(calls.onboarding, 1);
+    assert.equal(calls.customProviders, 1);
+    assert.equal(calls.loadedAt, 0);
+  }
+});
+
+test("initial and focus onboarding refreshes use the complete view loader", () => {
+  assert.match(html, /if \(view === "onboarding"\) return void loadOnboardingView\(\);/);
+  assert.match(html, /if \(view === "onboarding"\) \{\s+loadOnboardingView\(\);\s+return;/);
 });
 
 test("?view=onboarding resolves to the onboarding view", () => {

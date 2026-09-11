@@ -5751,7 +5751,7 @@
           "hidden",
           view === "onboarding" || view === "governance" || view === "connectors",
         );
-        if (view === "onboarding") return void loadOnboarding();
+        if (view === "onboarding") return void loadOnboardingView();
         if (view === "governance") return void loadScope();
         if (view === "connectors") return void loadConnectors();
         if (view === "user") return void showUserDetail(st.principal);
@@ -6211,7 +6211,7 @@
         if (view === "memory" && !(orgWideView() && urlToState().mem !== "edit")) return;
         if (view === "history" && urlToState().session) return;
         if (view === "onboarding") {
-          loadOnboarding();
+          loadOnboardingView();
           return;
         }
         if (view === "slack") {
@@ -7339,6 +7339,12 @@
           ? "•••• set — enter a replacement"
           : "Write-only API key";
       }
+      async function loadOnboardingView() {
+        const results = await Promise.allSettled([loadOnboarding(), loadCustomProviders()]);
+        if (results.every((result) => result.status === "fulfilled" && result.value)) {
+          viewLoadedAt.onboarding = Date.now();
+        }
+      }
       async function loadOnboarding() {
         const [models, slack, catalog, config] = await Promise.all([
           api("GET", "/api/model-providers"),
@@ -7349,7 +7355,7 @@
         if (!models.ok || !slack.ok || !catalog.ok || !config.ok) {
           setStatus("st-onboarding-model", "Setup status could not be loaded. Try again.", "err", true);
           renderOnboardingProviderOptions();
-          return;
+          return false;
         }
         onboardingModelStatuses = models.data.providers || [];
         onboardingModels = {};
@@ -7397,7 +7403,7 @@
         $("onboarding-oauth-summary").textContent = configured.length
           ? configured.map((item) => connectorName(item.provider)).join(", ") + " available in the web UI."
           : "Add Google, GitHub, Notion, or other OAuth clients to make those connectors available.";
-        viewLoadedAt.onboarding = Date.now();
+        return true;
       }
       $("onboarding-model-provider").onchange = () => renderOnboardingModelOptions();
       $("onboarding-model-save").onclick = async () => {
@@ -7419,8 +7425,7 @@
         const selected = await api("PUT", "/api/scopes/" + encodeURIComponent(orgScope()) + "/base-model", { modelId });
         $("onboarding-model-save").disabled = false;
         $("onboarding-model-key").value = "";
-        await loadOnboarding();
-        await loadCustomProviders();
+        await loadOnboardingView();
         setStatus(
           "st-onboarding-model",
           selected.ok ? "Key and base model saved." : "Key saved, but the base model could not be changed.",
@@ -7441,8 +7446,7 @@
           setStatus("st-onboarding-model", removed.data?.message || "Could not disable this provider.", "err");
           return;
         }
-        await loadOnboarding();
-        await loadCustomProviders();
+        await loadOnboardingView();
         setStatus("st-onboarding-model", "Provider disabled.", "ok");
       };
       let customProvidersLoaded = [];
@@ -7461,8 +7465,17 @@
           });
       }
       async function loadCustomProviders() {
-        const res = await api("GET", "/api/custom-providers");
-        if (!res.ok) return;
+        let res;
+        try {
+          res = await api("GET", "/api/custom-providers");
+        } catch {
+          setStatus("st-custom-provider", "Custom providers could not be loaded. Try again.", "err", true);
+          return false;
+        }
+        if (!res.ok) {
+          setStatus("st-custom-provider", "Custom providers could not be loaded. Try again.", "err", true);
+          return false;
+        }
         customProvidersLoaded = (res.data?.providers || []).filter((provider) => !provider.disabled);
         const rows = $("custom-provider-rows");
         rows.textContent = "";
@@ -7518,6 +7531,7 @@
           tr.appendChild(actions);
           rows.appendChild(tr);
         });
+        return true;
       }
       $("custom-provider-save").onclick = async () => {
         const id = $("custom-provider-id").value.trim();
