@@ -206,6 +206,59 @@ test("overlapping onboarding refreshes share one load", async () => {
   assert.equal(calls.customProviders, 1);
 });
 
+test("mutation refresh waits for an in-flight read and loads again", async () => {
+  const src =
+    slice("let onboardingLoad;", "async function loadOnboarding()") +
+    "\nconst first = loadOnboardingView(); await firstStarted; const forced = loadOnboardingView(true); await Promise.resolve(); assertForcedPending(); releaseFirst(); await first; await secondStarted; assertSecondStarted(); await forced;";
+  const calls = { onboarding: 0, customProviders: 0 };
+  let releaseFirst = () => {};
+  let resolveFirstStarted = () => {};
+  let resolveSecondStarted = () => {};
+  const firstLoad = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const firstStarted = new Promise<void>((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+  const secondStarted = new Promise<void>((resolve) => {
+    resolveSecondStarted = resolve;
+  });
+  function recordStart() {
+    const total = calls.onboarding + calls.customProviders;
+    if (total === 2) resolveFirstStarted();
+    if (total === 4) resolveSecondStarted();
+  }
+  const context = vm.createContext({
+    loadOnboarding: async () => {
+      calls.onboarding += 1;
+      recordStart();
+      if (calls.onboarding === 1) await firstLoad;
+      return true;
+    },
+    loadCustomProviders: async () => {
+      calls.customProviders += 1;
+      recordStart();
+      if (calls.customProviders === 1) await firstLoad;
+      return true;
+    },
+    assertForcedPending: () => {
+      assert.deepEqual(calls, { onboarding: 1, customProviders: 1 });
+    },
+    assertSecondStarted: () => {
+      assert.deepEqual(calls, { onboarding: 2, customProviders: 2 });
+    },
+    firstStarted,
+    secondStarted,
+    releaseFirst,
+    viewLoadedAt: new Proxy({}, { set: () => true }),
+    Promise,
+    Date,
+  });
+  await vm.runInContext(`(async () => { ${src} })()`, context);
+  assert.equal(calls.onboarding, 2);
+  assert.equal(calls.customProviders, 2);
+});
+
 test("initial and focus onboarding refreshes use the complete view loader", () => {
   assert.match(html, /if \(view === "onboarding"\) return void loadOnboardingView\(\);/);
   assert.match(html, /if \(view === "onboarding"\) \{\s+loadOnboardingView\(\);\s+return;/);

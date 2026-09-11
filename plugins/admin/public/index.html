@@ -7340,18 +7340,22 @@
           : "Write-only API key";
       }
       let onboardingLoad;
-      function loadOnboardingView() {
-        if (onboardingLoad) return onboardingLoad;
-        onboardingLoad = Promise.allSettled([loadOnboarding(), loadCustomProviders()])
+      function loadOnboardingView(force = false) {
+        if (!force && onboardingLoad) return onboardingLoad;
+        const prior = onboardingLoad;
+        const load = (force && prior ? prior : Promise.resolve())
+          .catch(() => {})
+          .then(() => Promise.allSettled([loadOnboarding(), loadCustomProviders()]))
           .then((results) => {
             if (results.every((result) => result.status === "fulfilled" && result.value)) {
               viewLoadedAt.onboarding = Date.now();
             }
           })
           .finally(() => {
-            onboardingLoad = null;
+            if (onboardingLoad === load) onboardingLoad = null;
           });
-        return onboardingLoad;
+        onboardingLoad = load;
+        return load;
       }
       async function loadOnboarding() {
         let models, slack, catalog, config;
@@ -7440,7 +7444,7 @@
         const selected = await api("PUT", "/api/scopes/" + encodeURIComponent(orgScope()) + "/base-model", { modelId });
         $("onboarding-model-save").disabled = false;
         $("onboarding-model-key").value = "";
-        await loadOnboardingView();
+        await loadOnboardingView(true);
         setStatus(
           "st-onboarding-model",
           selected.ok ? "Key and base model saved." : "Key saved, but the base model could not be changed.",
@@ -7461,7 +7465,7 @@
           setStatus("st-onboarding-model", removed.data?.message || "Could not disable this provider.", "err");
           return;
         }
-        await loadOnboardingView();
+        await loadOnboardingView(true);
         setStatus("st-onboarding-model", "Provider disabled.", "ok");
       };
       let customProvidersLoaded = [];
@@ -7538,7 +7542,7 @@
               setStatus("st-custom-provider", removed.data?.message || "Could not remove this provider.", "err");
               return;
             }
-            await loadCustomProviders();
+            await loadOnboardingView(true);
             setStatus("st-custom-provider", "Provider removed.", "ok");
           };
           actions.appendChild(edit);
@@ -7575,7 +7579,7 @@
           return;
         }
         $("custom-provider-key").value = "";
-        await loadCustomProviders();
+        await loadOnboardingView(true);
         setStatus("st-custom-provider", "Provider saved. Its models are now in the picker.", "ok");
       };
       function openOnboardingTarget(target) {
