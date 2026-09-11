@@ -7339,19 +7339,34 @@
           ? "•••• set — enter a replacement"
           : "Write-only API key";
       }
-      async function loadOnboardingView() {
-        const results = await Promise.allSettled([loadOnboarding(), loadCustomProviders()]);
-        if (results.every((result) => result.status === "fulfilled" && result.value)) {
-          viewLoadedAt.onboarding = Date.now();
-        }
+      let onboardingLoad;
+      function loadOnboardingView() {
+        if (onboardingLoad) return onboardingLoad;
+        onboardingLoad = Promise.allSettled([loadOnboarding(), loadCustomProviders()])
+          .then((results) => {
+            if (results.every((result) => result.status === "fulfilled" && result.value)) {
+              viewLoadedAt.onboarding = Date.now();
+            }
+          })
+          .finally(() => {
+            onboardingLoad = null;
+          });
+        return onboardingLoad;
       }
       async function loadOnboarding() {
-        const [models, slack, catalog, config] = await Promise.all([
-          api("GET", "/api/model-providers"),
-          api("GET", "/api/slack-installation"),
-          api("GET", "/api/connector-catalog"),
-          api("GET", "/api/scopes/" + encodeURIComponent(orgScope())),
-        ]);
+        let models, slack, catalog, config;
+        try {
+          [models, slack, catalog, config] = await Promise.all([
+            api("GET", "/api/model-providers"),
+            api("GET", "/api/slack-installation"),
+            api("GET", "/api/connector-catalog"),
+            api("GET", "/api/scopes/" + encodeURIComponent(orgScope())),
+          ]);
+        } catch {
+          setStatus("st-onboarding-model", "Setup status could not be loaded. Try again.", "err", true);
+          renderOnboardingProviderOptions();
+          return false;
+        }
         if (!models.ok || !slack.ok || !catalog.ok || !config.ok) {
           setStatus("st-onboarding-model", "Setup status could not be loaded. Try again.", "err", true);
           renderOnboardingProviderOptions();

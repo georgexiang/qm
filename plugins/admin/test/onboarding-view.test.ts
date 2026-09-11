@@ -77,10 +77,9 @@ async function runLoadOnboarding(modelProviders: unknown): Promise<Record<string
 
 async function runLoadOnboardingView(
   results: { onboarding?: boolean | Error; customProviders?: boolean | Error } = {},
+  calls = { onboarding: 0, customProviders: 0, loadedAt: 0 },
 ): Promise<{ onboarding: number; customProviders: number; loadedAt: number }> {
-  const src =
-    slice("async function loadOnboardingView()", "async function loadOnboarding()") + "\nloadOnboardingView();";
-  const calls = { onboarding: 0, customProviders: 0, loadedAt: 0 };
+  const src = slice("let onboardingLoad;", "async function loadOnboarding()") + "\nloadOnboardingView();";
   const context = vm.createContext({
     loadOnboarding: async () => {
       calls.onboarding += 1;
@@ -168,10 +167,12 @@ test("the onboarding view loads setup and saved custom providers", async () => {
 });
 
 test("saved custom providers still load when setup loading fails", async () => {
-  const calls = await runLoadOnboardingView({ onboarding: false });
-  assert.equal(calls.onboarding, 1);
-  assert.equal(calls.customProviders, 1);
-  assert.equal(calls.loadedAt, 0);
+  for (const onboarding of [false, new Error("unavailable")]) {
+    const calls = await runLoadOnboardingView({ onboarding });
+    assert.equal(calls.onboarding, 1);
+    assert.equal(calls.customProviders, 1);
+    assert.equal(calls.loadedAt, 0);
+  }
 });
 
 test("failed custom-provider loads do not mark onboarding fresh", async () => {
@@ -181,6 +182,28 @@ test("failed custom-provider loads do not mark onboarding fresh", async () => {
     assert.equal(calls.customProviders, 1);
     assert.equal(calls.loadedAt, 0);
   }
+});
+
+test("overlapping onboarding refreshes share one load", async () => {
+  const src =
+    slice("let onboardingLoad;", "async function loadOnboarding()") +
+    "\nawait Promise.all([loadOnboardingView(), loadOnboardingView()]);";
+  const calls = { onboarding: 0, customProviders: 0, loadedAt: 0 };
+  const context = vm.createContext({
+    loadOnboarding: async () => {
+      calls.onboarding += 1;
+      return true;
+    },
+    loadCustomProviders: async () => {
+      calls.customProviders += 1;
+      return true;
+    },
+    viewLoadedAt: new Proxy({}, { set: () => true }),
+    Promise,
+  });
+  await vm.runInContext(`(async () => { ${src} })()`, context);
+  assert.equal(calls.onboarding, 1);
+  assert.equal(calls.customProviders, 1);
 });
 
 test("initial and focus onboarding refreshes use the complete view loader", () => {
