@@ -275,6 +275,11 @@ export function prepareCodexHome(
       JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: source.OPENAI_API_KEY }),
       { mode: 0o600 },
     );
+    if (source.OPENAI_BASE_URL) {
+      writeFileSync(join(target, "config.toml"), `openai_base_url = ${JSON.stringify(source.OPENAI_BASE_URL)}\n`, {
+        mode: 0o600,
+      });
+    }
   }
   return target;
 }

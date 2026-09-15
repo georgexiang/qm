@@ -351,6 +351,16 @@ test("OpenCode config options forward a judge model only when its provider has a
   assert.equal(openCodeHarnessConfigOptions({} as Config).judgeModelId, undefined);
 });
 
+test("OpenCode config options forward the configured OpenAI base URL", () => {
+  assert.equal(
+    openCodeHarnessConfigOptions({
+      openaiApiKey: "azure-key",
+      providerBaseUrls: { openai: "https://azure.example/openai/v1" },
+    } as Config).openaiBaseUrl,
+    "https://azure.example/openai/v1",
+  );
+});
+
 test("custom providers materialize into the opencode config (enabled + provider map, key included)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "opencode-custom-"));
   const dump = join(dir, "config.json");
@@ -364,6 +374,8 @@ test("custom providers materialize into the opencode config (enabled + provider 
   chmodSync(wrapped, 0o755);
   const harness = createOpenCodeHarness({
     binaryPath: wrapped,
+    openaiApiKey: "azure-key",
+    openaiBaseUrl: "https://azure.example/openai/v1",
     resolveCustomProviders: async () => [
       {
         spec: {
@@ -399,6 +411,8 @@ test("custom providers materialize into the opencode config (enabled + provider 
     assert.equal(litellm.options.baseURL, "http://litellm.internal:4000/v1");
     assert.equal(litellm.options.apiKey, "sk-lite");
     assert.deepEqual(litellm.models["deepseek-chat"], { name: "DeepSeek", limit: { context: 128000, output: 8192 } });
+    assert.equal(config.provider.openai.options.apiKey, "azure-key");
+    assert.equal(config.provider.openai.options.baseURL, "https://azure.example/openai/v1");
     assert.equal(config.provider["responses-proxy"].npm, "@ai-sdk/openai");
     assert.equal(config.provider["responses-proxy"].options.apiKey, "sk-responses");
   } finally {

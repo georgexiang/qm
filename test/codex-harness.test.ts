@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -570,11 +571,23 @@ test("Codex child environment excludes core credentials and user homes", () => {
 test("Codex materializes API-key auth into its isolated home, and never an ambient login", (t) => {
   const jail = mkdtempSync(join(tmpdir(), "qm-codex-auth-test-"));
   t.after(() => rmSync(jail, { recursive: true, force: true }));
-  const home = prepareCodexHome({ CODEX_HOME: join(jail, "empty-source"), OPENAI_API_KEY: "sk-test" }, jail);
+  const home = prepareCodexHome(
+    {
+      CODEX_HOME: join(jail, "empty-source"),
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_BASE_URL: "https://azure.example/openai/v1",
+    },
+    jail,
+  );
   assert.deepEqual(JSON.parse(readFileSync(join(home, "auth.json"), "utf8")), {
     auth_mode: "apikey",
     OPENAI_API_KEY: "sk-test",
   });
+  assert.equal(
+    readFileSync(join(home, "config.toml"), "utf8"),
+    'openai_base_url = "https://azure.example/openai/v1"\n',
+  );
+  assert.equal(statSync(join(home, "config.toml")).mode & 0o777, 0o600);
 
   const bare = mkdtempSync(join(tmpdir(), "qm-codex-auth-bare-"));
   t.after(() => rmSync(bare, { recursive: true, force: true }));
@@ -618,6 +631,7 @@ test("Codex materializes ChatGPT OAuth auth as ephemeral child material without 
   });
   const home = prepareCodexHome(sourceEnv, jail);
   const childAuthFile = join(home, "auth.json");
+  assert.equal(existsSync(join(home, "config.toml")), false);
   const childAuth = JSON.parse(readFileSync(childAuthFile, "utf8")) as Record<string, unknown>;
   assert.equal(childAuth.OPENAI_API_KEY, undefined);
   assert.equal(
